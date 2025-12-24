@@ -9,7 +9,7 @@ import logging
 from hivemind import DHT, get_dht_time
 from hivemind.p2p import P2P
 from hivemind.utils.logging import get_logger
-from partition import load_partition, Stage0, Stage1
+from partition import load_partition, Stage0, StageSegment, StageLast
 from rpc_transport import RpcTransport
 from rpc_handler import Stage1ConnectionHandler
 
@@ -43,6 +43,13 @@ def _format_initial_peers(dht_initial_peers):
     return initial_peers_list
 
 
+def parse_splits(s: str):
+    parts = [int(x) for x in s.split(",") if x.strip()]
+    if len(parts) != 3 or sorted(parts) != parts:
+        raise ValueError("splits must be three increasing integers, e.g., 10,20,30")
+    return parts
+
+
 def _get_local_ip():
     try:
         import socket
@@ -57,10 +64,10 @@ def _get_local_ip():
 
 
 @torch.inference_mode()
-def run_rank0(args, device):
+def run_rank0(args, device, splits):
     """Run Stage0 (client side)."""
-    full = load_partition(args.model, args.split_layer, device)
-    s0 = Stage0(full, args.split_layer).to(device)
+    full = load_partition(args.model, splits[0], device)
+    s0 = Stage0(full, splits[0]).to(device)
 
     dht_peers = args.dht_initial_peers.split(',') if args.dht_initial_peers else []
     tx = RpcTransport(
@@ -69,6 +76,7 @@ def run_rank0(args, device):
         dht_initial_peers=dht_peers,
         dht_port=args.dht_port,
         rpc_port=args.rpc_port,
+        stage_keys=[f"mini_petals:stage{i}" for i in range(1, 4)],
     )
 
     # prompt
@@ -114,10 +122,25 @@ def run_rank0(args, device):
 
 
 @torch.inference_mode()
-def run_rank1(args, device):
-    """Run Stage1 (server side)."""
-    full = load_partition(args.model, args.split_layer, device)
-    s1 = Stage1(full, args.split_layer).to(device)
+def run_stage_server(args, device, splits):
+    """Run a server stage (1, 2, or 3)."""
+    if args.stage == 1:
+        start, end = splits[0], splits[1]
+        full = load_partition(args.model, end, device)
+        stage_model = StageSegment(full, start, end).to(device)
+        final_stage = False
+    elif args.stage == 2:
+        start, end = splits[1], splits[2]
+        full = load_partition(args.model, end, device)
+        stage_model = StageSegment(full, start, end).to(device)
+        final_stage = False
+    elif args.stage == 3:
+        start = splits[2]
+        full = load_partition(args.model, start, device)
+        stage_model = StageLast(full, start).to(device)
+        final_stage = True
+    else:
+        raise ValueError("stage must be 1, 2, or 3 for server")
 
     dht_peers = args.dht_initial_peers.split(",") if args.dht_initial_peers else []
     initial_peers_list = _format_initial_peers(dht_peers)
@@ -140,15 +163,16 @@ def run_rank1(args, device):
 
     handler = Stage1ConnectionHandler(
         dht=dht,
-        stage1_model=s1,
+        stage1_model=stage_model,
         device=device,
         request_timeout=args.request_timeout,
+        final_stage=final_stage,
     )
 
     async def setup_and_run():
         p2p = None
         try:
-            logger.info("Initializing P2P for Stage1...")
+            logger.info(f"Initializing P2P for Stage{args.stage}...")
             p2p = await P2P.create(host_maddrs=[f"/ip4/{local_ip}/tcp/{args.rpc_port}"])
             logger.info(f"P2P initialized successfully, PeerID: {p2p.peer_id}")
             # get_visible_maddrs is async in this hivemind version
@@ -158,11 +182,11 @@ def run_rank1(args, device):
             if p2p_maddr:
                 p2p_maddrs.append(str(p2p_maddr))
             if p2p_maddrs:
-                logger.info(f"Stage1 P2P listen maddrs: {p2p_maddrs}")
+                logger.info(f"Stage{args.stage} P2P listen maddrs: {p2p_maddrs}")
             else:
                 # Fallback to announced addr using rpc_port
                 p2p_maddrs = [f"/ip4/{local_ip}/tcp/{args.rpc_port}/p2p/{p2p.peer_id}"]
-                logger.warning(f"Stage1 P2P listen maddrs unknown; using fallback {p2p_maddrs}")
+                logger.warning(f"Stage{args.stage} P2P listen maddrs unknown; using fallback {p2p_maddrs}")
 
             peer_info = {
                 "peer_id": str(p2p.peer_id),
@@ -173,10 +197,10 @@ def run_rank1(args, device):
             }
             if p2p_maddrs:
                 peer_info["p2p_maddrs"] = p2p_maddrs
-            dht.store("mini_petals:stage1", peer_info, expiration_time=get_dht_time() + 3600)
+            dht.store(f"mini_petals:stage{args.stage}", peer_info, expiration_time=get_dht_time() + 3600)
 
             await handler.add_p2p_handlers(p2p)
-            logger.info("Stage1 handlers registered, waiting for requests...")
+            logger.info(f"Stage{args.stage} handlers registered, waiting for requests...")
             await asyncio.Event().wait()
         finally:
             handler.shutdown()
@@ -193,7 +217,8 @@ def run_rank1(args, device):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, required=True)
-    parser.add_argument("--split_layer", type=int, required=True)
+    parser.add_argument("--splits", type=str, required=True,
+                       help="Comma-separated cut points for 4-stage pipeline, e.g., 10,20,30")
     parser.add_argument("--max_new_tokens", type=int, default=64)
     parser.add_argument("--prompt", type=str, default="Hello, how are you?",
                        help="Input prompt for text generation")
@@ -203,8 +228,8 @@ def main():
                        help='Comma-separated list of initial DHT peers (e.g., full multiaddrs /ip4/host/tcp/port/p2p/PeerID)')
     parser.add_argument('--dht_port', type=int, default=8000, help='DHT port')
     parser.add_argument('--rpc_port', type=int, default=8001, help='RPC port')
-    parser.add_argument('--stage', type=int, required=True, choices=[0, 1],
-                       help='Stage number (0 for Stage0/client, 1 for Stage1/server)')
+    parser.add_argument('--stage', type=int, required=True, choices=[0, 1, 2, 3],
+                       help='Stage number (0=client, 1/2 mid, 3 final server)')
     parser.add_argument('--request_timeout', type=float, default=30.0,
                        help='Timeout for RPC requests in seconds')
     
@@ -218,10 +243,11 @@ def main():
     else:
         device = torch.device("cpu")
     
+    splits = parse_splits(args.splits)
     if args.stage == 0:
-        run_rank0(args, device)
+        run_rank0(args, device, splits)
     else:
-        run_rank1(args, device)
+        run_stage_server(args, device, splits)
 
 
 if __name__ == "__main__":

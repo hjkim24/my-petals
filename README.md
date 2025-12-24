@@ -10,179 +10,72 @@ pip install -r requirements.txt
 
 ## 사용법
 
-### GPU 1개 환경에서 테스트
+### 4-스테이지 파이프라인 실행 예시 (로컬, 포트만 다르게)
 
-GPU가 1개만 있어도 테스트 가능합니다. 다음 옵션 중 선택하세요:
+스플릿 예: `--splits 10,20,30` (Stage0: 0~10, Stage1: 10~20, Stage2: 20~30, Stage3: 30~끝)
 
-#### 옵션 1: 같은 GPU 공유 (작은 모델만 가능)
-
-**터미널 1 (Stage1):**
+1) Stage1 (부트스트랩 DHT + 서버)
 ```bash
 python mini_petals_stage1.py \
   --model gpt2 \
-  --split_layer 6 \
+  --splits 10,20,30 \
   --stage 1 \
   --dht_port 8000 \
-  --rpc_port 8001 \
-  --dht_initial_peers ""
+  --rpc_port 8001
 ```
+로그에 나온 `DHT visible multiaddrs`를 Stage2/3/0에 전달.
 
-**터미널 2 (Stage0):**
-```bash
-LOCAL_RANK=0 python mini_petals_stage1.py \
-  --model gpt2 \
-  --split_layer 6 \
-  --stage 0 \
-  --dht_port 8002 \
-  --rpc_port 8003 \
-  --dht_initial_peers "127.0.0.1:8000" \
-  --prompt "Hello, how are you?" \
-  --max_new_tokens 32
-```
-
-#### 옵션 2: 하나는 GPU, 하나는 CPU
-
-**터미널 1 (Stage1 - CPU):**
-```bash
-CUDA_VISIBLE_DEVICES="" python mini_petals_stage1.py \
-  --model gpt2 \
-  --split_layer 6 \
-  --stage 1 \
-  --dht_port 8000 \
-  --rpc_port 8001 \
-  --dht_initial_peers ""
-```
-
-**터미널 2 (Stage0 - GPU):**
-```bash
-LOCAL_RANK=0 python mini_petals_stage1.py \
-  --model gpt2 \
-  --split_layer 6 \
-  --stage 0 \
-  --dht_port 8002 \
-  --rpc_port 8003 \
-  --dht_initial_peers "127.0.0.1:8000" \
-  --prompt "Hello, how are you?" \
-  --max_new_tokens 32
-```
-
-#### 옵션 3: 둘 다 CPU (느리지만 테스트 가능)
-
-**터미널 1 (Stage1):**
-```bash
-CUDA_VISIBLE_DEVICES="" python mini_petals_stage1.py \
-  --model gpt2 \
-  --split_layer 6 \
-  --stage 1 \
-  --dht_port 8000 \
-  --rpc_port 8001 \
-  --dht_initial_peers ""
-```
-
-**터미널 2 (Stage0):**
-```bash
-CUDA_VISIBLE_DEVICES="" python mini_petals_stage1.py \
-  --model gpt2 \
-  --split_layer 6 \
-  --stage 0 \
-  --dht_port 8002 \
-  --rpc_port 8003 \
-  --dht_initial_peers "127.0.0.1:8000" \
-  --prompt "Hello, how are you?" \
-  --max_new_tokens 32
-```
-
-### 단일 노드 테스트 (2개 터미널, GPU 2개 이상)
-
-#### 1. Stage1 (서버) 실행 - 터미널 1
-
+2) Stage2 (서버)
 ```bash
 python mini_petals_stage1.py \
   --model gpt2 \
-  --split_layer 6 \
-  --stage 1 \
-  --dht_port 8000 \
-  --rpc_port 8001 \
-  --dht_initial_peers ""
-```
-
-#### 2. Stage0 (클라이언트) 실행 - 터미널 2
-
-```bash
-LOCAL_RANK=0 python mini_petals_stage1.py \
-  --model gpt2 \
-  --split_layer 6 \
-  --stage 0 \
+  --splits 10,20,30 \
+  --stage 2 \
   --dht_port 8002 \
   --rpc_port 8003 \
-  --dht_initial_peers "127.0.0.1:8000" \
-  --prompt "Hello, how are you?" \
-  --max_new_tokens 32
+  --dht_initial_peers /ip4/<host>/tcp/8000/p2p/<DHT_PEER_FROM_STAGE1>
 ```
 
-### 멀티 노드 테스트
-
-#### Node 1 (Stage1 서버)
-
+3) Stage3 (마지막 서버)
 ```bash
 python mini_petals_stage1.py \
   --model gpt2 \
-  --split_layer 6 \
-  --stage 1 \
-  --dht_port 8000 \
-  --rpc_port 8001 \
-  --dht_initial_peers ""
+  --splits 10,20,30 \
+  --stage 3 \
+  --dht_port 8004 \
+  --rpc_port 8005 \
+  --dht_initial_peers /ip4/<host>/tcp/8000/p2p/<DHT_PEER_FROM_STAGE1>
 ```
 
-#### Node 2 (Stage0 클라이언트)
-
+4) Stage0 (클라이언트)
 ```bash
-LOCAL_RANK=0 python mini_petals_stage1.py \
+python mini_petals_stage1.py \
   --model gpt2 \
-  --split_layer 6 \
+  --splits 10,20,30 \
   --stage 0 \
-  --dht_port 8002 \
-  --rpc_port 8003 \
-  --dht_initial_peers "NODE1_IP:8000" \
+  --dht_port 8006 \
+  --rpc_port 8007 \
+  --dht_initial_peers /ip4/<host>/tcp/8000/p2p/<DHT_PEER_FROM_STAGE1> \
   --prompt "Hello, how are you?" \
   --max_new_tokens 32
 ```
 
-## 인자 설명
-
-- `--model`: Hugging Face 모델 이름 (예: `gpt2`, `meta-llama/Llama-2-7b-hf`)
-- `--split_layer`: 모델을 나눌 레이어 인덱스 (Stage0: 0~k-1, Stage1: k~end)
-- `--stage`: 실행할 스테이지 (0: 클라이언트, 1: 서버)
-- `--prompt`: 입력 프롬프트 (기본값: "Hello, how are you?")
-- `--dht_port`: DHT 포트 번호
-- `--rpc_port`: RPC 포트 번호
-- `--dht_initial_peers`: 초기 DHT 피어 목록 (콤마로 구분, 예: `"ip1:port1,ip2:port2"`)
-- `--max_new_tokens`: 생성할 최대 토큰 수
-- `--request_timeout`: RPC 요청 타임아웃 (초)
-
-## 지원 모델
-
-- GPT-2
-- LLaMA / LLaMA-2
-- Mistral
-- Qwen2.5
-- GPT-NeoX
+### 인자 요약
+- `--model`: HF 모델 이름
+- `--splits`: 3개의 증가하는 정수, 예: `10,20,30` (4 스테이지용)
+- `--stage`: 0=클라이언트, 1/2=중간, 3=최종 서버
+- `--dht_initial_peers`: 부트스트랩 DHT 멀티어드레스(최소 1개)
+- `--dht_port`, `--rpc_port`: 각 노드의 포트
+- `--prompt`, `--max_new_tokens`, `--request_timeout`: 생성 관련 옵션
 
 ## 테스트 스크립트
-
 ```bash
-./test.sh [모델명] [split_layer] [max_tokens]
+./test.sh [모델명] [splits] [max_tokens]
 ```
-
-예시:
-```bash
-./test.sh gpt2 6 32
-```
+예: `./test.sh gpt2 10,20,30 32`
 
 ## 구조
-
-- `partition.py`: 모델을 Stage0과 Stage1로 분할
-- `rpc_transport.py`: 클라이언트 측 RPC 통신 (Stage0)
-- `rpc_handler.py`: 서버 측 RPC 요청 처리 (Stage1)
-- `mini_petals_stage1.py`: 메인 실행 스크립트
-
+- `partition.py`: 모델을 4개 스테이지로 슬라이싱
+- `rpc_transport.py`: Stage0에서 다단계 RPC 체인
+- `rpc_handler.py`: 각 스테이지 RPC 처리 및 (마지막이면 토큰 샘플링)
+- `mini_petals_stage1.py`: 실행 스크립트 (stage0~3)

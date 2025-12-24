@@ -37,7 +37,7 @@ from hivemind.moe.server.connection_handler import ConnectionHandler
 from hivemind.proto import runtime_pb2
 from hivemind.utils.logging import get_logger
 
-from partition import Stage1
+from partition import StageSegment, StageLast
 
 logger = get_logger(__name__)
 
@@ -48,9 +48,10 @@ class Stage1ConnectionHandler(ConnectionHandler):
     def __init__(
         self,
         dht: DHT,
-        stage1_model: Stage1,
+        stage1_model,
         device: torch.device,
         request_timeout: float = 30.0,
+        final_stage: bool = True,
     ):
         """
         Args:
@@ -58,6 +59,7 @@ class Stage1ConnectionHandler(ConnectionHandler):
             stage1_model: Stage1 model instance
             device: PyTorch device
             request_timeout: Timeout for RPC requests in seconds
+            final_stage: If True, sample and return token; else return hidden states
         """
         # ConnectionHandler expects module_backends dict, but we only have one model
         # Create a dummy dict with a single entry
@@ -71,6 +73,7 @@ class Stage1ConnectionHandler(ConnectionHandler):
         self._default_temperature = 0.8
         self._default_top_p = 0.9
         self._default_top_k = 0
+        self.final_stage = final_stage
 
     def _build_masks(
         self, seq_len: int, cur_len: int, is_prefill: bool, hidden_states: torch.Tensor
@@ -110,7 +113,7 @@ class Stage1ConnectionHandler(ConnectionHandler):
         attn_mask, pos_ids = self._build_masks(seq_len, cur_len, is_prefill, hidden_states)
 
         with torch.inference_mode():
-            logits, new_past = self.stage1_model(
+            outputs, new_past = self.stage1_model(
                 hidden_states.to(self.device),
                 position_ids=pos_ids,
                 attention_mask=attn_mask,
@@ -120,16 +123,24 @@ class Stage1ConnectionHandler(ConnectionHandler):
 
         self._kv_cache[session_id] = new_past
 
-        next_token_id = int(self._sample_token(logits[:, -1, :], temperature, top_p, top_k))
-
-        response_metadata = {"token_id": next_token_id, "session_id": session_id}
-        token_tensor = torch.tensor([[next_token_id]], device=self.device, dtype=torch.long)
-        serialized_token = serialize_torch_tensor(token_tensor.cpu())
-
-        return runtime_pb2.ExpertResponse(
-            tensors=[serialized_token],
-            metadata=MSGPackSerializer.dumps(response_metadata),
-        )
+        if self.final_stage:
+            logits = outputs
+            next_token_id = int(self._sample_token(logits[:, -1, :], temperature, top_p, top_k))
+            response_metadata = {"token_id": next_token_id, "session_id": session_id}
+            token_tensor = torch.tensor([[next_token_id]], device=self.device, dtype=torch.long)
+            serialized_token = serialize_torch_tensor(token_tensor.cpu())
+            return runtime_pb2.ExpertResponse(
+                tensors=[serialized_token],
+                metadata=MSGPackSerializer.dumps(response_metadata),
+            )
+        else:
+            hidden_out = outputs
+            serialized_hidden = serialize_torch_tensor(hidden_out.cpu())
+            response_metadata = {"session_id": session_id}
+            return runtime_pb2.ExpertResponse(
+                tensors=[serialized_hidden],
+                metadata=MSGPackSerializer.dumps(response_metadata),
+            )
 
     def _sample_token(self, logits: torch.Tensor, temperature: float, top_p: float, top_k: int) -> int:
         """Apply temperature / nucleus / top-k sampling to reduce repetition."""
