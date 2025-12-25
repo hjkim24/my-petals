@@ -6,6 +6,7 @@ import asyncio
 import concurrent.futures
 import socket
 import random
+import time
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -54,6 +55,12 @@ class RpcTransport:
 
         self._last_token: Optional[int] = None
         self.remote_info: Dict[str, Dict] = {}
+        self.last_prefill_stage_times: List[Tuple[str, float]] = []
+        self.last_prefill_total: Optional[float] = None
+        self.last_decode_stage_times: List[Tuple[str, float]] = []
+        self.last_decode_total: Optional[float] = None
+        self.decode_stage_history: List[List[Tuple[str, float]]] = []
+        self.decode_total_times: List[float] = []
 
         initial_peers_list = self._format_initial_peers(dht_initial_peers)
 
@@ -268,6 +275,7 @@ class RpcTransport:
             raise RuntimeError("send_prefill should only be called by stage0")
 
         async def _send():
+            start_all = time.perf_counter()
             hidden_cpu = hidden.cpu().detach()
             metadata = MSGPackSerializer.dumps(
                 {
@@ -280,17 +288,24 @@ class RpcTransport:
             )
 
             cur = hidden_cpu
+            stage_times: List[Tuple[str, float]] = []
             for idx, stage_key in enumerate(self.stage_keys):
                 expect_hidden = idx < len(self.stage_keys) - 1
+                stage_start = time.perf_counter()
                 serialized = serialize_torch_tensor(cur)
                 size = cur.element_size() * cur.nelement()
                 forward_fn = self._call_stage_stream if size > MAX_UNARY_PAYLOAD_SIZE // 2 else self._call_stage_unary
                 result = await forward_fn(stage_key, [serialized], metadata, self.timeout, expect_hidden=expect_hidden)
+                stage_times.append((stage_key, time.perf_counter() - stage_start))
                 if expect_hidden:
                     cur = result
                 else:
+                    self.last_prefill_stage_times = stage_times
+                    self.last_prefill_total = time.perf_counter() - start_all
                     return result
 
+            self.last_prefill_stage_times = stage_times
+            self.last_prefill_total = time.perf_counter() - start_all
             raise RuntimeError("No final stage returned a token")
 
         self._last_token = self._run_async(_send())
@@ -301,6 +316,7 @@ class RpcTransport:
             raise RuntimeError("send_decode_step should only be called by stage0")
 
         async def _send():
+            start_all = time.perf_counter()
             hidden_cpu = hidden.cpu().detach()
             metadata = MSGPackSerializer.dumps(
                 {
@@ -313,17 +329,30 @@ class RpcTransport:
             )
 
             cur = hidden_cpu
+            stage_times: List[Tuple[str, float]] = []
             for idx, stage_key in enumerate(self.stage_keys):
                 expect_hidden = idx < len(self.stage_keys) - 1
+                stage_start = time.perf_counter()
                 serialized = serialize_torch_tensor(cur)
                 size = cur.element_size() * cur.nelement()
                 forward_fn = self._call_stage_stream if size > MAX_UNARY_PAYLOAD_SIZE // 2 else self._call_stage_unary
                 result = await forward_fn(stage_key, [serialized], metadata, self.timeout, expect_hidden=expect_hidden)
+                stage_times.append((stage_key, time.perf_counter() - stage_start))
                 if expect_hidden:
                     cur = result
                 else:
+                    total = time.perf_counter() - start_all
+                    self.last_decode_stage_times = stage_times
+                    self.last_decode_total = total
+                    self.decode_stage_history.append(stage_times)
+                    self.decode_total_times.append(total)
                     return result
 
+            self.last_decode_stage_times = stage_times
+            total = time.perf_counter() - start_all
+            self.last_decode_total = total
+            self.decode_stage_history.append(stage_times)
+            self.decode_total_times.append(total)
             raise RuntimeError("No final stage returned a token")
 
         self._last_token = self._run_async(_send())

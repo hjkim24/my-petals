@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import os
 from uuid import uuid4
+import time
 
 import torch
 from transformers import AutoTokenizer
@@ -93,15 +94,21 @@ def run_rank0(args, device, splits):
     session_id = str(uuid4())
     max_length = L + args.max_new_tokens
 
+    t_prefill_start = time.perf_counter()
     # send prefill hidden to rank1
     tx.send_prefill(L, hidden, session_id=session_id, max_length=max_length)  # [1,L,H]
 
     # receive first next_token_id (after stage1 prefill)
     next_id = tx.recv_token()
+    ttft = time.perf_counter() - t_prefill_start
     generated = [next_id]
+
+    # metrics containers
+    decode_total_times = []
 
     # decode loop
     cur_len = L + 1
+    t_decode_start = time.perf_counter()
     for _ in range(args.max_new_tokens - 1):
         # new token
         new_input = torch.tensor([[next_id]], device=device, dtype=torch.long)
@@ -111,11 +118,38 @@ def run_rank0(args, device, splits):
 
         tx.send_decode_step(cur_len, hidden, session_id=session_id, max_length=max_length)  # [1,1,H]
         next_id = tx.recv_token()
+        if tx.last_decode_total is not None:
+            decode_total_times.append(tx.last_decode_total)
         generated.append(next_id)
         cur_len += 1
 
+    total_decode_time = time.perf_counter() - t_decode_start
+    total_dec_tokens = len(decode_total_times)
+    decode_tps = (total_dec_tokens / total_decode_time) if total_decode_time > 0 else 0.0
+
     text = tok.decode(generated, skip_special_tokens=True)
     print("Generated:", text)
+
+    # Log simple timing summary
+    print("=== Timing Summary ===")
+    print(f"TTFT: {ttft*1000:.2f} ms")
+    if tx.last_prefill_stage_times:
+        prefill_stage_ms = ", ".join(f"{k}={v*1000:.2f} ms" for k, v in tx.last_prefill_stage_times)
+        print(f"Prefill stages: {prefill_stage_ms}")
+    if tx.last_prefill_total is not None:
+        print(f"Prefill total: {tx.last_prefill_total*1000:.2f} ms")
+    print(f"Decode tokens: {total_dec_tokens}, decode throughput: {decode_tps:.2f} tok/s")
+    if tx.decode_stage_history:
+        agg = {}
+        for stages in tx.decode_stage_history:
+            for k, v in stages:
+                agg.setdefault(k, []).append(v)
+        stage_lines = []
+        for k, vals in agg.items():
+            avg = sum(vals) / len(vals)
+            stage_lines.append(f"{k} avg={avg*1000:.2f} ms")
+        print("Decode stages (avg): " + ", ".join(stage_lines))
+
     
     # Cleanup
     tx.shutdown()
