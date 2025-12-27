@@ -10,9 +10,9 @@ import logging
 from hivemind import DHT, get_dht_time
 from hivemind.p2p import P2P
 from hivemind.utils.logging import get_logger
-from partition import load_partition, Stage0, StageSegment, StageLast
+from partition import load_stage_model, Stage0, StageSegment, StageLast
 from rpc_transport import RpcTransport
-from rpc_handler import Stage1ConnectionHandler
+from rpc_handler import StageConnectionHandler
 
 logger = get_logger(__name__)
 # Ensure logs are emitted when running from terminal
@@ -26,6 +26,7 @@ def build_masks(seq_len: int, device):
     return attn, pos
 
 
+# dht_initial_peer에 대한 Multiaddr formatting(/p2p 이외의 주소의 경우 ValueError 처리)
 def _format_initial_peers(dht_initial_peers):
     initial_peers_list = []
     for peer in dht_initial_peers:
@@ -43,54 +44,66 @@ def _format_initial_peers(dht_initial_peers):
             initial_peers_list.append(peer)
     return initial_peers_list
 
-
+# arg로 받은 layer split parsing(str -> int)
 def parse_splits(s: str):
     parts = [int(x) for x in s.split(",") if x.strip()]
     if len(parts) != 3 or sorted(parts) != parts:
         raise ValueError("splits must be three increasing integers, e.g., 10,20,30")
     return parts
 
-
+# DHT를 통해 다른 네트워크에 존재하는 노드가 찾을 수 있도록 현재 노드의 IP 주소 저장
 def _get_local_ip():
     try:
         import socket
 
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
+        s.connect(("8.8.8.8", 80)) # 외부로 연결 시도
+        ip = s.getsockname()[0] # 외부 연결에 실제로 사용된 인터페이스의 IP 주소를 반환
         s.close()
         return ip
     except Exception:
         return "127.0.0.1"
 
 
-@torch.inference_mode()
+@torch.inference_mode() # gradient 계산 비활성화하여 오버헤드 제거
 def run_rank0(args, device, splits):
     """Run Stage0 (client side)."""
-    full = load_partition(args.model, splits[0], device)
-    s0 = Stage0(full, splits[0]).to(device)
 
+    # 1. Initialize
+    full = load_stage_model(args.model, device, role="stage0", end=splits[0])
+    s0 = Stage0(full, splits[0]).to(device) # load to GPU
+
+    # connect to DHT Network with initial(stage1) DHT peer address
     dht_peers = args.dht_initial_peers.split(',') if args.dht_initial_peers else []
+    
+    # initialize RpcTransport for connection
     tx = RpcTransport(
         device=device,
         stage=0,
         dht_initial_peers=dht_peers,
         dht_port=args.dht_port,
         rpc_port=args.rpc_port,
+        # 기존에 DHT network에 등록되어있는 keys
         stage_keys=[f"mini_petals:stage{i}" for i in range(1, 4)],
     )
 
-    # prompt
-    tok = AutoTokenizer.from_pretrained(args.model)
+
+    # 2. Input Process (prompt -> token)
+    tok = AutoTokenizer.from_pretrained(args.model) # model에 맞는 tokenizer 로드
     prompt = args.prompt
+    # tokenized된 token을 GPU에 로드
     input_ids = tok(prompt, return_tensors="pt").input_ids.to(device)  # [1, L]
     L = input_ids.size(1)
 
+    # 입력 토큰 차원에 맞게 attention mask, position embedding tensor 생성
     attn, pos = build_masks(L, device)
 
-    past0 = None
-    hidden, past0 = s0(input_ids, pos, attn, past0, use_cache=True)
+    past0 = None # 첫 호출이므로 KV Cache 없음
 
+    # forward pass
+    hidden, past0 = s0(input_ids, pos, attn, past0, use_cache=True) # nn.Module.__call__ method -> forward pass
+
+    # 3. Prefill (for initial input tokens)
     session_id = str(uuid4())
     max_length = L + args.max_new_tokens
 
@@ -98,7 +111,7 @@ def run_rank0(args, device, splits):
     # send prefill hidden to rank1
     tx.send_prefill(L, hidden, session_id=session_id, max_length=max_length)  # [1,L,H]
 
-    # receive first next_token_id (after stage1 prefill)
+    # load _last_token after prefill
     next_id = tx.recv_token()
     ttft = time.perf_counter() - t_prefill_start
     generated = [next_id]
@@ -106,18 +119,20 @@ def run_rank0(args, device, splits):
     # metrics containers
     decode_total_times = []
 
-    # decode loop
+    # 4. Decoding (for newly generated token)
     cur_len = L + 1
     t_decode_start = time.perf_counter()
-    for _ in range(args.max_new_tokens - 1):
-        # new token
+    for _ in range(args.max_new_tokens - 1): # Prefill에서 1개 토큰 생성했으므로 max - 1 생성
         new_input = torch.tensor([[next_id]], device=device, dtype=torch.long)
         attn, pos = build_masks(cur_len, device)  # simple, batch=1
         # position_ids should be full length; many HF impl accept this
         hidden, past0 = s0(new_input, pos[:, -1:], attn, past0, use_cache=True)  # [1,1,H]
 
+        # send_prefill과 동일
         tx.send_decode_step(cur_len, hidden, session_id=session_id, max_length=max_length)  # [1,1,H]
         next_id = tx.recv_token()
+
+
         if tx.last_decode_total is not None:
             decode_total_times.append(tx.last_decode_total)
         generated.append(next_id)
@@ -127,6 +142,7 @@ def run_rank0(args, device, splits):
     total_dec_tokens = len(decode_total_times)
     decode_tps = (total_dec_tokens / total_decode_time) if total_decode_time > 0 else 0.0
 
+    # 5. Result
     text = tok.decode(generated, skip_special_tokens=True)
     print("Generated:", text)
 
@@ -160,17 +176,17 @@ def run_stage_server(args, device, splits):
     """Run a server stage (1, 2, or 3)."""
     if args.stage == 1:
         start, end = splits[0], splits[1]
-        full = load_partition(args.model, end, device)
+        full = load_stage_model(args.model, device, role="segment", start=start, end=end)
         stage_model = StageSegment(full, start, end).to(device)
         final_stage = False
     elif args.stage == 2:
         start, end = splits[1], splits[2]
-        full = load_partition(args.model, end, device)
+        full = load_stage_model(args.model, device, role="segment", start=start, end=end)
         stage_model = StageSegment(full, start, end).to(device)
         final_stage = False
     elif args.stage == 3:
         start = splits[2]
-        full = load_partition(args.model, start, device)
+        full = load_stage_model(args.model, device, role="last", start=start)
         stage_model = StageLast(full, start).to(device)
         final_stage = True
     else:
@@ -180,11 +196,14 @@ def run_stage_server(args, device, splits):
     initial_peers_list = _format_initial_peers(dht_peers)
     local_ip = _get_local_ip()
 
+    # Initialize DHT Network
     dht = DHT(
         start=True,
         initial_peers=initial_peers_list if initial_peers_list else None,
         host_maddrs=[f"/ip4/{local_ip}/tcp/{args.dht_port}"],
     )
+
+    # 초기화된 DHT 네트워크의 multiaddr 리스트 반환
     visible = dht.get_visible_maddrs()
     peer_id = str(dht.peer_id)
     if visible:
@@ -195,9 +214,10 @@ def run_stage_server(args, device, splits):
             f"DHT visible multiaddrs not available; try fallback: {fallback}"
         )
 
-    handler = Stage1ConnectionHandler(
+
+    handler = StageConnectionHandler(
         dht=dht,
-        stage1_model=stage_model,
+        stage_model=stage_model,
         device=device,
         request_timeout=args.request_timeout,
         final_stage=final_stage,
@@ -207,12 +227,14 @@ def run_stage_server(args, device, splits):
         p2p = None
         try:
             logger.info(f"Initializing P2P for Stage{args.stage}...")
+            # P2P Daemon 생성(hivemind 내장)
             p2p = await P2P.create(host_maddrs=[f"/ip4/{local_ip}/tcp/{args.rpc_port}"])
             logger.info(f"P2P initialized successfully, PeerID: {p2p.peer_id}")
             # get_visible_maddrs is async in this hivemind version
-            visible_maddrs = await p2p.get_visible_maddrs()
-            p2p_maddr = getattr(p2p, "daemon_listen_maddr", None)
+            visible_maddrs = await p2p.get_visible_maddrs() # P2P가 자동으로 감지한 외부 접근 가능한 multiaddr 리스트
+            p2p_maddr = getattr(p2p, "daemon_listen_maddr", None) # P2P Daemon이 실제로 리스닝하는 주소
             p2p_maddrs = [str(m) for m in visible_maddrs] if visible_maddrs else []
+            # visible_maddrs와 p2p_maddr를 병합
             if p2p_maddr:
                 p2p_maddrs.append(str(p2p_maddr))
             if p2p_maddrs:
@@ -229,12 +251,18 @@ def run_stage_server(args, device, splits):
                 "dht_port": args.dht_port,
                 "timestamp": get_dht_time(),
             }
+            # P2P Multiaddr 존재하면 peer_info에 추가
             if p2p_maddrs:
                 peer_info["p2p_maddrs"] = p2p_maddrs
+
+            # DHT Network에 rpc 통신에 필요한 정보 저장
             dht.store(f"mini_petals:stage{args.stage}", peer_info, expiration_time=get_dht_time() + 3600)
 
+            # P2P Daemon에 StageConnectionHandler의 rpc_* 메서드 등록
             await handler.add_p2p_handlers(p2p)
             logger.info(f"Stage{args.stage} handlers registered, waiting for requests...")
+
+            # 요청 들어올때까지 대기
             await asyncio.Event().wait()
         finally:
             handler.shutdown()
@@ -269,13 +297,14 @@ def main():
     
     args = parser.parse_args()
 
-    # Get device
+    # Get Local Rank for multi GPU environment(if Single, 0)
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     if torch.cuda.is_available():
         torch.cuda.set_device(local_rank)
         device = torch.device("cuda", local_rank)
     else:
         device = torch.device("cpu")
+    logger.info(f"Using device: {device}")
     
     splits = parse_splits(args.splits)
     if args.stage == 0:

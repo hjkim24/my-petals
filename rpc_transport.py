@@ -53,14 +53,14 @@ class RpcTransport:
         self.local_ip = self._get_local_ip()
         self.stage_keys = stage_keys or ["mini_petals:stage1", "mini_petals:stage2", "mini_petals:stage3"]
 
-        self._last_token: Optional[int] = None
-        self.remote_info: Dict[str, Dict] = {}
-        self.last_prefill_stage_times: List[Tuple[str, float]] = []
-        self.last_prefill_total: Optional[float] = None
-        self.last_decode_stage_times: List[Tuple[str, float]] = []
-        self.last_decode_total: Optional[float] = None
-        self.decode_stage_history: List[List[Tuple[str, float]]] = []
-        self.decode_total_times: List[float] = []
+        self._last_token: Optional[int] = None # 마지막으로 받은 토큰 ID
+        self.remote_info: Dict[str, Dict] = {} # 원격 스테이지 연결 정보
+        self.last_prefill_stage_times: List[Tuple[str, float]] = [] # Prefill 단계 Stage별 소요 시간
+        self.last_prefill_total: Optional[float] = None # Prefill 단계 전체 소요 시간
+        self.last_decode_stage_times: List[Tuple[str, float]] = [] # 마지막 Decode Step에서 Stage별 소요 시간
+        self.last_decode_total: Optional[float] = None # 마지막 Decode Step 전체 소요 시간
+        self.decode_stage_history: List[List[Tuple[str, float]]] = [] # 모든 Decode Step의 Stage별 소요 시간 히스토리
+        self.decode_total_times: List[float] = [] # 모든 Decode Step의 전체 소요 시간 리스트
 
         initial_peers_list = self._format_initial_peers(dht_initial_peers)
 
@@ -211,7 +211,7 @@ class RpcTransport:
         response = await asyncio.wait_for(
             self.p2p.call_protobuf_handler(
                 peer_id,
-                "Stage1ConnectionHandler.rpc_forward",
+                "StageConnectionHandler.rpc_forward",
                 request,
                 runtime_pb2.ExpertResponse,
             ),
@@ -241,7 +241,7 @@ class RpcTransport:
 
         outputs = self.p2p.iterate_protobuf_handler(
             peer_id,
-            "Stage1ConnectionHandler.rpc_forward_stream",
+            "StageConnectionHandler.rpc_forward_stream",
             iter_as_aiter(parts),
             runtime_pb2.ExpertResponse,
         )
@@ -276,6 +276,7 @@ class RpcTransport:
 
         async def _send():
             start_all = time.perf_counter()
+            # GPU에 있던 tensor를 CPU로 이동(for sending)
             hidden_cpu = hidden.cpu().detach()
             metadata = MSGPackSerializer.dumps(
                 {
@@ -292,14 +293,14 @@ class RpcTransport:
             for idx, stage_key in enumerate(self.stage_keys):
                 expect_hidden = idx < len(self.stage_keys) - 1
                 stage_start = time.perf_counter()
-                serialized = serialize_torch_tensor(cur)
+                serialized = serialize_torch_tensor(cur) # 1. Serialize Tensor
                 size = cur.element_size() * cur.nelement()
-                forward_fn = self._call_stage_stream if size > MAX_UNARY_PAYLOAD_SIZE // 2 else self._call_stage_unary
-                result = await forward_fn(stage_key, [serialized], metadata, self.timeout, expect_hidden=expect_hidden)
-                stage_times.append((stage_key, time.perf_counter() - stage_start))
-                if expect_hidden:
+                forward_fn = self._call_stage_stream if size > MAX_UNARY_PAYLOAD_SIZE // 2 else self._call_stage_unary # 2. Select RPC mode depending on size (unary / stream)
+                result = await forward_fn(stage_key, [serialized], metadata, self.timeout, expect_hidden=expect_hidden) # 3. Call RPC await
+                stage_times.append((stage_key, time.perf_counter() - stage_start)) # 4. Record time
+                if expect_hidden: # Not last stage
                     cur = result
-                else:
+                else: # Last stage
                     self.last_prefill_stage_times = stage_times
                     self.last_prefill_total = time.perf_counter() - start_all
                     return result
@@ -308,6 +309,7 @@ class RpcTransport:
             self.last_prefill_total = time.perf_counter() - start_all
             raise RuntimeError("No final stage returned a token")
 
+        # _last_token에 토큰 저장
         self._last_token = self._run_async(_send())
 
     def send_decode_step(self, cur_len: int, hidden: torch.Tensor, session_id: str, max_length: int):

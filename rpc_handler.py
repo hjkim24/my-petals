@@ -42,13 +42,13 @@ from partition import StageSegment, StageLast
 logger = get_logger(__name__)
 
 
-class Stage1ConnectionHandler(ConnectionHandler):
+class StageConnectionHandler(ConnectionHandler):
     """Connection handler for Stage1 that processes forward requests."""
 
     def __init__(
         self,
         dht: DHT,
-        stage1_model,
+        stage_model,
         device: torch.device,
         request_timeout: float = 30.0,
         final_stage: bool = True,
@@ -56,17 +56,17 @@ class Stage1ConnectionHandler(ConnectionHandler):
         """
         Args:
             dht: DHT instance for peer discovery
-            stage1_model: Stage1 model instance
+            stage_model: Stage model instance
             device: PyTorch device
             request_timeout: Timeout for RPC requests in seconds
             final_stage: If True, sample and return token; else return hidden states
         """
         # ConnectionHandler expects module_backends dict, but we only have one model
         # Create a dummy dict with a single entry
-        module_backends = {"stage1": stage1_model}
+        module_backends = {"stage1": stage_model}
         super().__init__(dht, module_backends, start=False)
         
-        self.stage1_model = stage1_model
+        self.stage_model = stage_model
         self.device = device
         self.request_timeout = request_timeout
         self._kv_cache: Dict[str, Optional[tuple]] = {}
@@ -113,7 +113,7 @@ class Stage1ConnectionHandler(ConnectionHandler):
         attn_mask, pos_ids = self._build_masks(seq_len, cur_len, is_prefill, hidden_states)
 
         with torch.inference_mode():
-            outputs, new_past = self.stage1_model(
+            outputs, new_past = self.stage_model(
                 hidden_states.to(self.device),
                 position_ids=pos_ids,
                 attention_mask=attn_mask,
@@ -169,7 +169,7 @@ class Stage1ConnectionHandler(ConnectionHandler):
         self, request: runtime_pb2.ExpertRequest, context: P2PContext
     ) -> runtime_pb2.ExpertResponse:
         """
-        Process forward request: receive hidden states, run Stage1, return logits.
+        Process forward request: receive hidden states, run Stage, return logits.
         
         Expected request format:
         - request.tensors[0]: hidden states tensor [batch, seq_len, hidden_size]
