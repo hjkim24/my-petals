@@ -33,6 +33,9 @@ class RpcTransport:
         dht_port: int = 8000,
         rpc_port: int = 8001,
         timeout: float = 30.0,
+        temperature: float = 1.0,
+        top_p: float = 0.92,
+        top_k: int = 50,
         stage_keys: Optional[List[str]] = None,
     ):
         """
@@ -52,6 +55,7 @@ class RpcTransport:
         self.timeout = timeout
         self.local_ip = self._get_local_ip()
         self.stage_keys = stage_keys or ["mini_petals:stage1", "mini_petals:stage2", "mini_petals:stage3"]
+        self.sampling = {"temperature": float(temperature), "top_p": float(top_p), "top_k": int(top_k)}
 
         self._last_token: Optional[int] = None # 마지막으로 받은 토큰 ID
         self.remote_info: Dict[str, Dict] = {} # 원격 스테이지 연결 정보
@@ -285,6 +289,7 @@ class RpcTransport:
                     "cur_len": L,
                     "is_prefill": True,
                     "max_length": max_length,
+                    **self.sampling,
                 }
             )
 
@@ -327,6 +332,7 @@ class RpcTransport:
                     "cur_len": cur_len,
                     "is_prefill": False,
                     "max_length": max_length,
+                    **self.sampling,
                 }
             )
 

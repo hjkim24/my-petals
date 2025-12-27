@@ -3,6 +3,18 @@ import torch.nn as nn
 import inspect
 from transformers import AutoModelForCausalLM
 
+
+def _get_past_from_output(out):
+    """Return past cache (if any) from a transformer layer output."""
+    if hasattr(out, "past_key_values") and out.past_key_values is not None:
+        return out.past_key_values
+    if hasattr(out, "next_cache") and out.next_cache is not None:
+        return out.next_cache
+    if isinstance(out, (tuple, list)) and len(out) > 1:
+        return out[1]
+    return None
+
+
 class Stage0(nn.Module):
     def __init__(self, full, end: int):
         super().__init__()
@@ -47,7 +59,7 @@ class Stage0(nn.Module):
             x = out[0]
             # KV 캐시 저장
             if use_cache:
-                new_past.append(out[1])
+                new_past.append(_get_past_from_output(out))
         return x, tuple(new_past) if use_cache else None
 
 
@@ -81,7 +93,7 @@ class StageSegment(nn.Module):
             out = layer(x, **kwargs)
             x = out[0]
             if use_cache:
-                new_past.append(out[1])
+                new_past.append(_get_past_from_output(out))
         return x, tuple(new_past) if use_cache else None
 
 
@@ -124,7 +136,7 @@ class StageLast(nn.Module):
             out = layer(x, **kwargs)
             x = out[0]
             if use_cache:
-                new_past.append(out[1])
+                new_past.append(_get_past_from_output(out))
         x = self.norm(x)
         logits = self.lm_head(x)
         return logits, tuple(new_past) if use_cache else None
@@ -148,7 +160,7 @@ def load_stage_model(
     *, # arguments below this asterisk are keyword-only
     start: int = 0,
     end: int | None = None,
-    dtype=torch.bfloat16,
+    dtype=torch.float16,
 ):
     """
     Load only the layers needed for a stage to reduce memory.

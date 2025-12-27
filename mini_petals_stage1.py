@@ -19,9 +19,10 @@ logger = get_logger(__name__)
 logging.basicConfig(level=logging.INFO)
 
 
-def build_masks(seq_len: int, device):
+def build_masks(seq_len: int, device, dtype=None):
     # batch=1, no padding
-    attn = torch.ones(1, seq_len, device=device, dtype=torch.float)
+    mask_dtype = dtype if dtype is not None else torch.float
+    attn = torch.ones(1, seq_len, device=device, dtype=mask_dtype)
     pos = torch.arange(seq_len, device=device, dtype=torch.long).unsqueeze(0)  # [1, seq]
     return attn, pos
 
@@ -70,7 +71,7 @@ def run_rank0(args, device, splits):
     """Run Stage0 (client side)."""
 
     # 1. Initialize
-    full = load_stage_model(args.model, device, role="stage0", end=splits[0])
+    full = load_stage_model(args.model, device, role="stage0", end=splits[0], dtype=args.dtype)
     s0 = Stage0(full, splits[0]).to(device) # load to GPU
 
     # connect to DHT Network with initial(stage1) DHT peer address
@@ -83,6 +84,9 @@ def run_rank0(args, device, splits):
         dht_initial_peers=dht_peers,
         dht_port=args.dht_port,
         rpc_port=args.rpc_port,
+        temperature=args.temperature,
+        top_p=args.top_p,
+        top_k=args.top_k,
         # 기존에 DHT network에 등록되어있는 keys
         stage_keys=[f"mini_petals:stage{i}" for i in range(1, 4)],
     )
@@ -96,7 +100,8 @@ def run_rank0(args, device, splits):
     L = input_ids.size(1)
 
     # 입력 토큰 차원에 맞게 attention mask, position embedding tensor 생성
-    attn, pos = build_masks(L, device)
+    model_dtype = s0.embed_tokens.weight.dtype
+    attn, pos = None, torch.arange(L, device=device, dtype=torch.long).unsqueeze(0)
 
     past0 = None # 첫 호출이므로 KV Cache 없음
 
@@ -124,9 +129,11 @@ def run_rank0(args, device, splits):
     t_decode_start = time.perf_counter()
     for _ in range(args.max_new_tokens - 1): # Prefill에서 1개 토큰 생성했으므로 max - 1 생성
         new_input = torch.tensor([[next_id]], device=device, dtype=torch.long)
-        attn, pos = build_masks(cur_len, device)  # simple, batch=1
-        # position_ids should be full length; many HF impl accept this
-        hidden, past0 = s0(new_input, pos[:, -1:], attn, past0, use_cache=True)  # [1,1,H]
+        # past cache 길이에 맞춰 attention mask/position_ids 생성
+        past_len = past0[0][0].shape[-2] if past0 and past0[0] is not None else cur_len - 1
+        attn = None
+        pos = torch.tensor([[past_len]], device=device, dtype=torch.long)
+        hidden, past0 = s0(new_input, pos, attn, past0, use_cache=True)  # [1,1,H]
 
         # send_prefill과 동일
         tx.send_decode_step(cur_len, hidden, session_id=session_id, max_length=max_length)  # [1,1,H]
@@ -176,17 +183,17 @@ def run_stage_server(args, device, splits):
     """Run a server stage (1, 2, or 3)."""
     if args.stage == 1:
         start, end = splits[0], splits[1]
-        full = load_stage_model(args.model, device, role="segment", start=start, end=end)
+        full = load_stage_model(args.model, device, role="segment", start=start, end=end, dtype=args.dtype)
         stage_model = StageSegment(full, start, end).to(device)
         final_stage = False
     elif args.stage == 2:
         start, end = splits[1], splits[2]
-        full = load_stage_model(args.model, device, role="segment", start=start, end=end)
+        full = load_stage_model(args.model, device, role="segment", start=start, end=end, dtype=args.dtype)
         stage_model = StageSegment(full, start, end).to(device)
         final_stage = False
     elif args.stage == 3:
         start = splits[2]
-        full = load_stage_model(args.model, device, role="last", start=start)
+        full = load_stage_model(args.model, device, role="last", start=start, dtype=args.dtype)
         stage_model = StageLast(full, start).to(device)
         final_stage = True
     else:
@@ -281,6 +288,8 @@ def main():
     parser.add_argument("--model", type=str, required=True)
     parser.add_argument("--splits", type=str, required=True,
                        help="Comma-separated cut points for 4-stage pipeline, e.g., 10,20,30")
+    parser.add_argument("--dtype", type=str, default="fp16", choices=["fp16", "bf16", "fp32"],
+                       help="Model dtype: fp16 (default), bf16, fp32")
     parser.add_argument("--max_new_tokens", type=int, default=64)
     parser.add_argument("--prompt", type=str, default="Hello, how are you?",
                        help="Input prompt for text generation")
@@ -294,6 +303,9 @@ def main():
                        help='Stage number (0=client, 1/2 mid, 3 final server)')
     parser.add_argument('--request_timeout', type=float, default=30.0,
                        help='Timeout for RPC requests in seconds')
+    parser.add_argument('--temperature', type=float, default=1.0, help='Sampling temperature (client->stage3)')
+    parser.add_argument('--top_p', type=float, default=0.92, help='Nucleus sampling p')
+    parser.add_argument('--top_k', type=int, default=50, help='Top-k sampling (0=disabled)')
     
     args = parser.parse_args()
 
@@ -305,6 +317,13 @@ def main():
     else:
         device = torch.device("cpu")
     logger.info(f"Using device: {device}")
+
+    dtype_map = {
+        "fp16": torch.float16,
+        "bf16": torch.bfloat16,
+        "fp32": torch.float32,
+    }
+    args.dtype = dtype_map[args.dtype]
     
     splits = parse_splits(args.splits)
     if args.stage == 0:

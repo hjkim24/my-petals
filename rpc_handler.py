@@ -75,17 +75,28 @@ class StageConnectionHandler(ConnectionHandler):
         self._default_top_k = 0
         self.final_stage = final_stage
 
+    @staticmethod
+    def _past_len(past_key_values, cur_len: int, chunk_len: int) -> int:
+        """Safely derive past sequence length for cache-aware masking."""
+        if not past_key_values:
+            return max(cur_len - chunk_len, 0)
+        first = past_key_values[0] if len(past_key_values) > 0 else None
+        if first is None:
+            return max(cur_len - chunk_len, 0)
+        if isinstance(first, (tuple, list)) and len(first) > 0 and first[0] is not None:
+            return first[0].shape[-2]
+        return max(cur_len - chunk_len, 0)
+
     def _build_masks(
-        self, seq_len: int, cur_len: int, is_prefill: bool, hidden_states: torch.Tensor
+        self, seq_len: int, cur_len: int, is_prefill: bool, hidden_states: torch.Tensor, past_len: int
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Create attention mask and position ids for prefill/decode."""
         if is_prefill:
-            attn_mask = torch.ones(1, seq_len, device=self.device, dtype=hidden_states.dtype)
+            attn_mask = None  # causal mask internal to GPT-style blocks
             pos_ids = torch.arange(seq_len, device=self.device, dtype=torch.long).unsqueeze(0)
         else:
-            attn_mask = torch.ones(1, cur_len, device=self.device, dtype=hidden_states.dtype)
-            pos_ids = torch.arange(cur_len, device=self.device, dtype=torch.long).unsqueeze(0)
-            pos_ids = pos_ids[:, -hidden_states.shape[1]:]
+            attn_mask = None
+            pos_ids = torch.arange(past_len, past_len + hidden_states.shape[1], device=self.device, dtype=torch.long).unsqueeze(0)
         return attn_mask, pos_ids
 
     def _run_forward(
@@ -105,12 +116,14 @@ class StageConnectionHandler(ConnectionHandler):
 
         if is_prefill:
             past_key_values = None
+            past_len = 0
         else:
             past_key_values = self._kv_cache.get(session_id)
             if past_key_values is None:
                 raise ValueError(f"Missing past_key_values for session_id={session_id}")
+            past_len = self._past_len(past_key_values, cur_len, hidden_states.shape[1])
 
-        attn_mask, pos_ids = self._build_masks(seq_len, cur_len, is_prefill, hidden_states)
+        attn_mask, pos_ids = self._build_masks(seq_len, cur_len, is_prefill, hidden_states, past_len)
 
         with torch.inference_mode():
             outputs, new_past = self.stage_model(
