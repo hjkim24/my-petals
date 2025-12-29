@@ -238,12 +238,16 @@ def run_stage_server(args, device, splits):
     
     # 공인 IP가 제공되면 announce_maddrs에 사용, 없으면 local_ip 사용
     announce_ip = args.public_ip if args.public_ip else local_ip
+    
+    # 외부 포트가 제공되면 사용, 없으면 내부 포트 사용 (포트 포워딩 시나리오 대응)
+    public_dht_port = args.public_dht_port if args.public_dht_port is not None else args.dht_port
+    public_rpc_port = args.public_rpc_port if args.public_rpc_port is not None else args.rpc_port
 
     # 공인 IP가 제공되면 모든 인터페이스(0.0.0.0)에서 리스닝하여 외부 접근 허용
-    # announce_maddrs에 공인 IP를 설정하여 다른 피어에게 알림
+    # announce_maddrs에 공인 IP와 외부 포트를 설정하여 다른 피어에게 알림
     if args.public_ip:
         host_maddrs = [f"/ip4/0.0.0.0/tcp/{args.dht_port}"]
-        announce_maddrs = [f"/ip4/{args.public_ip}/tcp/{args.dht_port}"]
+        announce_maddrs = [f"/ip4/{args.public_ip}/tcp/{public_dht_port}"]
     else:
         host_maddrs = [f"/ip4/{local_ip}/tcp/{args.dht_port}"]
         announce_maddrs = None
@@ -267,8 +271,8 @@ def run_stage_server(args, device, splits):
         has_public_ip = any(args.public_ip in str(m) for m in visible_str)
         
         if not has_public_ip:
-            # 공인 IP를 사용한 multiaddr을 명시적으로 생성
-            public_maddr = f"/ip4/{args.public_ip}/tcp/{args.dht_port}/p2p/{peer_id}"
+            # 공인 IP와 외부 포트를 사용한 multiaddr을 명시적으로 생성
+            public_maddr = f"/ip4/{args.public_ip}/tcp/{public_dht_port}/p2p/{peer_id}"
             logger.warning(
                 f"DHT visible multiaddrs do not contain public IP {args.public_ip}. "
                 f"Use this multiaddr for --dht_initial_peers: {public_maddr}"
@@ -281,7 +285,8 @@ def run_stage_server(args, device, splits):
     else:
         # 공인 IP가 없고 visible maddrs도 없으면 local_ip 사용
         fallback_ip = announce_ip
-        fallback = [f"/ip4/{fallback_ip}/tcp/{args.dht_port}/p2p/{peer_id}"]
+        fallback_dht_port = public_dht_port  # 외부 포트가 있으면 사용, 없으면 내부 포트
+        fallback = [f"/ip4/{fallback_ip}/tcp/{fallback_dht_port}/p2p/{peer_id}"]
         logger.info(
             f"DHT visible multiaddrs not available; try fallback: {fallback}"
         )
@@ -319,8 +324,8 @@ def run_stage_server(args, device, splits):
             if args.public_ip:
                 has_public_ip = any(args.public_ip in m for m in p2p_maddrs)
                 if not has_public_ip:
-                    # 공인 IP를 사용한 multiaddr을 명시적으로 생성
-                    public_p2p_maddr = f"/ip4/{args.public_ip}/tcp/{args.rpc_port}/p2p/{p2p.peer_id}"
+                    # 공인 IP와 외부 RPC 포트를 사용한 multiaddr을 명시적으로 생성
+                    public_p2p_maddr = f"/ip4/{args.public_ip}/tcp/{public_rpc_port}/p2p/{p2p.peer_id}"
                     logger.warning(
                         f"Stage{args.stage} P2P visible maddrs do not contain public IP {args.public_ip}. "
                         f"Use this multiaddr: {public_p2p_maddr}"
@@ -330,8 +335,8 @@ def run_stage_server(args, device, splits):
             if p2p_maddrs:
                 logger.info(f"Stage{args.stage} P2P listen maddrs: {p2p_maddrs}")
             else:
-                # Fallback to announced addr using rpc_port (공인 IP 사용)
-                p2p_maddrs = [f"/ip4/{announce_ip}/tcp/{args.rpc_port}/p2p/{p2p.peer_id}"]
+                # Fallback to announced addr using rpc_port (공인 IP와 외부 포트 사용)
+                p2p_maddrs = [f"/ip4/{announce_ip}/tcp/{public_rpc_port}/p2p/{p2p.peer_id}"]
                 logger.warning(f"Stage{args.stage} P2P listen maddrs unknown; using fallback {p2p_maddrs}")
 
             peer_info = {
@@ -383,6 +388,10 @@ def main():
                        help='Comma-separated list of initial DHT peers (e.g., full multiaddrs /ip4/host/tcp/port/p2p/PeerID)')
     parser.add_argument("--public_ip", type=str, default="",
                        help="Public IP address for DHT announcement (required for cross-instance connections)")
+    parser.add_argument("--public_dht_port", type=int, default=None,
+                       help="Public DHT port (for port forwarding scenarios like RunPod). If not provided, uses --dht_port")
+    parser.add_argument("--public_rpc_port", type=int, default=None,
+                       help="Public RPC port (for port forwarding scenarios like RunPod). If not provided, uses --rpc_port")
     parser.add_argument("--dht_port", type=int, default=8000)
     parser.add_argument("--rpc_port", type=int, default=8001)
     parser.add_argument('--stage', type=int, required=True, choices=[0, 1, 2, 3],

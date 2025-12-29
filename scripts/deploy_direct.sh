@@ -10,8 +10,10 @@ DHT_INITIAL_PEERS=${4:-""}
 PUBLIC_IP=${5:-""}
 DHT_PORT=${6:-$((8000 + ($STAGE - 1) * 2))}
 RPC_PORT=${7:-$((8001 + ($STAGE - 1) * 2))}
-PROMPT=${8:-"Hello, how are you?"}
-MAX_TOKENS=${9:-32}
+PUBLIC_DHT_PORT=${8:-""}  # 외부 DHT 포트 (포트 포워딩용, 예: RunPod)
+PUBLIC_RPC_PORT=${9:-""}   # 외부 RPC 포트 (포트 포워딩용, 예: RunPod)
+PROMPT=${10:-"Hello, how are you?"}
+MAX_TOKENS=${11:-32}
 
 echo "=========================================="
 echo "Stage $STAGE 직접 실행 (Docker 없이)"
@@ -21,6 +23,12 @@ echo "Splits: $SPLITS"
 echo "DHT Port: $DHT_PORT"
 echo "RPC Port: $RPC_PORT"
 echo "Public IP: $PUBLIC_IP"
+if [ -n "$PUBLIC_DHT_PORT" ]; then
+    echo "Public DHT Port: $PUBLIC_DHT_PORT"
+fi
+if [ -n "$PUBLIC_RPC_PORT" ]; then
+    echo "Public RPC Port: $PUBLIC_RPC_PORT"
+fi
 echo "=========================================="
 
 # Python 가상환경 확인 및 생성 (선택사항)
@@ -64,6 +72,14 @@ CMD="python -m src.main \
 
 if [ -n "$PUBLIC_IP" ]; then
     CMD="$CMD --public_ip $PUBLIC_IP"
+fi
+
+if [ -n "$PUBLIC_DHT_PORT" ]; then
+    CMD="$CMD --public_dht_port $PUBLIC_DHT_PORT"
+fi
+
+if [ -n "$PUBLIC_RPC_PORT" ]; then
+    CMD="$CMD --public_rpc_port $PUBLIC_RPC_PORT"
 fi
 
 if [ $STAGE -eq 0 ]; then
