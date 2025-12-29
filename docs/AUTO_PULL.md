@@ -163,7 +163,7 @@ if [ -n "$4" ]; then
     sleep 2
     
     # Stage 재시작 (deploy_direct.sh 사용)
-    ./deploy_direct.sh 1 gpt2 "10,20,30" "" <PUBLIC_IP> 8000 8001
+    ./deploy_direct.sh 1 gpt2 "10,20,30" "" <PUBLIC_IP> 8002 8003
     # ... 다른 stage들도 재시작
 fi
 ```

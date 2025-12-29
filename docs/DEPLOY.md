@@ -3,7 +3,7 @@
 ## 전제 조건
 - 4개의 GPU 인스턴스 (각각 다른 서버/클라우드)
 - 각 인스턴스의 공인 IP 주소 확인
-- 방화벽에서 DHT/RPC 포트 오픈 (기본: 8000-8007)
+- 방화벽에서 DHT/RPC 포트 오픈 (기본: 8002-8009)
 
 **배포 방법 선택:**
 - **방법 1 (Docker)**: Docker 및 nvidia-docker 설치 필요
@@ -31,34 +31,34 @@ cd my-petals
 
 ```bash
 chmod +x deploy.sh
-./deploy.sh 1 gpt2 "10,20,30" "" <PUBLIC_IP_1> 8000 8001
+./deploy.sh 1 gpt2 "10,20,30" "" <PUBLIC_IP_1> 8002 8003
 
 # DHT multiaddr 확인 (로그에서 추출)
 docker logs mini-petals-stage1 | grep "DHT visible multiaddrs"
-# 출력 예: INFO:__main__:DHT visible multiaddrs (use for --dht_initial_peers): [<Multiaddr /ip4/1.2.3.4/tcp/8000/p2p/12D3KooW...>]
+# 출력 예: INFO:__main__:DHT visible multiaddrs (use for --dht_initial_peers): [<Multiaddr /ip4/1.2.3.4/tcp/8002/p2p/12D3KooW...>]
 ```
 
-**중요**: Stage1의 DHT multiaddr을 복사하세요. 형식: `/ip4/<PUBLIC_IP_1>/tcp/8000/p2p/<PEER_ID>`
+**중요**: Stage1의 DHT multiaddr을 복사하세요. 형식: `/ip4/<PUBLIC_IP_1>/tcp/8002/p2p/<PEER_ID>`
 
 ### 3. Stage2 배포
 **인스턴스 2**에서 실행:
 
 ```bash
-./deploy.sh 2 gpt2 "10,20,30" "/ip4/<PUBLIC_IP_1>/tcp/8000/p2p/<PEER_ID>" <PUBLIC_IP_2> 8002 8003
+./deploy.sh 2 gpt2 "10,20,30" "/ip4/<PUBLIC_IP_1>/tcp/8002/p2p/<PEER_ID>" <PUBLIC_IP_2> 8004 8005
 ```
 
 ### 4. Stage3 배포
 **인스턴스 3**에서 실행:
 
 ```bash
-./deploy.sh 3 gpt2 "10,20,30" "/ip4/<PUBLIC_IP_1>/tcp/8000/p2p/<PEER_ID>" <PUBLIC_IP_3> 8004 8005
+./deploy.sh 3 gpt2 "10,20,30" "/ip4/<PUBLIC_IP_1>/tcp/8002/p2p/<PEER_ID>" <PUBLIC_IP_3> 8006 8007
 ```
 
 ### 5. Stage0 배포 (클라이언트)
 **인스턴스 4**에서 실행:
 
 ```bash
-./deploy.sh 0 gpt2 "10,20,30" "/ip4/<PUBLIC_IP_1>/tcp/8000/p2p/<PEER_ID>" <PUBLIC_IP_4> 8006 8007 "Hello, how are you?" 32
+./deploy.sh 0 gpt2 "10,20,30" "/ip4/<PUBLIC_IP_1>/tcp/8002/p2p/<PEER_ID>" <PUBLIC_IP_4> 8008 8009 "Hello, how are you?" 32
 ```
 
 ### 로그 확인 (Docker)
@@ -93,34 +93,34 @@ cd my-petals
 
 ```bash
 chmod +x deploy_direct.sh
-./deploy_direct.sh 1 gpt2 "10,20,30" "" <PUBLIC_IP_1> 8000 8001
+./deploy_direct.sh 1 gpt2 "10,20,30" "" <PUBLIC_IP_1> 8002 8003
 
 # DHT multiaddr 확인 (로그에서 추출)
 tail -f stage1.log | grep "DHT visible multiaddrs"
-# 출력 예: INFO:__main__:DHT visible multiaddrs (use for --dht_initial_peers): [<Multiaddr /ip4/1.2.3.4/tcp/8000/p2p/12D3KooW...>]
+# 출력 예: INFO:__main__:DHT visible multiaddrs (use for --dht_initial_peers): [<Multiaddr /ip4/1.2.3.4/tcp/8002/p2p/12D3KooW...>]
 ```
 
-**중요**: Stage1의 DHT multiaddr을 복사하세요. 형식: `/ip4/<PUBLIC_IP_1>/tcp/8000/p2p/<PEER_ID>`
+**중요**: Stage1의 DHT multiaddr을 복사하세요. 형식: `/ip4/<PUBLIC_IP_1>/tcp/8002/p2p/<PEER_ID>`
 
 ### 3. Stage2 배포
 **인스턴스 2**에서 실행:
 
 ```bash
-./deploy_direct.sh 2 gpt2 "10,20,30" "/ip4/<PUBLIC_IP_1>/tcp/8000/p2p/<PEER_ID>" <PUBLIC_IP_2> 8002 8003
+./deploy_direct.sh 2 gpt2 "10,20,30" "/ip4/<PUBLIC_IP_1>/tcp/8002/p2p/<PEER_ID>" <PUBLIC_IP_2> 8004 8005
 ```
 
 ### 4. Stage3 배포
 **인스턴스 3**에서 실행:
 
 ```bash
-./deploy_direct.sh 3 gpt2 "10,20,30" "/ip4/<PUBLIC_IP_1>/tcp/8000/p2p/<PEER_ID>" <PUBLIC_IP_3> 8004 8005
+./deploy_direct.sh 3 gpt2 "10,20,30" "/ip4/<PUBLIC_IP_1>/tcp/8002/p2p/<PEER_ID>" <PUBLIC_IP_3> 8006 8007
 ```
 
 ### 5. Stage0 배포 (클라이언트)
 **인스턴스 4**에서 실행:
 
 ```bash
-./deploy_direct.sh 0 gpt2 "10,20,30" "/ip4/<PUBLIC_IP_1>/tcp/8000/p2p/<PEER_ID>" <PUBLIC_IP_4> 8006 8007 "Hello, how are you?" 32
+./deploy_direct.sh 0 gpt2 "10,20,30" "/ip4/<PUBLIC_IP_1>/tcp/8002/p2p/<PEER_ID>" <PUBLIC_IP_4> 8008 8009 "Hello, how are you?" 32
 ```
 
 ### 로그 확인 (직접 실행)
@@ -150,10 +150,10 @@ kill <PID>
 
 ### 포트가 열려있지 않은 경우
 각 인스턴스의 방화벽에서 포트 오픈:
-- Stage1: 8000 (DHT), 8001 (RPC)
-- Stage2: 8002 (DHT), 8003 (RPC)
-- Stage3: 8004 (DHT), 8005 (RPC)
-- Stage0: 8006 (DHT), 8007 (RPC)
+- Stage1: 8002 (DHT), 8003 (RPC)
+- Stage2: 8004 (DHT), 8005 (RPC)
+- Stage3: 8006 (DHT), 8007 (RPC)
+- Stage0: 8008 (DHT), 8009 (RPC)
 
 ### 공인 IP 확인
 ```bash
@@ -183,19 +183,19 @@ docker rm mini-petals-stage<N>
 ```
 
 **예시:**
-- Stage1: `./deploy.sh 1 gpt2 "10,20,30" "" 1.2.3.4 8000 8001`
-- Stage2: `./deploy.sh 2 gpt2 "10,20,30" "/ip4/1.2.3.4/tcp/8000/p2p/12D3KooW..." 5.6.7.8 8002 8003`
-- Stage0: `./deploy.sh 0 gpt2 "10,20,30" "/ip4/1.2.3.4/tcp/8000/p2p/12D3KooW..." 9.10.11.12 8006 8007 "Hello" 32`
+- Stage1: `./deploy.sh 1 gpt2 "10,20,30" "" 1.2.3.4 8002 8003`
+- Stage2: `./deploy.sh 2 gpt2 "10,20,30" "/ip4/1.2.3.4/tcp/8002/p2p/12D3KooW..." 5.6.7.8 8004 8005`
+- Stage0: `./deploy.sh 0 gpt2 "10,20,30" "/ip4/1.2.3.4/tcp/8002/p2p/12D3KooW..." 9.10.11.12 8008 8009 "Hello" 32`
 
 ### deploy_direct.sh 사용법 (직접 실행)
 ```bash
-./deploy_direct.sh <STAGE> <MODEL> <SPLITS> <DHT_INITIAL_PEERS> <PUBLIC_IP> <DHT_PORT> <RPC_PORT> [PROMPT] [MAX_TOKENS]
+./deploy_direct.sh <STAGE> <MODEL> <SPLITS> <DHT_INITIAL_PEERS> <PUBLIC_IP> <DHT_PORT> <RPC_PORT> [PUBLIC_DHT_PORT] [PUBLIC_RPC_PORT] [PROMPT] [MAX_TOKENS]
 ```
 
 **예시:**
-- Stage1: `./deploy_direct.sh 1 gpt2 "10,20,30" "" 1.2.3.4 8000 8001`
-- Stage2: `./deploy_direct.sh 2 gpt2 "10,20,30" "/ip4/1.2.3.4/tcp/8000/p2p/12D3KooW..." 5.6.7.8 8002 8003`
-- Stage0: `./deploy_direct.sh 0 gpt2 "10,20,30" "/ip4/1.2.3.4/tcp/8000/p2p/12D3KooW..." 9.10.11.12 8006 8007 "Hello" 32`
+- Stage1: `./deploy_direct.sh 1 gpt2 "10,20,30" "" 1.2.3.4 8002 8003`
+- Stage2: `./deploy_direct.sh 2 gpt2 "10,20,30" "/ip4/1.2.3.4/tcp/8002/p2p/12D3KooW..." 5.6.7.8 8004 8005`
+- Stage0: `./deploy_direct.sh 0 gpt2 "10,20,30" "/ip4/1.2.3.4/tcp/8002/p2p/12D3KooW..." 9.10.11.12 8008 8009 "Hello" 32`
 
 ### DHT Multiaddr 추출
 

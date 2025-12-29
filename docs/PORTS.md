@@ -8,48 +8,48 @@
 
 | Stage | DHT 포트 | RPC 포트 | 용도 |
 |-------|----------|----------|------|
-| Stage1 | 8000 | 8001 | DHT 부트스트랩, Stage1 서버 |
-| Stage2 | 8002 | 8003 | Stage2 서버 |
-| Stage3 | 8004 | 8005 | Stage3 서버 (최종) |
-| Stage0 | 8006 | 8007 | 클라이언트 |
+| Stage1 | 8002 | 8003 | DHT 부트스트랩, Stage1 서버 |
+| Stage2 | 8004 | 8005 | Stage2 서버 |
+| Stage3 | 8006 | 8007 | Stage3 서버 (최종) |
+| Stage0 | 8008 | 8009 | 클라이언트 |
 
 ## 인스턴스별 포트 설정
 
 ### 인스턴스 1 (Stage1)
 **열어야 할 포트:**
-- **8000/TCP** (DHT) - 필수
-- **8001/TCP** (RPC) - 필수
-
-**설명:**
-- DHT 포트(8000): 다른 Stage들이 DHT 네트워크에 연결하기 위해 필요
-- RPC 포트(8001): Stage0에서 Stage1로 RPC 요청을 보내기 위해 필요
-
-### 인스턴스 2 (Stage2)
-**열어야 할 포트:**
 - **8002/TCP** (DHT) - 필수
 - **8003/TCP** (RPC) - 필수
 
 **설명:**
-- DHT 포트(8002): DHT 네트워크 참여용
-- RPC 포트(8003): Stage1에서 Stage2로 RPC 요청을 보내기 위해 필요
+- DHT 포트(8002): 다른 Stage들이 DHT 네트워크에 연결하기 위해 필요
+- RPC 포트(8003): Stage0에서 Stage1로 RPC 요청을 보내기 위해 필요
 
-### 인스턴스 3 (Stage3)
+### 인스턴스 2 (Stage2)
 **열어야 할 포트:**
 - **8004/TCP** (DHT) - 필수
 - **8005/TCP** (RPC) - 필수
 
 **설명:**
 - DHT 포트(8004): DHT 네트워크 참여용
-- RPC 포트(8005): Stage2에서 Stage3로 RPC 요청을 보내기 위해 필요
+- RPC 포트(8005): Stage1에서 Stage2로 RPC 요청을 보내기 위해 필요
 
-### 인스턴스 4 (Stage0)
+### 인스턴스 3 (Stage3)
 **열어야 할 포트:**
 - **8006/TCP** (DHT) - 필수
 - **8007/TCP** (RPC) - 필수
 
 **설명:**
 - DHT 포트(8006): DHT 네트워크 참여용
-- RPC 포트(8007): Stage3에서 Stage0로 토큰을 반환하기 위해 필요
+- RPC 포트(8007): Stage2에서 Stage3로 RPC 요청을 보내기 위해 필요
+
+### 인스턴스 4 (Stage0)
+**열어야 할 포트:**
+- **8008/TCP** (DHT) - 필수
+- **8009/TCP** (RPC) - 필수
+
+**설명:**
+- DHT 포트(8008): DHT 네트워크 참여용
+- RPC 포트(8009): Stage3에서 Stage0로 토큰을 반환하기 위해 필요
 
 ## 방화벽 설정 방법
 
@@ -87,20 +87,20 @@ gcloud compute firewall-rules create allow-stage1-rpc \
 ### Ubuntu/Debian (UFW)
 ```bash
 # Stage1 인스턴스에서
-sudo ufw allow 8000/tcp comment "DHT Port"
-sudo ufw allow 8001/tcp comment "RPC Port"
-
-# Stage2 인스턴스에서
 sudo ufw allow 8002/tcp comment "DHT Port"
 sudo ufw allow 8003/tcp comment "RPC Port"
 
-# Stage3 인스턴스에서
+# Stage2 인스턴스에서
 sudo ufw allow 8004/tcp comment "DHT Port"
 sudo ufw allow 8005/tcp comment "RPC Port"
 
-# Stage0 인스턴스에서
+# Stage3 인스턴스에서
 sudo ufw allow 8006/tcp comment "DHT Port"
 sudo ufw allow 8007/tcp comment "RPC Port"
+
+# Stage0 인스턴스에서
+sudo ufw allow 8008/tcp comment "DHT Port"
+sudo ufw allow 8009/tcp comment "RPC Port"
 
 # 방화벽 활성화
 sudo ufw enable
@@ -110,23 +110,23 @@ sudo ufw status
 ### CentOS/RHEL (firewalld)
 ```bash
 # Stage1 인스턴스에서
-sudo firewall-cmd --permanent --add-port=8000/tcp
-sudo firewall-cmd --permanent --add-port=8001/tcp
-sudo firewall-cmd --reload
-
-# Stage2 인스턴스에서
 sudo firewall-cmd --permanent --add-port=8002/tcp
 sudo firewall-cmd --permanent --add-port=8003/tcp
 sudo firewall-cmd --reload
 
-# Stage3 인스턴스에서
+# Stage2 인스턴스에서
 sudo firewall-cmd --permanent --add-port=8004/tcp
 sudo firewall-cmd --permanent --add-port=8005/tcp
 sudo firewall-cmd --reload
 
-# Stage0 인스턴스에서
+# Stage3 인스턴스에서
 sudo firewall-cmd --permanent --add-port=8006/tcp
 sudo firewall-cmd --permanent --add-port=8007/tcp
+sudo firewall-cmd --reload
+
+# Stage0 인스턴스에서
+sudo firewall-cmd --permanent --add-port=8008/tcp
+sudo firewall-cmd --permanent --add-port=8009/tcp
 sudo firewall-cmd --reload
 ```
 
@@ -188,7 +188,7 @@ SSH 접근은 별도의 Security Group 규칙으로 관리하세요.
 ### 모든 포트 한 번에 열기 (테스트용)
 ```bash
 # UFW 사용 시
-for port in 8000 8001 8002 8003 8004 8005 8006 8007; do
+for port in 8002 8003 8004 8005 8006 8007 8008 8009; do
     sudo ufw allow $port/tcp
 done
 sudo ufw enable
@@ -199,7 +199,7 @@ sudo ufw enable
 #!/bin/bash
 # check_ports.sh
 PUBLIC_IP=$1
-PORTS=(8000 8001 8002 8003 8004 8005 8006 8007)
+PORTS=(8002 8003 8004 8005 8006 8007 8008 8009)
 
 for port in "${PORTS[@]}"; do
     if nc -zv -w 2 $PUBLIC_IP $port 2>&1 | grep -q "succeeded"; then
