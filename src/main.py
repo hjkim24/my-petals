@@ -235,12 +235,16 @@ def run_stage_server(args, device, splits):
     dht_peers = args.dht_initial_peers.split(",") if args.dht_initial_peers else []
     initial_peers_list = _format_initial_peers(args.dht_initial_peers)
     local_ip = _get_local_ip()
+    
+    # 공인 IP가 제공되면 announce_maddrs에 사용, 없으면 local_ip 사용
+    announce_ip = args.public_ip if args.public_ip else local_ip
 
     # Initialize DHT Network
     dht = DHT(
         start=True,
         initial_peers=initial_peers_list if initial_peers_list else None,
         host_maddrs=[f"/ip4/{local_ip}/tcp/{args.dht_port}"],
+        announce_maddrs=[f"/ip4/{announce_ip}/tcp/{args.dht_port}"] if announce_ip != local_ip else None,
     )
 
     # 초기화된 DHT 네트워크의 multiaddr 리스트 반환
@@ -249,7 +253,9 @@ def run_stage_server(args, device, splits):
     if visible:
         logger.info(f"DHT visible multiaddrs (use for --dht_initial_peers): {visible}")
     else:
-        fallback = [f"/ip4/{local_ip}/tcp/{args.dht_port}/p2p/{peer_id}"]
+        # 공인 IP가 있으면 그것을 사용, 없으면 local_ip 사용
+        fallback_ip = announce_ip
+        fallback = [f"/ip4/{fallback_ip}/tcp/{args.dht_port}/p2p/{peer_id}"]
         logger.info(
             f"DHT visible multiaddrs not available; try fallback: {fallback}"
         )
@@ -280,8 +286,8 @@ def run_stage_server(args, device, splits):
             if p2p_maddrs:
                 logger.info(f"Stage{args.stage} P2P listen maddrs: {p2p_maddrs}")
             else:
-                # Fallback to announced addr using rpc_port
-                p2p_maddrs = [f"/ip4/{local_ip}/tcp/{args.rpc_port}/p2p/{p2p.peer_id}"]
+                # Fallback to announced addr using rpc_port (공인 IP 사용)
+                p2p_maddrs = [f"/ip4/{announce_ip}/tcp/{args.rpc_port}/p2p/{p2p.peer_id}"]
                 logger.warning(f"Stage{args.stage} P2P listen maddrs unknown; using fallback {p2p_maddrs}")
 
             peer_info = {
@@ -331,6 +337,8 @@ def main():
                        help="Input prompt for text generation")
     parser.add_argument("--dht_initial_peers", type=str, default="",
                        help='Comma-separated list of initial DHT peers (e.g., full multiaddrs /ip4/host/tcp/port/p2p/PeerID)')
+    parser.add_argument("--public_ip", type=str, default="",
+                       help="Public IP address for DHT announcement (required for cross-instance connections)")
     parser.add_argument("--dht_port", type=int, default=8000)
     parser.add_argument("--rpc_port", type=int, default=8001)
     parser.add_argument('--stage', type=int, required=True, choices=[0, 1, 2, 3],

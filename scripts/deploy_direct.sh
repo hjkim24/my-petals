@@ -58,6 +58,10 @@ CMD="python -m src.main \
     --rpc_port $RPC_PORT \
     --dht_initial_peers \"$DHT_INITIAL_PEERS\""
 
+if [ -n "$PUBLIC_IP" ]; then
+    CMD="$CMD --public_ip $PUBLIC_IP"
+fi
+
 if [ $STAGE -eq 0 ]; then
     CMD="$CMD --prompt \"$PROMPT\" --max_new_tokens $MAX_TOKENS"
 fi
