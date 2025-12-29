@@ -317,7 +317,7 @@ class RpcTransport:
         # _last_token에 토큰 저장
         self._last_token = self._run_async(_send())
 
-    def send_decode_step(self, cur_len: int, hidden: torch.Tensor, session_id: str, max_length: int):
+    def send_decode_step(self, cur_len: int, hidden: torch.Tensor, session_id: str, max_length: int, generated_tokens: Optional[List[int]] = None):
         """Send decode step hidden states through all remote stages."""
         if self.stage != 0:
             raise RuntimeError("send_decode_step should only be called by stage0")
@@ -332,6 +332,7 @@ class RpcTransport:
                     "cur_len": cur_len,
                     "is_prefill": False,
                     "max_length": max_length,
+                    "generated_tokens": (generated_tokens[-50:] if generated_tokens else []),  # 최근 50개 전달 (반복 체크 범위 확대)
                     **self.sampling,
                 }
             )

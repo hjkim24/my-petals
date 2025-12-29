@@ -3,7 +3,7 @@ RPC handler for Stage1 server using hivemind ConnectionHandler.
 """
 import asyncio
 from contextlib import asynccontextmanager
-from typing import AsyncIterator, Dict, Optional
+from typing import AsyncIterator, Dict, List, Optional
 
 import torch
 from hivemind import DHT, MSGPackSerializer, P2PContext, deserialize_torch_tensor, serialize_torch_tensor
@@ -37,7 +37,13 @@ from hivemind.moe.server.connection_handler import ConnectionHandler
 from hivemind.proto import runtime_pb2
 from hivemind.utils.logging import get_logger
 
-from partition import StageSegment, StageLast
+try:
+    from .partition import StageSegment, StageLast
+except ImportError:
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).parent.parent))
+    from src.partition import StageSegment, StageLast
 
 logger = get_logger(__name__)
 
@@ -84,7 +90,11 @@ class StageConnectionHandler(ConnectionHandler):
         if first is None:
             return max(cur_len - chunk_len, 0)
         if isinstance(first, (tuple, list)) and len(first) > 0 and first[0] is not None:
-            return first[0].shape[-2]
+            # KV cache의 실제 sequence length 반환
+            kv_seq_len = first[0].shape[-2]
+            # KV cache 길이가 예상과 다를 수 있으므로, 더 안전한 방법 사용
+            # decode 단계에서는 항상 1개 토큰씩 처리하므로, past_len은 kv_seq_len과 같아야 함
+            return kv_seq_len
         return max(cur_len - chunk_len, 0)
 
     def _build_masks(
@@ -93,10 +103,14 @@ class StageConnectionHandler(ConnectionHandler):
         """Create attention mask and position ids for prefill/decode."""
         if is_prefill:
             attn_mask = None  # causal mask internal to GPT-style blocks
+            # Prefill: 전체 시퀀스의 position IDs [0, 1, 2, ..., seq_len-1]
             pos_ids = torch.arange(seq_len, device=self.device, dtype=torch.long).unsqueeze(0)
         else:
             attn_mask = None
-            pos_ids = torch.arange(past_len, past_len + hidden_states.shape[1], device=self.device, dtype=torch.long).unsqueeze(0)
+            # Decode: 새 토큰의 position ID는 past_len부터 시작
+            # hidden_states.shape[1]은 항상 1 (decode 단계에서는 1개 토큰씩 처리)
+            new_token_pos = past_len
+            pos_ids = torch.tensor([[new_token_pos]], device=self.device, dtype=torch.long)
         return attn_mask, pos_ids
 
     def _run_forward(
@@ -113,6 +127,8 @@ class StageConnectionHandler(ConnectionHandler):
         temperature = float(metadata.get("temperature", self._default_temperature))
         top_p = float(metadata.get("top_p", self._default_top_p))
         top_k = int(metadata.get("top_k", self._default_top_k))
+        repetition_penalty = float(metadata.get("repetition_penalty", 1.5))  # 기본값 증가
+        generated_tokens = metadata.get("generated_tokens", [])
 
         if is_prefill:
             past_key_values = None
@@ -122,8 +138,26 @@ class StageConnectionHandler(ConnectionHandler):
             if past_key_values is None:
                 raise ValueError(f"Missing past_key_values for session_id={session_id}")
             past_len = self._past_len(past_key_values, cur_len, hidden_states.shape[1])
+            # 디버깅: past_len이 올바른지 확인 (INFO 레벨로 변경하여 항상 출력)
+            expected_past_len = cur_len - hidden_states.shape[1]
+            if past_len != expected_past_len:
+                logger.warning(
+                    f"[{session_id[:8]}] Past len mismatch: past_len={past_len}, cur_len={cur_len}, "
+                    f"hidden_shape={hidden_states.shape[1]}, expected={expected_past_len}"
+                )
+            else:
+                logger.info(
+                    f"[{session_id[:8]}] Decode step: past_len={past_len}, cur_len={cur_len}, "
+                    f"hidden_shape={hidden_states.shape}"
+                )
 
         attn_mask, pos_ids = self._build_masks(seq_len, cur_len, is_prefill, hidden_states, past_len)
+        
+        # 디버깅: position IDs 확인 (INFO 레벨로 변경)
+        if not is_prefill:
+            logger.info(
+                f"[{session_id[:8]}] Position IDs: {pos_ids.tolist()}, past_len={past_len}"
+            )
 
         with torch.inference_mode():
             outputs, new_past = self.stage_model(
@@ -138,7 +172,25 @@ class StageConnectionHandler(ConnectionHandler):
 
         if self.final_stage:
             logits = outputs
-            next_token_id = int(self._sample_token(logits[:, -1, :], temperature, top_p, top_k))
+            # 마지막 토큰의 logits만 사용
+            # logits shape: [batch, seq_len, vocab_size] 또는 [batch, vocab_size]
+            if logits.dim() == 3:
+                # [batch, seq_len, vocab_size] -> [batch, vocab_size] (마지막 토큰)
+                next_token_logits = logits[:, -1, :]
+            elif logits.dim() == 2:
+                # 이미 [batch, vocab_size] 형태
+                next_token_logits = logits
+            else:
+                raise ValueError(f"Unexpected logits shape: {logits.shape}")
+            next_token_id = int(self._sample_token(
+                next_token_logits, 
+                temperature, 
+                top_p, 
+                top_k,
+                repetition_penalty=repetition_penalty,
+                generated_tokens=generated_tokens
+            ))
+            logger.info(f"[{session_id[:8]}] Sampled token: {next_token_id}, logits shape: {next_token_logits.shape}")
             response_metadata = {"token_id": next_token_id, "session_id": session_id}
             token_tensor = torch.tensor([[next_token_id]], device=self.device, dtype=torch.long)
             serialized_token = serialize_torch_tensor(token_tensor.cpu())
@@ -148,6 +200,8 @@ class StageConnectionHandler(ConnectionHandler):
             )
         else:
             hidden_out = outputs
+            # 디버깅: hidden states shape 확인 (INFO 레벨로 변경)
+            logger.info(f"[{session_id[:8]}] Stage output: {hidden_out.shape}, input: {hidden_states.shape}")
             serialized_hidden = serialize_torch_tensor(hidden_out.cpu())
             response_metadata = {"session_id": session_id}
             return runtime_pb2.ExpertResponse(
@@ -155,9 +209,43 @@ class StageConnectionHandler(ConnectionHandler):
                 metadata=MSGPackSerializer.dumps(response_metadata),
             )
 
-    def _sample_token(self, logits: torch.Tensor, temperature: float, top_p: float, top_k: int) -> int:
-        """Apply temperature / nucleus / top-k sampling to reduce repetition."""
+    def _sample_token(self, logits: torch.Tensor, temperature: float, top_p: float, top_k: int, 
+                      repetition_penalty: float = 1.2, generated_tokens: Optional[List[int]] = None) -> int:
+        """Apply temperature / nucleus / top-k sampling with repetition penalty."""
         temp = max(temperature, 1e-5)
+        
+        # Repetition penalty 적용 - 더 강하게
+        if repetition_penalty != 1.0 and generated_tokens:
+            # 최근 50개 토큰 체크 (범위 확대)
+            recent_tokens = generated_tokens[-50:] if len(generated_tokens) > 50 else generated_tokens
+            
+            # 각 토큰의 반복 횟수에 따라 패널티 적용
+            token_counts = {}
+            for token_id in recent_tokens:
+                token_counts[token_id] = token_counts.get(token_id, 0) + 1
+            
+            for token_id, count in token_counts.items():
+                if token_id < logits.shape[-1]:
+                    # 반복 횟수에 따라 패널티 증가
+                    penalty = repetition_penalty ** count
+                    if logits[0, token_id] > 0:
+                        logits[0, token_id] /= penalty
+                    else:
+                        logits[0, token_id] *= penalty
+            
+            # 연속 반복 방지 (최근 3개 토큰이 모두 같으면 강한 패널티)
+            if len(generated_tokens) >= 3:
+                last_three = generated_tokens[-3:]
+                if len(set(last_three)) == 1:  # 모두 같은 토큰
+                    repeated_token = last_three[0]
+                    if repeated_token < logits.shape[-1]:
+                        # 매우 강한 패널티
+                        strong_penalty = repetition_penalty ** 3
+                        if logits[0, repeated_token] > 0:
+                            logits[0, repeated_token] /= strong_penalty
+                        else:
+                            logits[0, repeated_token] *= strong_penalty
+        
         probs = torch.softmax(logits / temp, dim=-1)
 
         if top_k > 0 and top_k < probs.size(-1):

@@ -33,27 +33,18 @@ ENV/
 *.swo
 *~
 
+# Logs
+*.log
+stage*.log
+auto_pull.log
+
 # OS
 .DS_Store
 Thumbs.db
 
-# Environment variables
-.env
-.env.local
+# Docker
+.dockerignore
 
-# Logs
-*.log
-
-# Jupyter Notebook
-.ipynb_checkpoints
-
-# pytest
-.pytest_cache/
-.coverage
-htmlcov/
-
-# mypy
-.mypy_cache/
-.dmypy.json
-dmypy.json
-
+# Model cache (optional)
+.cache/
+models/

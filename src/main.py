@@ -10,9 +10,22 @@ import logging
 from hivemind import DHT, get_dht_time
 from hivemind.p2p import P2P
 from hivemind.utils.logging import get_logger
-from partition import load_stage_model, Stage0, StageSegment, StageLast
-from rpc_transport import RpcTransport
-from rpc_handler import StageConnectionHandler
+
+# Import 경로 처리: 패키지로 실행되거나 직접 실행될 때 모두 지원
+try:
+    # 패키지로 실행될 때 (python -m src.main)
+    from .partition import load_stage_model, Stage0, StageSegment, StageLast
+    from .rpc_transport import RpcTransport
+    from .rpc_handler import StageConnectionHandler
+except ImportError:
+    # 직접 실행될 때 (python src/main.py)
+    import sys
+    from pathlib import Path
+    project_root = Path(__file__).parent.parent
+    sys.path.insert(0, str(project_root))
+    from src.partition import load_stage_model, Stage0, StageSegment, StageLast
+    from src.rpc_transport import RpcTransport
+    from src.rpc_handler import StageConnectionHandler
 
 logger = get_logger(__name__)
 # Ensure logs are emitted when running from terminal
@@ -27,39 +40,26 @@ def build_masks(seq_len: int, device, dtype=None):
     return attn, pos
 
 
-# dht_initial_peer에 대한 Multiaddr formatting(/p2p 이외의 주소의 경우 ValueError 처리)
-def _format_initial_peers(dht_initial_peers):
-    initial_peers_list = []
-    for peer in dht_initial_peers:
-        peer = peer.strip()
-        if not peer:
-            continue
-        if "/p2p/" in peer:
-            initial_peers_list.append(peer)
-        elif ":" in peer:
-            raise ValueError(
-                f"dht_initial_peers entry '{peer}' is missing '/p2p/<peer_id>'. "
-                "Use the full multiaddr printed by Stage1 (e.g., /ip4/127.0.0.1/tcp/8000/p2p/<peer_id>)."
-            )
-        else:
-            initial_peers_list.append(peer)
-    return initial_peers_list
+def parse_splits(splits_str: str):
+    """Parse comma-separated splits string into list of integers."""
+    return [int(x.strip()) for x in splits_str.split(",")]
 
-# arg로 받은 layer split parsing(str -> int)
-def parse_splits(s: str):
-    parts = [int(x) for x in s.split(",") if x.strip()]
-    if len(parts) != 3 or sorted(parts) != parts:
-        raise ValueError("splits must be three increasing integers, e.g., 10,20,30")
-    return parts
 
-# DHT를 통해 다른 네트워크에 존재하는 노드가 찾을 수 있도록 현재 노드의 IP 주소 저장
-def _get_local_ip():
+def _format_initial_peers(dht_initial_peers: str) -> list:
+    """Format DHT initial peers from comma-separated string."""
+    if not dht_initial_peers:
+        return []
+    peers = [p.strip() for p in dht_initial_peers.split(",") if p.strip()]
+    return peers
+
+
+def _get_local_ip() -> str:
+    """Get local IP address."""
+    import socket
     try:
-        import socket
-
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80)) # 외부로 연결 시도
-        ip = s.getsockname()[0] # 외부 연결에 실제로 사용된 인터페이스의 IP 주소를 반환
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
         s.close()
         return ip
     except Exception:
@@ -75,9 +75,12 @@ def run_rank0(args, device, splits):
     s0 = Stage0(full, splits[0]).to(device) # load to GPU
 
     # connect to DHT Network with initial(stage1) DHT peer address
-    dht_peers = args.dht_initial_peers.split(',') if args.dht_initial_peers else []
-    
-    # initialize RpcTransport for connection
+    dht_peers = _format_initial_peers(args.dht_initial_peers)
+
+    tok = AutoTokenizer.from_pretrained(args.model)
+    if tok.pad_token is None:
+        tok.pad_token = tok.eos_token
+
     tx = RpcTransport(
         device=device,
         stage=0,
@@ -91,11 +94,7 @@ def run_rank0(args, device, splits):
         stage_keys=[f"mini_petals:stage{i}" for i in range(1, 4)],
     )
 
-
-    # 2. Input Process (prompt -> token)
-    tok = AutoTokenizer.from_pretrained(args.model) # model에 맞는 tokenizer 로드
     prompt = args.prompt
-    # tokenized된 token을 GPU에 로드
     input_ids = tok(prompt, return_tensors="pt").input_ids.to(device)  # [1, L]
     L = input_ids.size(1)
 
@@ -105,73 +104,107 @@ def run_rank0(args, device, splits):
 
     past0 = None # 첫 호출이므로 KV Cache 없음
 
-    # forward pass
-    hidden, past0 = s0(input_ids, pos, attn, past0, use_cache=True) # nn.Module.__call__ method -> forward pass
+    # 2. Prefill: 입력 시퀀스 전체를 처리하고 첫 번째 토큰 생성
+    t_prefill_start = time.perf_counter()
+    hidden, past0 = s0(input_ids, pos, attn, past0, use_cache=True)  # [1, L, H]
 
-    # 3. Prefill (for initial input tokens)
     session_id = str(uuid4())
     max_length = L + args.max_new_tokens
 
-    t_prefill_start = time.perf_counter()
-    # send prefill hidden to rank1
-    tx.send_prefill(L, hidden, session_id=session_id, max_length=max_length)  # [1,L,H]
-
-    # load _last_token after prefill
+    tx.send_prefill(L, hidden, session_id=session_id, max_length=max_length)  # [1, L, H]
     next_id = tx.recv_token()
-    ttft = time.perf_counter() - t_prefill_start
     generated = [next_id]
+    t_prefill_end = time.perf_counter()
+    prefill_time = t_prefill_end - t_prefill_start
 
-    # metrics containers
-    decode_total_times = []
+    logger.info(f"Prefill completed in {prefill_time:.3f}s")
+    logger.info(f"Generated token: {next_id} ({tok.decode([next_id], skip_special_tokens=True)})")
 
-    # 4. Decoding (for newly generated token)
+    # 3. Decoding (for newly generated token)
     cur_len = L + 1
     t_decode_start = time.perf_counter()
+    eos_token_id = tok.eos_token_id if tok.eos_token_id is not None else tok.pad_token_id
+    
+    # 연속 반복 감지용
+    consecutive_repeat_count = 0
+    last_token = None
+    
+    # 성능 통계용
+    decode_total_times = []
+    
     for _ in range(args.max_new_tokens - 1): # Prefill에서 1개 토큰 생성했으므로 max - 1 생성
         new_input = torch.tensor([[next_id]], device=device, dtype=torch.long)
         # past cache 길이에 맞춰 attention mask/position_ids 생성
-        past_len = past0[0][0].shape[-2] if past0 and past0[0] is not None else cur_len - 1
+        if past0 and past0[0] is not None:
+            past_len = past0[0][0].shape[-2]
+        else:
+            past_len = cur_len - 1
+            logger.warning(f"Stage0: past0 is None or empty, using cur_len-1={past_len}")
+        
         attn = None
         pos = torch.tensor([[past_len]], device=device, dtype=torch.long)
+        logger.info(f"Stage0 decode step {cur_len-L}: past_len={past_len}, pos_ids={pos.tolist()}, input_token={next_id}")
         hidden, past0 = s0(new_input, pos, attn, past0, use_cache=True)  # [1,1,H]
+        
+        # past0 검증 및 로깅
+        if past0 is None:
+            logger.error(f"Stage0: past0 is None after forward pass! This should not happen.")
+            raise RuntimeError("Stage0 forward returned None for past_key_values")
+        elif past0[0] is None:
+            logger.error(f"Stage0: past0[0] is None! KV cache not properly returned.")
+            raise RuntimeError("Stage0 KV cache is None")
+        else:
+            new_past_len = past0[0][0].shape[-2] if past0[0][0] is not None else 'N/A'
+            logger.info(f"Stage0: hidden shape={hidden.shape}, new_past_len={new_past_len}, past0 type={type(past0)}, past0 len={len(past0) if past0 else 'N/A'}")
 
-        # send_prefill과 동일
-        tx.send_decode_step(cur_len, hidden, session_id=session_id, max_length=max_length)  # [1,1,H]
+        # send_prefill과 동일 (generated_tokens 전달)
+        tx.send_decode_step(cur_len, hidden, session_id=session_id, max_length=max_length, generated_tokens=generated)  # [1,1,H]
         next_id = tx.recv_token()
+        logger.info(f"Stage0: received token={next_id}")
 
+        # EOS 토큰 체크 - 생성 중단
+        if eos_token_id is not None and next_id == eos_token_id:
+            logger.info("EOS token generated, stopping generation")
+            break
+        
+        # 연속 반복 체크 (같은 토큰이 5번 연속 나오면 중단)
+        if next_id == last_token:
+            consecutive_repeat_count += 1
+            if consecutive_repeat_count >= 5:
+                logger.warning(f"Consecutive repetition detected (token {next_id}), stopping generation")
+                break
+        else:
+            consecutive_repeat_count = 0
+            last_token = next_id
 
         if tx.last_decode_total is not None:
             decode_total_times.append(tx.last_decode_total)
+
         generated.append(next_id)
         cur_len += 1
 
-    total_decode_time = time.perf_counter() - t_decode_start
-    total_dec_tokens = len(decode_total_times)
-    decode_tps = (total_dec_tokens / total_decode_time) if total_decode_time > 0 else 0.0
+    t_decode_end = time.perf_counter()
+    decode_time = t_decode_end - t_decode_start
+    total_time = t_decode_end - t_prefill_start
 
-    # 5. Result
-    text = tok.decode(generated, skip_special_tokens=True)
-    print("Generated:", text)
+    # 생성된 모든 토큰을 한 번에 디코딩하여 출력
+    generated_text = tok.decode(generated, skip_special_tokens=True)
+    print(f"\nGenerated: {generated_text}")
+    logger.info(f"\nDecode completed in {decode_time:.3f}s")
+    logger.info(f"Total time: {total_time:.3f}s")
+    logger.info(f"TTFT (Time to First Token): {prefill_time:.3f}s")
+    logger.info(f"Throughput: {len(generated) / total_time:.2f} tokens/s")
 
-    # Log simple timing summary
-    print("=== Timing Summary ===")
-    print(f"TTFT: {ttft*1000:.2f} ms")
-    if tx.last_prefill_stage_times:
-        prefill_stage_ms = ", ".join(f"{k}={v*1000:.2f} ms" for k, v in tx.last_prefill_stage_times)
-        print(f"Prefill stages: {prefill_stage_ms}")
-    if tx.last_prefill_total is not None:
-        print(f"Prefill total: {tx.last_prefill_total*1000:.2f} ms")
-    print(f"Decode tokens: {total_dec_tokens}, decode throughput: {decode_tps:.2f} tok/s")
-    if tx.decode_stage_history:
-        agg = {}
-        for stages in tx.decode_stage_history:
-            for k, v in stages:
-                agg.setdefault(k, []).append(v)
+    # 성능 통계 출력
+    if hasattr(tx, 'decode_stage_times') and tx.decode_stage_times:
         stage_lines = []
-        for k, vals in agg.items():
-            avg = sum(vals) / len(vals)
-            stage_lines.append(f"{k} avg={avg*1000:.2f} ms")
-        print("Decode stages (avg): " + ", ".join(stage_lines))
+        for stage_num in [1, 2, 3]:
+            stage_times = [t for t in tx.decode_stage_times if t.get('stage') == stage_num]
+            if stage_times:
+                avg_time = sum(t['time'] for t in stage_times) / len(stage_times)
+                stage_lines.append(f"Stage{stage_num}={avg_time*1000:.1f}ms")
+        if stage_lines:
+            logger.info("Decode stages (avg): " + ", ".join(stage_lines))
 
     
     # Cleanup
@@ -200,7 +233,7 @@ def run_stage_server(args, device, splits):
         raise ValueError("stage must be 1, 2, or 3 for server")
 
     dht_peers = args.dht_initial_peers.split(",") if args.dht_initial_peers else []
-    initial_peers_list = _format_initial_peers(dht_peers)
+    initial_peers_list = _format_initial_peers(args.dht_initial_peers)
     local_ip = _get_local_ip()
 
     # Initialize DHT Network
@@ -269,22 +302,25 @@ def run_stage_server(args, device, splits):
             await handler.add_p2p_handlers(p2p)
             logger.info(f"Stage{args.stage} handlers registered, waiting for requests...")
 
-            # 요청 들어올때까지 대기
+            # P2P 초기화 대기
+            await asyncio.sleep(0.5)
+
+            # 무한 대기 (요청 처리)
             await asyncio.Event().wait()
+        except KeyboardInterrupt:
+            logger.info(f"Stage{args.stage} shutting down...")
         finally:
-            handler.shutdown()
-            if p2p is not None:
+            if p2p:
                 try:
                     await p2p.shutdown()
                 except Exception as e:
                     logger.warning(f"Error shutting down P2P: {e}")
-            dht.shutdown()
 
     asyncio.run(setup_and_run())
 
 
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="Mini Petals: Distributed Inference")
     parser.add_argument("--model", type=str, required=True)
     parser.add_argument("--splits", type=str, required=True,
                        help="Comma-separated cut points for 4-stage pipeline, e.g., 10,20,30")
@@ -293,12 +329,10 @@ def main():
     parser.add_argument("--max_new_tokens", type=int, default=64)
     parser.add_argument("--prompt", type=str, default="Hello, how are you?",
                        help="Input prompt for text generation")
-    
-    # RPC-related arguments
-    parser.add_argument('--dht_initial_peers', type=str, default='', 
+    parser.add_argument("--dht_initial_peers", type=str, default="",
                        help='Comma-separated list of initial DHT peers (e.g., full multiaddrs /ip4/host/tcp/port/p2p/PeerID)')
-    parser.add_argument('--dht_port', type=int, default=8000, help='DHT port')
-    parser.add_argument('--rpc_port', type=int, default=8001, help='RPC port')
+    parser.add_argument("--dht_port", type=int, default=8000)
+    parser.add_argument("--rpc_port", type=int, default=8001)
     parser.add_argument('--stage', type=int, required=True, choices=[0, 1, 2, 3],
                        help='Stage number (0=client, 1/2 mid, 3 final server)')
     parser.add_argument('--request_timeout', type=float, default=30.0,
@@ -335,4 +369,3 @@ def main():
 if __name__ == "__main__":
     main()
 
-#atest
