@@ -62,32 +62,35 @@ echo "Stage $STAGE 실행 중..."
 # 프로젝트 루트로 이동
 cd "$(dirname "$0")/.." || exit 1
 
-CMD="python -m src.main \
-    --model $MODEL \
-    --splits $SPLITS \
-    --stage $STAGE \
-    --dht_port $DHT_PORT \
-    --rpc_port $RPC_PORT \
-    --dht_initial_peers \"$DHT_INITIAL_PEERS\""
+# 배열을 사용하여 명령어 구성 (따옴표/공백 문제 해결)
+CMD_ARGS=(
+    "python" "-m" "src.main"
+    "--model" "$MODEL"
+    "--splits" "$SPLITS"
+    "--stage" "$STAGE"
+    "--dht_port" "$DHT_PORT"
+    "--rpc_port" "$RPC_PORT"
+    "--dht_initial_peers" "$DHT_INITIAL_PEERS"
+)
 
 if [ -n "$PUBLIC_IP" ]; then
-    CMD="$CMD --public_ip $PUBLIC_IP"
+    CMD_ARGS+=("--public_ip" "$PUBLIC_IP")
 fi
 
 if [ -n "$PUBLIC_DHT_PORT" ]; then
-    CMD="$CMD --public_dht_port $PUBLIC_DHT_PORT"
+    CMD_ARGS+=("--public_dht_port" "$PUBLIC_DHT_PORT")
 fi
 
 if [ -n "$PUBLIC_RPC_PORT" ]; then
-    CMD="$CMD --public_rpc_port $PUBLIC_RPC_PORT"
+    CMD_ARGS+=("--public_rpc_port" "$PUBLIC_RPC_PORT")
 fi
 
 if [ $STAGE -eq 0 ]; then
-    CMD="$CMD --prompt \"$PROMPT\" --max_new_tokens $MAX_TOKENS"
+    CMD_ARGS+=("--prompt" "$PROMPT" "--max_new_tokens" "$MAX_TOKENS")
 fi
 
 # 백그라운드 실행 및 로그 저장
-nohup $CMD > stage${STAGE}.log 2>&1 &
+nohup "${CMD_ARGS[@]}" > stage${STAGE}.log 2>&1 &
 PID=$!
 
 echo "Stage $STAGE 실행됨 (PID: $PID)"
