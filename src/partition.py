@@ -139,7 +139,6 @@ class Stage0(nn.Module):
         else:
             raise ValueError(f"Unsupported model architecture: {type(full)}.")
         self.config = full.config
-        
         # GPT-2Block인 경우 래퍼 적용
         self.layers = nn.ModuleList()
         for layer in raw_layers:
@@ -152,6 +151,8 @@ class Stage0(nn.Module):
         self._supports_pos_ids = ['position_ids' in p for p in sig_params]
         self._supports_past_key_value = ['past_key_value' in p for p in sig_params]
         self._supports_layer_past = ['layer_past' in p for p in sig_params]
+        self._supports_position_embeddings = ['position_embeddings' in p for p in sig_params]
+        self._supports_cache_position = ['cache_position' in p for p in sig_params]
 
     def forward(self, input_ids, position_ids, attention_mask, past_key_values=None, use_cache=True):
         if self.is_gpt2:
@@ -178,6 +179,12 @@ class Stage0(nn.Module):
             kwargs = dict(attention_mask=attention_mask, use_cache=use_cache)
             if self._supports_pos_ids[i]:
                 kwargs['position_ids'] = position_ids
+            if self._supports_position_embeddings[i] and hasattr(layer, "self_attn") and hasattr(layer.self_attn, "rotary_emb"):
+                # Llama/Qwen RoPE: 사전에 cos/sin 계산
+                cos, sin = layer.self_attn.rotary_emb(x, position_ids)
+                kwargs['position_embeddings'] = (cos, sin)
+            if self._supports_cache_position[i] and position_ids is not None:
+                kwargs['cache_position'] = position_ids.view(-1)
             if self._supports_past_key_value[i]:
                 kwargs['past_key_value'] = pkv
             elif self._supports_layer_past[i]:
@@ -442,6 +449,8 @@ class StageSegment(nn.Module):
         self._supports_pos_ids = ['position_ids' in p for p in sig_params]
         self._supports_past_key_value = ['past_key_value' in p for p in sig_params]
         self._supports_layer_past = ['layer_past' in p for p in sig_params]
+        self._supports_position_embeddings = ['position_embeddings' in p for p in sig_params]
+        self._supports_cache_position = ['cache_position' in p for p in sig_params]
 
     def forward(self, hidden_states, position_ids, attention_mask, past_key_values=None, use_cache=True):
         x = hidden_states
@@ -451,6 +460,11 @@ class StageSegment(nn.Module):
             kwargs = dict(attention_mask=attention_mask, use_cache=use_cache)
             if self._supports_pos_ids[i]:
                 kwargs['position_ids'] = position_ids
+            if self._supports_position_embeddings[i] and hasattr(layer, "self_attn") and hasattr(layer.self_attn, "rotary_emb"):
+                cos, sin = layer.self_attn.rotary_emb(x, position_ids)
+                kwargs['position_embeddings'] = (cos, sin)
+            if self._supports_cache_position[i] and position_ids is not None:
+                kwargs['cache_position'] = position_ids.view(-1)
             if self._supports_past_key_value[i]:
                 kwargs['past_key_value'] = pkv
             elif self._supports_layer_past[i]:
@@ -492,6 +506,8 @@ class StageLast(nn.Module):
         self._supports_pos_ids = ['position_ids' in p for p in sig_params]
         self._supports_past_key_value = ['past_key_value' in p for p in sig_params]
         self._supports_layer_past = ['layer_past' in p for p in sig_params]
+        self._supports_position_embeddings = ['position_embeddings' in p for p in sig_params]
+        self._supports_cache_position = ['cache_position' in p for p in sig_params]
 
     def forward(self, hidden_states, position_ids, attention_mask, past_key_values=None, use_cache=True):
         x = hidden_states
@@ -501,6 +517,11 @@ class StageLast(nn.Module):
             kwargs = dict(attention_mask=attention_mask, use_cache=use_cache)
             if self._supports_pos_ids[i]:
                 kwargs['position_ids'] = position_ids
+            if self._supports_position_embeddings[i] and hasattr(layer, "self_attn") and hasattr(layer.self_attn, "rotary_emb"):
+                cos, sin = layer.self_attn.rotary_emb(x, position_ids)
+                kwargs['position_embeddings'] = (cos, sin)
+            if self._supports_cache_position[i] and position_ids is not None:
+                kwargs['cache_position'] = position_ids.view(-1)
             if self._supports_past_key_value[i]:
                 kwargs['past_key_value'] = pkv
             elif self._supports_layer_past[i]:
