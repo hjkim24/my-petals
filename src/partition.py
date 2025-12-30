@@ -201,7 +201,7 @@ class Stage0(nn.Module):
                 out = layer(x, **kwargs)
             except TypeError as e:
                 # 일부 모델이 position_embeddings/cache_position을 지원하지 않는 경우 제거 후 재시도
-                if "position_embeddings" in str(e):
+                if "position_embeddings" in kwargs:
                     kwargs.pop("position_embeddings", None)
                     kwargs.pop("cache_position", None)
                     out = layer(x, **kwargs)
@@ -481,7 +481,7 @@ class StageSegment(nn.Module):
             try:
                 out = layer(x, **kwargs)
             except TypeError as e:
-                if "position_embeddings" in str(e):
+                if "position_embeddings" in kwargs:
                     kwargs.pop("position_embeddings", None)
                     kwargs.pop("cache_position", None)
                     out = layer(x, **kwargs)
@@ -546,7 +546,7 @@ class StageLast(nn.Module):
             try:
                 out = layer(x, **kwargs)
             except TypeError as e:
-                if "position_embeddings" in str(e):
+                if "position_embeddings" in kwargs:
                     kwargs.pop("position_embeddings", None)
                     kwargs.pop("cache_position", None)
                     out = layer(x, **kwargs)
