@@ -179,13 +179,6 @@ class Stage0(nn.Module):
             kwargs = dict(attention_mask=attention_mask, use_cache=use_cache)
             if self._supports_pos_ids[i]:
                 kwargs['position_ids'] = position_ids
-            # RoPE: 항상 cos/sin을 미리 계산하여 전달 (Llama/Qwen)
-            if hasattr(layer, "self_attn") and hasattr(layer.self_attn, "rotary_emb") and position_ids is not None:
-                cos_sin = layer.self_attn.rotary_emb(x, position_ids)
-                if isinstance(cos_sin, (tuple, list)) and len(cos_sin) == 2:
-                    kwargs['position_embeddings'] = (cos_sin[0], cos_sin[1])
-                    if self._supports_cache_position[i]:
-                        kwargs['cache_position'] = position_ids.view(-1)
             if self._supports_past_key_value[i]:
                 kwargs['past_key_value'] = pkv
             elif self._supports_layer_past[i]:
@@ -470,12 +463,6 @@ class StageSegment(nn.Module):
             kwargs = dict(attention_mask=attention_mask, use_cache=use_cache)
             if self._supports_pos_ids[i]:
                 kwargs['position_ids'] = position_ids
-            if hasattr(layer, "self_attn") and hasattr(layer.self_attn, "rotary_emb") and position_ids is not None:
-                cos_sin = layer.self_attn.rotary_emb(x, position_ids)
-                if isinstance(cos_sin, (tuple, list)) and len(cos_sin) == 2:
-                    kwargs['position_embeddings'] = (cos_sin[0], cos_sin[1])
-                    if self._supports_cache_position[i]:
-                        kwargs['cache_position'] = position_ids.view(-1)
             if self._supports_past_key_value[i]:
                 kwargs['past_key_value'] = pkv
             elif self._supports_layer_past[i]:
@@ -536,12 +523,6 @@ class StageLast(nn.Module):
             kwargs = dict(attention_mask=attention_mask, use_cache=use_cache)
             if self._supports_pos_ids[i]:
                 kwargs['position_ids'] = position_ids
-            if hasattr(layer, "self_attn") and hasattr(layer.self_attn, "rotary_emb") and position_ids is not None:
-                cos_sin = layer.self_attn.rotary_emb(x, position_ids)
-                if isinstance(cos_sin, (tuple, list)) and len(cos_sin) == 2:
-                    kwargs['position_embeddings'] = (cos_sin[0], cos_sin[1])
-                    if self._supports_cache_position[i]:
-                        kwargs['cache_position'] = position_ids.view(-1)
             if self._supports_past_key_value[i]:
                 kwargs['past_key_value'] = pkv
             elif self._supports_layer_past[i]:
