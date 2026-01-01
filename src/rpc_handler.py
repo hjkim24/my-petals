@@ -149,9 +149,21 @@ class StageConnectionHandler(ConnectionHandler):
             # 디버깅: past_len이 올바른지 확인 (INFO 레벨로 변경하여 항상 출력)
             expected_past_len = cur_len - hidden_states.shape[1]
             if past_len != expected_past_len:
+                pkv_type = type(past_key_values).__name__
+                try:
+                    from transformers.cache_utils import Cache  # type: ignore
+                except Exception:
+                    Cache = None
+                cache_len = None
+                if Cache is not None and isinstance(past_key_values, Cache):
+                    try:
+                        cache_len = past_key_values.get_seq_length()
+                    except Exception:
+                        cache_len = "error"
                 logger.warning(
                     f"[{session_id[:8]}] Past len mismatch: past_len={past_len}, cur_len={cur_len}, "
-                    f"hidden_shape={hidden_states.shape[1]}, expected={expected_past_len}"
+                    f"hidden_shape={hidden_states.shape[1]}, expected={expected_past_len}, "
+                    f"pkv_type={pkv_type}, cache_len={cache_len}"
                 )
             else:
                 logger.info(

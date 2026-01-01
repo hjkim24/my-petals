@@ -597,14 +597,6 @@ class StageSegment(nn.Module):
             layer_type_name = type(layer).__name__
             if layer_type_name == "GPT2Block":
                 self.layers.append(GPT2BlockWrapper(layer))
-            elif is_llama_model or 'Llama' in layer_type_name:
-                # LLaMA 계열 레이어: position_embeddings와 cache_position 필터링
-                # forward 시그니처에 position_embeddings가 있는지 확인
-                sig_params = inspect.signature(layer.forward).parameters
-                if 'position_embeddings' in sig_params:
-                    self.layers.append(LLaMALayerWrapper(layer))
-                else:
-                    self.layers.append(layer)
             else:
                 self.layers.append(layer)
 
@@ -676,14 +668,6 @@ class StageLast(nn.Module):
             layer_type_name = type(layer).__name__
             if layer_type_name == "GPT2Block":
                 self.layers.append(GPT2BlockWrapper(layer))
-            elif is_llama_model or 'Llama' in layer_type_name:
-                # LLaMA 계열 레이어: position_embeddings와 cache_position 필터링
-                # forward 시그니처에 position_embeddings가 있는지 확인
-                sig_params = inspect.signature(layer.forward).parameters
-                if 'position_embeddings' in sig_params:
-                    self.layers.append(LLaMALayerWrapper(layer))
-                else:
-                    self.layers.append(layer)
             else:
                 self.layers.append(layer)
 
