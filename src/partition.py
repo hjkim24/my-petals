@@ -204,10 +204,7 @@ class GPT2BlockWrapper(nn.Module):
 class Stage0(nn.Module):
     def __init__(self, full, end: int):
         super().__init__()
-        self.is_gpt2 = (
-            getattr(full.config, "model_type", "") == "gpt2"
-            or (hasattr(full, "transformer") and hasattr(full.transformer, "h"))
-        )
+        self.is_gpt2 = getattr(full.config, "model_type", "") == "gpt2"
         if self.is_gpt2:
             # GPT-2: use the pruned GPT2Model so it builds attention masks / present internally
             self.model = full.transformer
