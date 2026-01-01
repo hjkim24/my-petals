@@ -63,8 +63,11 @@ def _debug_conversion(original_layer: LlamaDecoderLayer, optimized_layer: Optimi
                 if buffer_name in opt_rotary_buffers:
                     orig_buf = orig_rotary_buffers[buffer_name]
                     opt_buf = opt_rotary_buffers[buffer_name]
-                    if not torch.equal(orig_buf, opt_buf):
-                        buf_diff = (orig_buf - opt_buf).abs().max().item()
+                    # Device가 다를 수 있으므로 CPU로 이동하여 비교
+                    orig_buf_cpu = orig_buf.cpu()
+                    opt_buf_cpu = opt_buf.cpu()
+                    if not torch.equal(orig_buf_cpu, opt_buf_cpu):
+                        buf_diff = (orig_buf_cpu - opt_buf_cpu).abs().max().item()
                         logger.error(f"Layer {layer_idx}: Rotary buffer '{buffer_name}' mismatch: {buf_diff:.8f}")
                     else:
                         logger.debug(f"Layer {layer_idx}: Rotary buffer '{buffer_name}' OK")
@@ -295,7 +298,8 @@ def _convert_layers(raw_layers: nn.ModuleList, config, device=None, dtype=None, 
                                 for buffer_name, buffer_value in orig_rotary_buffers.items():
                                     if buffer_name in opt_rotary_buffers:
                                         opt_buffer = getattr(opt_layer.self_attn.rotary_emb, buffer_name)
-                                        opt_buffer.data.copy_(buffer_value.data)
+                                        # Device가 다를 수 있으므로 opt_buffer의 device로 복사
+                                        opt_buffer.data.copy_(buffer_value.data.to(opt_buffer.device))
                                         logger.debug(f"Layer {idx}: Copied rotary_emb buffer: {buffer_name}")
                                     else:
                                         logger.warning(f"Layer {idx}: Rotary buffer {buffer_name} not found in optimized layer")
@@ -342,9 +346,14 @@ def _convert_layers(raw_layers: nn.ModuleList, config, device=None, dtype=None, 
                     for buffer_name, orig_buffer in orig_rotary_buffers.items():
                         if buffer_name in opt_rotary_buffers:
                             opt_buffer = getattr(opt_rotary, buffer_name)
-                            if not torch.equal(orig_buffer, opt_buffer):
-                                opt_buffer.data.copy_(orig_buffer.data)
+                            # Device가 다를 수 있으므로 CPU로 이동하여 비교
+                            orig_buffer_cpu = orig_buffer.cpu()
+                            opt_buffer_cpu = opt_buffer.cpu()
+                            if not torch.equal(orig_buffer_cpu, opt_buffer_cpu):
+                                opt_buffer.data.copy_(orig_buffer.data.to(opt_buffer.device))
                                 logger.info(f"Layer {idx}: Copied rotary_emb buffer: {buffer_name}")
+                            else:
+                                logger.debug(f"Layer {idx}: Rotary buffer {buffer_name} already matches")
                         else:
                             logger.warning(f"Layer {idx}: Rotary buffer {buffer_name} not found in optimized layer")
             
