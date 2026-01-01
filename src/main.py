@@ -70,6 +70,29 @@ def _get_local_ip() -> str:
 def run_rank0(args, device, splits):
     """Run Stage0 (client side)."""
 
+    try:
+        from transformers.cache_utils import Cache  # type: ignore
+    except Exception:
+        Cache = None
+
+    def _describe_past(past):
+        if past is None:
+            return "None"
+        if Cache is not None and isinstance(past, Cache):
+            try:
+                l0 = past.get_seq_length(0)
+            except Exception:
+                l0 = "err"
+            return f"{type(past).__name__}(len={l0})"
+        if isinstance(past, (list, tuple)):
+            if len(past) == 0:
+                return "empty tuple"
+            first = past[0]
+            if isinstance(first, (list, tuple)) and first and first[0] is not None:
+                return f"tuple(len={len(past)}, first_shape={tuple(first[0].shape)})"
+            return f"tuple(len={len(past)}, first={first})"
+        return str(type(past))
+
     # 1. Initialize
     full = load_stage_model(args.model, device, role="stage0", end=splits[0], dtype=args.dtype)
     s0 = Stage0(full, splits[0]).to(device) # load to GPU
@@ -110,6 +133,7 @@ def run_rank0(args, device, splits):
     from src.utils import normalize_cache
     hidden, past0 = s0(input_ids, pos, attn, past0, use_cache=True)  # [1, L, H]
     past0 = normalize_cache(past0)
+    logger.info(f"Stage0 prefill past summary: {_describe_past(past0)}")
 
     session_id = str(uuid4())
     max_length = L + args.max_new_tokens
@@ -137,7 +161,7 @@ def run_rank0(args, device, splits):
     
     for _ in range(args.max_new_tokens - 1): # Prefill에서 1개 토큰 생성했으므로 max - 1 생성
         # Stage0 cache가 비어 있으면 전체 히스토리를 재계산하여 캐시를 복원한다.
-        need_full_recompute = (not past0) or (len(past0) == 0) or (past0[0] is None)
+        need_full_recompute = (past0 is None) or (isinstance(past0, (list, tuple)) and len(past0) == 0)
 
         if need_full_recompute:
             logger.warning("Stage0 cache missing; recomputing from full history.")
@@ -148,17 +172,28 @@ def run_rank0(args, device, splits):
             past0 = normalize_cache(past0)
             hidden = hidden_full[:, -1:, :]  # 마지막 토큰 hidden만 사용
             past_len = full_input.shape[1] - 1
-            logger.info(f"Stage0 recompute: total_len={full_input.shape[1]}, past_len={past_len}, hidden_shape={hidden.shape}")
+            logger.info(f"Stage0 recompute: total_len={full_input.shape[1]}, past_len={past_len}, hidden_shape={hidden.shape}, past summary: {_describe_past(past0)}")
         else:
             new_input = torch.tensor([[next_id]], device=device, dtype=torch.long)
-            past_len = past0[0][0].shape[-2]
+            if isinstance(past0, (list, tuple)) and isinstance(past0[0], (list, tuple)) and past0[0][0] is not None:
+                past_len = past0[0][0].shape[-2]
+            elif Cache is not None and isinstance(past0, Cache):
+                past_len = past0.get_seq_length(0)
+            else:
+                past_len = cur_len - 1
+                logger.warning(f"Stage0 past tuple missing first entry, fallback past_len={past_len}, past summary: {_describe_past(past0)}")
             attn = None
             pos = torch.tensor([[past_len]], device=device, dtype=torch.long)
             logger.info(f"Stage0 decode step {cur_len-L}: past_len={past_len}, pos_ids={pos.tolist()}, input_token={next_id}")
             hidden, past0 = s0(new_input, pos, attn, past0, use_cache=True)  # [1,1,H]
             past0 = normalize_cache(past0)
-            new_past_len = past0[0][0].shape[-2] if past0 and past0[0] is not None else 'N/A'
-            logger.info(f"Stage0: hidden shape={hidden.shape}, new_past_len={new_past_len}, past0 len={len(past0) if past0 else 'N/A'}")
+            if isinstance(past0, (list, tuple)) and past0 and isinstance(past0[0], (list, tuple)) and past0[0][0] is not None:
+                new_past_len = past0[0][0].shape[-2]
+            elif Cache is not None and isinstance(past0, Cache):
+                new_past_len = past0.get_seq_length(0)
+            else:
+                new_past_len = "N/A"
+            logger.info(f"Stage0: hidden shape={hidden.shape}, new_past_len={new_past_len}, past summary: {_describe_past(past0)}")
 
         # send_prefill과 동일 (generated_tokens 전달)
         tx.send_decode_step(cur_len, hidden, session_id=session_id, max_length=max_length, generated_tokens=generated)  # [1,1,H]
