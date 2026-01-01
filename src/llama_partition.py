@@ -762,23 +762,84 @@ class Stage0(nn.Module):
                         f"expected_max≈{silu_max * up_max:.4f}, actual_max={activated_max:.4f}"
                     )
                 
-                # down_proj
+                # down_proj (가중치 확인)
+                down_proj_weight = layer.mlp.down_proj.weight
+                down_proj_weight_stats = {
+                    'min': down_proj_weight.min().item(),
+                    'max': down_proj_weight.max().item(),
+                    'mean': down_proj_weight.mean().item(),
+                    'std': down_proj_weight.std().item(),
+                    'abs_max': down_proj_weight.abs().max().item()
+                }
+                logger.info(
+                    f"Stage0: Prefill - Layer {i} down_proj.weight stats: "
+                    f"abs_max={down_proj_weight_stats['abs_max']:.4f}, "
+                    f"min={down_proj_weight_stats['min']:.4f}, max={down_proj_weight_stats['max']:.4f}, "
+                    f"mean={down_proj_weight_stats['mean']:.4f}, std={down_proj_weight_stats['std']:.4f}, "
+                    f"shape={down_proj_weight.shape}"
+                )
+                
+                # down_proj 계산
+                activated_max = activated.max().item()
+                expected_down_max = activated_max * down_proj_weight_stats['abs_max']
+                logger.info(
+                    f"Stage0: Prefill - Layer {i} down_proj calculation: "
+                    f"activated_max={activated_max:.4f}, weight_abs_max={down_proj_weight_stats['abs_max']:.4f}, "
+                    f"expected_output_max≈{expected_down_max:.4f}"
+                )
+                
                 x_after_mlp = layer.mlp.down_proj(activated)
                 logger.info(
                     f"Stage0: Prefill - Layer {i} after down_proj (MLP output): "
                     f"min={x_after_mlp.min().item():.4f}, max={x_after_mlp.max().item():.4f}, "
+                    f"mean={x_after_mlp.mean().item():.4f}, std={x_after_mlp.std().item():.4f}, "
+                    f"expected_max≈{expected_down_max:.4f}"
+                )
+                
+                # 예상값과 실제값 비교
+                actual_max = x_after_mlp.max().item()
+                if abs(actual_max - expected_down_max) > 100.0:
+                    logger.error(
+                        f"Stage0: Prefill - Layer {i} down_proj output mismatch! "
+                        f"expected_max≈{expected_down_max:.4f}, actual_max={actual_max:.4f}, "
+                        f"diff={abs(actual_max - expected_down_max):.4f}"
+                    )
+                
+                # 6. Final residual (residual2 = residual + MLP output)
+                residual2_input = x_after_residual1.clone()
+                logger.info(
+                    f"Stage0: Prefill - Layer {i} residual2 input (x_after_residual1): "
+                    f"min={residual2_input.min().item():.4f}, max={residual2_input.max().item():.4f}, "
+                    f"mean={residual2_input.mean().item():.4f}, std={residual2_input.std().item():.4f}"
+                )
+                logger.info(
+                    f"Stage0: Prefill - Layer {i} residual2 MLP output (x_after_mlp): "
+                    f"min={x_after_mlp.min().item():.4f}, max={x_after_mlp.max().item():.4f}, "
                     f"mean={x_after_mlp.mean().item():.4f}, std={x_after_mlp.std().item():.4f}"
                 )
                 
-                # 6. Final residual
+                # residual connection 계산
                 x_final = x_after_residual1 + x_after_mlp
+                expected_final_max = max(residual2_input.max().item(), x_after_mlp.max().item())
+                expected_final_min = min(residual2_input.min().item(), x_after_mlp.min().item())
+                
                 logger.info(
                     f"Stage0: Prefill - Layer {i} after residual2 (FINAL): "
                     f"min={x_final.min().item():.4f}, max={x_final.max().item():.4f}, "
-                    f"mean={x_final.mean().item():.4f}, std={x_final.std().item():.4f}"
+                    f"mean={x_final.mean().item():.4f}, std={x_final.std().item():.4f}, "
+                    f"expected_range≈[{expected_final_min:.4f}, {expected_final_max:.4f}]"
                 )
                 
+                # residual connection이 문제인지 확인
+                if x_final.max().item() > expected_final_max * 1.5:
+                    logger.error(
+                        f"Stage0: Prefill - Layer {i} residual2 overflow detected! "
+                        f"residual_max={residual2_input.max().item():.4f}, mlp_max={x_after_mlp.max().item():.4f}, "
+                        f"expected_max≈{expected_final_max:.4f}, actual_max={x_final.max().item():.4f}"
+                    )
+                
                 # 정상 forward pass도 실행 (KV cache를 위해)
+                # 하지만 이미 x_final을 계산했으므로 비교
                 out = layer(
                     x,
                     attention_mask=None,
@@ -787,7 +848,24 @@ class Stage0(nn.Module):
                     use_cache=use_cache,
                     output_attentions=False,
                 )
-                x = out[0]
+                x_normal = out[0]
+                
+                # 수동 계산과 정상 forward pass 비교
+                diff = (x_final - x_normal).abs()
+                max_diff = diff.max().item()
+                mean_diff = diff.mean().item()
+                logger.info(
+                    f"Stage0: Prefill - Layer {i} manual vs normal forward: "
+                    f"max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}"
+                )
+                
+                if max_diff > 1e-3:
+                    logger.error(
+                        f"Stage0: Prefill - Layer {i} manual and normal forward mismatch! "
+                        f"max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}"
+                    )
+                
+                x = x_normal
             else:
                 out = layer(
                     x,
