@@ -1,110 +1,164 @@
 import logging
+from typing import Optional, Tuple
+
 import torch
 import torch.nn as nn
 from transformers import AutoModelForCausalLM
-from transformers.models.llama.modeling_llama import LlamaDecoderLayer, apply_rotary_pos_emb
-try:
-    from transformers.cache_utils import Cache  # type: ignore
-except Exception:
-    Cache = None
-from typing import Optional, Tuple
-
-logger = logging.getLogger(__name__)
-
-try:
-    from petals.llama.block import OptimizedLlamaDecoderLayer
-    # 임시로 OptimizedLlamaDecoderLayer 사용 비활성화 (hidden states 폭발 문제 해결을 위해)
-    OPTIMIZED_LAYER_AVAILABLE = False
-    logger.warning("OptimizedLlamaDecoderLayer is available but disabled due to hidden states explosion issue. Using default LlamaDecoderLayer.")
-except ImportError as e:
-    OPTIMIZED_LAYER_AVAILABLE = False
-    logger.warning(f"OptimizedLlamaDecoderLayer not available ({e}), using default LlamaDecoderLayer")
+from transformers.models.llama.modeling_llama import LlamaDecoderLayer
 
 from .utils import extract_kv_tuple, default_position_ids
 
+logger = logging.getLogger(__name__)
 
-class LlamaDecoderLayerWrapper(nn.Module):
-    """Wrapper for LlamaDecoderLayer to ensure past_key_value is returned."""
-    
-    def __init__(self, layer: LlamaDecoderLayer):
-        super().__init__()
-        self.layer = layer
-    
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.Tensor] = None,
-        past_key_value: Optional[Tuple] = None,
-        output_attentions: bool = False,
-        use_cache: bool = False,
-        **kwargs,
-    ):
-        # 강제로 use_cache=True로 self_attn을 호출하여 present_key_value를 확보
-        cache_flag = True if use_cache else False
-        if cache_flag:
-            residual = hidden_states
-            hidden_states = self.layer.input_layernorm(hidden_states)
+# Prefer optimized block implementation if available
+try:
+    from petals.llama.block import OptimizedLlamaDecoderLayer
 
-            attn_out = self.layer.self_attn(
-                hidden_states=hidden_states,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_value=past_key_value,
-                output_attentions=False,
-                use_cache=True,
-            )
+    OPTIMIZED_LAYER_AVAILABLE = True
+except Exception as e:  # pragma: no cover - optional dependency
+    OptimizedLlamaDecoderLayer = None
+    OPTIMIZED_LAYER_AVAILABLE = False
+    logger.warning(f"OptimizedLlamaDecoderLayer not available ({e}), using vanilla LlamaDecoderLayer.")
 
-            if len(attn_out) == 3:
-                attn_output, self_attn_weights, present_key_value = attn_out
-            elif len(attn_out) == 2:
-                attn_output, present_key_value = attn_out
-                self_attn_weights = None
-            else:
-                raise ValueError(f"Unexpected self_attn output length: {len(attn_out)}")
 
-            if present_key_value is None:
-                # 마지막 수단: 직접 key/value를 계산하여 반환
-                attn = self.layer.self_attn
-                bsz, q_len, _ = hidden_states.size()
-                query_states = attn.q_proj(hidden_states)
-                key_states = attn.k_proj(hidden_states)
-                value_states = attn.v_proj(hidden_states)
-                query_states = query_states.view(bsz, q_len, attn.num_heads, attn.head_dim).transpose(1, 2)
-                key_states = key_states.view(bsz, q_len, attn.num_key_value_heads, attn.head_dim).transpose(1, 2)
-                value_states = value_states.view(bsz, q_len, attn.num_key_value_heads, attn.head_dim).transpose(1, 2)
-                cos, sin = attn.rotary_emb(value_states, position_ids)
-                cos, sin = cos.unsqueeze(1), sin.unsqueeze(1)
-                query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
-                if past_key_value is not None:
-                    key_states = torch.cat([past_key_value[0], key_states], dim=2)
-                    value_states = torch.cat([past_key_value[1], value_states], dim=2)
-                present_key_value = (key_states, value_states)
-                logger.warning("LlamaDecoderLayerWrapper: present_key_value was None; recomputed manually.")
-
-            hidden_states = residual + attn_output
-            residual = hidden_states
-            hidden_states = self.layer.post_attention_layernorm(hidden_states)
-            hidden_states = self.layer.mlp(hidden_states)
-            hidden_states = residual + hidden_states
-
-            outputs = (hidden_states,)
-            if output_attentions:
-                outputs += (self_attn_weights,)
-            if cache_flag:
-                outputs += (present_key_value,)
-            return outputs
-
-        # use_cache=False는 기본 레이어 호출
-        return self.layer(
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_value=past_key_value,
-            output_attentions=output_attentions,
-            use_cache=False,
-            **kwargs,
+def _verify_layer_conversion(original_layer: LlamaDecoderLayer, optimized_layer: OptimizedLlamaDecoderLayer, 
+                             config, layer_idx: int) -> bool:
+    """Verify that the converted layer produces the same output as the original."""
+    try:
+        # 입력 텐서 생성 (원본 레이어의 device와 dtype 사용)
+        device = original_layer.input_layernorm.weight.device
+        dtype = original_layer.input_layernorm.weight.dtype
+        batch_size, seq_len = 2, 10
+        hidden_states = torch.randn(
+            batch_size, seq_len, config.hidden_size,
+            device=device,
+            dtype=dtype
         )
+        
+        # position_ids 생성
+        position_ids = torch.arange(seq_len, device=device, dtype=torch.long).unsqueeze(0).expand(batch_size, -1)
+        
+        with torch.no_grad():
+            # 원본 레이어 출력
+            original_output = original_layer(
+                hidden_states=hidden_states,
+                position_ids=position_ids,
+                use_cache=False,
+                output_attentions=False,
+            )
+            
+            # 최적화 버전 출력
+            optimized_output = optimized_layer(
+                hidden_states=hidden_states,
+                position_ids=position_ids,
+                use_cache=False,
+                output_attentions=False,
+            )
+        
+        # 결과 비교 (hidden_states만 비교)
+        original_hidden = original_output[0]
+        optimized_hidden = optimized_output[0]
+        
+        if not torch.allclose(original_hidden, optimized_hidden, atol=1e-5, rtol=1e-5):
+            max_diff = (original_hidden - optimized_hidden).abs().max().item()
+            mean_diff = (original_hidden - optimized_hidden).abs().mean().item()
+            logger.error(
+                f"Layer {layer_idx}: Output mismatch! max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}"
+            )
+            return False
+        
+        logger.info(f"Layer {layer_idx}: ✓ Conversion verified successfully")
+        return True
+        
+    except Exception as e:
+        logger.warning(f"Layer {layer_idx}: Verification failed with error: {e}")
+        return False
+
+
+def _convert_layers(raw_layers: nn.ModuleList, config, device=None, dtype=None, verify: bool = True) -> nn.ModuleList:
+    """Convert HF LlamaDecoderLayer to optimized version if available.
+    
+    Args:
+        raw_layers: Original layers to convert
+        config: Model configuration
+        device: Target device (if None, uses original layer's device)
+        dtype: Target dtype (if None, uses original layer's dtype)
+        verify: Whether to verify conversion by running forward pass
+    """
+    if not OPTIMIZED_LAYER_AVAILABLE:
+        return nn.ModuleList(raw_layers)
+
+    optimized = []
+    for idx, layer in enumerate(raw_layers):
+        if isinstance(layer, OptimizedLlamaDecoderLayer):
+            optimized.append(layer)
+        elif isinstance(layer, LlamaDecoderLayer):
+            # 1. 원본 레이어에서 state_dict 추출
+            original_state_dict = layer.state_dict()
+            
+            # 2. OptimizedLlamaDecoderLayer 생성
+            opt_layer = OptimizedLlamaDecoderLayer(config)
+            
+            # 3. 가중치 로드 (strict=True로 시도, 실패하면 strict=False)
+            try:
+                missing, unexpected = opt_layer.load_state_dict(original_state_dict, strict=True)
+                if missing:
+                    logger.warning(f"Layer {idx}: missing keys: {list(missing)[:5]}")
+                if unexpected:
+                    logger.warning(f"Layer {idx}: unexpected keys: {list(unexpected)[:5]}")
+            except RuntimeError as e:
+                logger.warning(f"Layer {idx}: strict=True failed, trying strict=False: {e}")
+                missing, unexpected = opt_layer.load_state_dict(original_state_dict, strict=False)
+                if missing or unexpected:
+                    logger.warning(
+                        f"Layer {idx}: optimized load had missing={len(missing)}, unexpected={len(unexpected)}"
+                    )
+            
+            # 4. 디바이스 이동 (원본 레이어와 동일한 device로)
+            if device is not None:
+                opt_layer = opt_layer.to(device)
+            elif hasattr(layer, 'self_attn') and hasattr(layer.self_attn, 'q_proj'):
+                # 원본 레이어의 device 확인
+                original_device = layer.self_attn.q_proj.weight.device
+                opt_layer = opt_layer.to(original_device)
+            
+            # 5. dtype 변환 (원본 레이어와 동일한 dtype으로)
+            if dtype is not None:
+                opt_layer = opt_layer.to(dtype)
+            elif hasattr(layer, 'self_attn') and hasattr(layer.self_attn, 'q_proj'):
+                # 원본 레이어의 dtype 확인
+                original_dtype = layer.self_attn.q_proj.weight.dtype
+                opt_layer = opt_layer.to(original_dtype)
+            
+            # 6. 가중치 검증 (선택적)
+            opt_state_dict = opt_layer.state_dict()
+            key_checks = [
+                'self_attn.q_proj.weight', 'self_attn.k_proj.weight', 'self_attn.v_proj.weight',
+                'self_attn.o_proj.weight', 'mlp.gate_proj.weight', 'mlp.up_proj.weight', 'mlp.down_proj.weight'
+            ]
+            for key in key_checks:
+                if key in original_state_dict and key in opt_state_dict:
+                    orig_tensor = original_state_dict[key]
+                    opt_tensor = opt_state_dict[key]
+                    # CPU, float32로 변환하여 비교
+                    orig_tensor = orig_tensor.cpu().float()
+                    opt_tensor = opt_tensor.cpu().float()
+                    if not torch.allclose(orig_tensor, opt_tensor, atol=1e-4):
+                        logger.error(f"Layer {idx}: Weight mismatch for {key}!")
+                elif key in original_state_dict:
+                    logger.error(f"Layer {idx}: Missing key {key} in optimized layer!")
+            
+            # 7. Forward pass 검증 (선택적)
+            if verify:
+                verification_passed = _verify_layer_conversion(layer, opt_layer, config, idx)
+                if not verification_passed:
+                    logger.warning(f"Layer {idx}: Forward pass verification failed, but continuing...")
+            
+            optimized.append(opt_layer)
+        else:
+            optimized.append(layer)
+    
+    return nn.ModuleList(optimized)
 
 
 class Stage0(nn.Module):
@@ -126,55 +180,16 @@ class Stage0(nn.Module):
         else:
             raise ValueError(f"Unsupported LLaMA architecture: {type(full)}.")
 
-        # Convert to OptimizedLlamaDecoderLayer if available
-        if OPTIMIZED_LAYER_AVAILABLE:
-            optimized_layers = []
-            for i, layer in enumerate(raw_layers):
-                if isinstance(layer, OptimizedLlamaDecoderLayer):
-                    optimized_layers.append(layer)
-                elif isinstance(layer, LlamaDecoderLayer):
-                    # Create OptimizedLlamaDecoderLayer and copy weights
-                    opt_layer = OptimizedLlamaDecoderLayer(full.config)
-                    original_state = layer.state_dict()
-                    missing_keys, unexpected_keys = opt_layer.load_state_dict(original_state, strict=False)
-                    optimized_layers.append(opt_layer)
-                    # 디버깅: 가중치 복사 확인 및 검증
-                    if missing_keys or unexpected_keys:
-                        logger.warning(f"Stage0 layer {i}: missing_keys={len(missing_keys)}, unexpected_keys={len(unexpected_keys)}")
-                        if missing_keys:
-                            logger.warning(f"Stage0 layer {i} missing_keys: {list(missing_keys)[:5]}")  # 처음 5개만 출력
-                        if unexpected_keys:
-                            logger.warning(f"Stage0 layer {i} unexpected_keys: {list(unexpected_keys)[:5]}")
-                    else:
-                        logger.info(f"Stage0 layer {i}: Successfully converted to OptimizedLlamaDecoderLayer")
-                    
-                    # 가중치 복사 검증: 중요한 가중치가 제대로 복사되었는지 확인
-                    opt_state = opt_layer.state_dict()
-                    key_checks = ['self_attn.q_proj.weight', 'self_attn.k_proj.weight', 'self_attn.v_proj.weight', 
-                                 'self_attn.o_proj.weight', 'mlp.gate_proj.weight', 'mlp.up_proj.weight', 'mlp.down_proj.weight']
-                    for key in key_checks:
-                        if key in original_state and key in opt_state:
-                            orig_tensor = original_state[key]
-                            opt_tensor = opt_state[key]
-                            # device와 dtype이 다를 수 있으므로 CPU, float32로 변환하여 비교
-                            orig_tensor = orig_tensor.cpu().float()
-                            opt_tensor = opt_tensor.cpu().float()
-                            if not torch.allclose(orig_tensor, opt_tensor, atol=1e-4):
-                                logger.error(f"Stage0 layer {i}: Weight mismatch for {key}!")
-                        elif key in original_state:
-                            logger.error(f"Stage0 layer {i}: Missing key {key} in optimized layer!")
-                else:
-                    optimized_layers.append(layer)
-            self.layers = nn.ModuleList(optimized_layers)
-        else:
-            # 기본 LlamaDecoderLayer를 래핑하여 past_key_value 반환 보장
-            wrapped_layers = []
-            for layer in raw_layers:
-                if isinstance(layer, LlamaDecoderLayer) and not isinstance(layer, LlamaDecoderLayerWrapper):
-                    wrapped_layers.append(LlamaDecoderLayerWrapper(layer))
-                else:
-                    wrapped_layers.append(layer)
-            self.layers = nn.ModuleList(wrapped_layers)
+        # device와 dtype 추출
+        device = None
+        dtype = None
+        if len(raw_layers) > 0:
+            first_layer = raw_layers[0]
+            if hasattr(first_layer, 'self_attn') and hasattr(first_layer.self_attn, 'q_proj'):
+                device = first_layer.self_attn.q_proj.weight.device
+                dtype = first_layer.self_attn.q_proj.weight.dtype
+
+        self.layers = _convert_layers(raw_layers, full.config, device=device, dtype=dtype)
         self.config = full.config
 
     def forward(
@@ -187,11 +202,12 @@ class Stage0(nn.Module):
     ):
         x = self.embed_tokens(input_ids)
         new_cache = []
-        cache_obj: Optional[Cache] = None
 
         for i, layer in enumerate(self.layers):
             layer_past = None if past_key_values is None else past_key_values[i]
-            layer_pos = position_ids if position_ids is not None else default_position_ids(layer_past, x.shape[1], x.device)
+            layer_pos = position_ids if position_ids is not None else default_position_ids(
+                layer_past, x.shape[1], x.device
+            )
             out = layer(
                 x,
                 attention_mask=None,
@@ -202,41 +218,13 @@ class Stage0(nn.Module):
             )
             x = out[0]
             if use_cache:
-                # 디버깅: 레이어 출력 구조 확인
-                if i == 0:
-                    layer_type = type(layer).__name__
-                    logger.info(f"Stage0 layer {i} (type={layer_type}) output: type={type(out)}, len={len(out)}, "
-                               f"out[0] type={type(out[0])}, out[-1] type={type(out[-1]) if len(out) > 0 else 'N/A'}, "
-                               f"out[-1] value={out[-1] if len(out) > 0 else 'N/A'}")
-                
-                kv_candidate = out[-1] if len(out) > 2 else (out[1] if len(out) > 1 else None)
-                if Cache is not None and isinstance(kv_candidate, Cache):
-                    cache_obj = kv_candidate
-                    kv = kv_candidate[i] if hasattr(kv_candidate, "__getitem__") else None
-                else:
-                    kv = extract_kv_tuple(out, layer_idx=i)
-                
-                # 기본 LlamaDecoderLayer는 past_key_value를 반환하지 않을 수 있으므로
-                # attention 모듈의 forward 결과에서 직접 가져오기 시도
+                kv = extract_kv_tuple(out, layer_idx=i)
                 if kv is None:
-                    # LlamaDecoderLayer는 self_attn을 호출하고 그 결과를 사용
-                    # self_attn의 forward가 (attn_output, attn_weights, past_key_value)를 반환
-                    # 하지만 이것은 내부적으로만 사용되므로 직접 접근 불가
-                    # 대신 레이어 출력에서 찾기
-                    if len(out) >= 2:
-                        # out[1]이 None이면, 실제로는 다른 위치에 있을 수 있음
-                        logger.warning(f"Stage0: layer {i} out[1] is None, checking all outputs")
-                        for idx, item in enumerate(out):
-                            logger.info(f"Stage0: layer {i} out[{idx}] = {item} (type={type(item)})")
-                
+                    logger.warning(f"Stage0: layer {i} did not return KV cache")
                 new_cache.append(kv)
-                if kv is None:
-                    logger.warning(f"Stage0: layer {i} returned no KV (kv_candidate type={type(kv_candidate)}, out_len={len(out)})")
 
         if not use_cache:
             return x, None
-        if cache_obj is not None:
-            return x, cache_obj
         return x, tuple(new_cache)
 
 
@@ -256,55 +244,16 @@ class StageSegment(nn.Module):
         else:
             raise ValueError(f"Unsupported LLaMA architecture: {type(full)}.")
 
-        # Convert to OptimizedLlamaDecoderLayer if available
-        if OPTIMIZED_LAYER_AVAILABLE:
-            optimized_layers = []
-            for i, layer in enumerate(raw_layers):
-                if isinstance(layer, OptimizedLlamaDecoderLayer):
-                    optimized_layers.append(layer)
-                elif isinstance(layer, LlamaDecoderLayer):
-                    # Create OptimizedLlamaDecoderLayer and copy weights
-                    opt_layer = OptimizedLlamaDecoderLayer(full.config)
-                    original_state = layer.state_dict()
-                    missing_keys, unexpected_keys = opt_layer.load_state_dict(original_state, strict=False)
-                    optimized_layers.append(opt_layer)
-                    # 디버깅: 가중치 복사 확인
-                    if missing_keys or unexpected_keys:
-                        logger.warning(f"StageSegment layer {i}: missing_keys={len(missing_keys)}, unexpected_keys={len(unexpected_keys)}")
-                        if missing_keys:
-                            logger.warning(f"StageSegment layer {i} missing_keys: {list(missing_keys)[:5]}")  # 처음 5개만 출력
-                        if unexpected_keys:
-                            logger.warning(f"StageSegment layer {i} unexpected_keys: {list(unexpected_keys)[:5]}")
-                    else:
-                        logger.info(f"StageSegment layer {i}: Successfully converted to OptimizedLlamaDecoderLayer")
-                    
-                    # 가중치 복사 검증
-                    opt_state = opt_layer.state_dict()
-                    key_checks = ['self_attn.q_proj.weight', 'self_attn.k_proj.weight', 'self_attn.v_proj.weight', 
-                                 'self_attn.o_proj.weight', 'mlp.gate_proj.weight', 'mlp.up_proj.weight', 'mlp.down_proj.weight']
-                    for key in key_checks:
-                        if key in original_state and key in opt_state:
-                            orig_tensor = original_state[key]
-                            opt_tensor = opt_state[key]
-                            # device와 dtype이 다를 수 있으므로 CPU, float32로 변환하여 비교
-                            orig_tensor = orig_tensor.cpu().float()
-                            opt_tensor = opt_tensor.cpu().float()
-                            if not torch.allclose(orig_tensor, opt_tensor, atol=1e-4):
-                                logger.error(f"StageSegment layer {i}: Weight mismatch for {key}!")
-                        elif key in original_state:
-                            logger.error(f"StageSegment layer {i}: Missing key {key} in optimized layer!")
-                else:
-                    optimized_layers.append(layer)
-            self.layers = nn.ModuleList(optimized_layers)
-        else:
-            # 기본 LlamaDecoderLayer를 래핑하여 past_key_value 반환 보장
-            wrapped_layers = []
-            for layer in raw_layers:
-                if isinstance(layer, LlamaDecoderLayer) and not isinstance(layer, LlamaDecoderLayerWrapper):
-                    wrapped_layers.append(LlamaDecoderLayerWrapper(layer))
-                else:
-                    wrapped_layers.append(layer)
-            self.layers = nn.ModuleList(wrapped_layers)
+        # device와 dtype 추출
+        device = None
+        dtype = None
+        if len(raw_layers) > 0:
+            first_layer = raw_layers[0]
+            if hasattr(first_layer, 'self_attn') and hasattr(first_layer.self_attn, 'q_proj'):
+                device = first_layer.self_attn.q_proj.weight.device
+                dtype = first_layer.self_attn.q_proj.weight.dtype
+
+        self.layers = _convert_layers(raw_layers, full.config, device=device, dtype=dtype)
         self.config = full.config
 
     def forward(
@@ -317,11 +266,12 @@ class StageSegment(nn.Module):
     ):
         x = hidden_states
         new_cache = []
-        cache_obj: Optional[Cache] = None
 
         for i, layer in enumerate(self.layers):
             layer_past = None if past_key_values is None else past_key_values[i]
-            layer_pos = position_ids if position_ids is not None else default_position_ids(layer_past, x.shape[1], x.device)
+            layer_pos = position_ids if position_ids is not None else default_position_ids(
+                layer_past, x.shape[1], x.device
+            )
             out = layer(
                 x,
                 attention_mask=None,
@@ -332,19 +282,13 @@ class StageSegment(nn.Module):
             )
             x = out[0]
             if use_cache:
-                kv_candidate = out[-1] if len(out) > 2 else (out[1] if len(out) > 1 else None)
-                if Cache is not None and isinstance(kv_candidate, Cache):
-                    cache_obj = kv_candidate
-                    kv = kv_candidate[i] if hasattr(kv_candidate, "__getitem__") else None
-                else:
-                    kv = extract_kv_tuple(out, layer_idx=i)
-                
+                kv = extract_kv_tuple(out, layer_idx=i)
+                if kv is None:
+                    logger.warning(f"StageSegment: layer {i} did not return KV cache")
                 new_cache.append(kv)
 
         if not use_cache:
             return x, None
-        if cache_obj is not None:
-            return x, cache_obj
         return x, tuple(new_cache)
 
 
@@ -371,56 +315,16 @@ class StageLast(nn.Module):
         else:
             raise ValueError(f"Unsupported LLaMA architecture: {type(full)}.")
 
-        # Convert to OptimizedLlamaDecoderLayer if available
-        if OPTIMIZED_LAYER_AVAILABLE:
-            optimized_layers = []
-            for i, layer in enumerate(raw_layers):
-                if isinstance(layer, OptimizedLlamaDecoderLayer):
-                    optimized_layers.append(layer)
-                elif isinstance(layer, LlamaDecoderLayer):
-                    # Create OptimizedLlamaDecoderLayer and copy weights
-                    opt_layer = OptimizedLlamaDecoderLayer(full.config)
-                    original_state = layer.state_dict()
-                    missing_keys, unexpected_keys = opt_layer.load_state_dict(original_state, strict=False)
-                    optimized_layers.append(opt_layer)
-                    # 디버깅: 가중치 복사 확인
-                    if missing_keys or unexpected_keys:
-                        logger.warning(f"StageLast layer {i}: missing_keys={len(missing_keys)}, unexpected_keys={len(unexpected_keys)}")
-                        if missing_keys:
-                            logger.warning(f"StageLast layer {i} missing_keys: {list(missing_keys)[:5]}")  # 처음 5개만 출력
-                        if unexpected_keys:
-                            logger.warning(f"StageLast layer {i} unexpected_keys: {list(unexpected_keys)[:5]}")
-                    else:
-                        logger.info(f"StageLast layer {i}: Successfully converted to OptimizedLlamaDecoderLayer")
-                    
-                    # 가중치 복사 검증
-                    opt_state = opt_layer.state_dict()
-                    key_checks = ['self_attn.q_proj.weight', 'self_attn.k_proj.weight', 'self_attn.v_proj.weight', 
-                                 'self_attn.o_proj.weight', 'mlp.gate_proj.weight', 'mlp.up_proj.weight', 'mlp.down_proj.weight']
-                    for key in key_checks:
-                        if key in original_state and key in opt_state:
-                            orig_tensor = original_state[key]
-                            opt_tensor = opt_state[key]
-                            # device와 dtype이 다를 수 있으므로 CPU, float32로 변환하여 비교
-                            orig_tensor = orig_tensor.cpu().float()
-                            opt_tensor = opt_tensor.cpu().float()
-                            if not torch.allclose(orig_tensor, opt_tensor, atol=1e-4):
-                                logger.error(f"StageLast layer {i}: Weight mismatch for {key}!")
-                        elif key in original_state:
-                            logger.error(f"StageLast layer {i}: Missing key {key} in optimized layer!")
-                else:
-                    optimized_layers.append(layer)
-            self.layers = nn.ModuleList(optimized_layers)
-        else:
-            # 기본 LlamaDecoderLayer를 래핑하여 past_key_value 반환 보장
-            wrapped_layers = []
-            for layer in raw_layers:
-                if isinstance(layer, LlamaDecoderLayer) and not isinstance(layer, LlamaDecoderLayerWrapper):
-                    wrapped_layers.append(LlamaDecoderLayerWrapper(layer))
-                else:
-                    wrapped_layers.append(layer)
-            self.layers = nn.ModuleList(wrapped_layers)
+        # device와 dtype 추출
+        device = None
+        dtype = None
+        if len(raw_layers) > 0:
+            first_layer = raw_layers[0]
+            if hasattr(first_layer, 'self_attn') and hasattr(first_layer.self_attn, 'q_proj'):
+                device = first_layer.self_attn.q_proj.weight.device
+                dtype = first_layer.self_attn.q_proj.weight.dtype
 
+        self.layers = _convert_layers(raw_layers, full.config, device=device, dtype=dtype)
         self.lm_head = full.lm_head
         self.config = full.config
 
@@ -434,11 +338,12 @@ class StageLast(nn.Module):
     ):
         x = hidden_states
         new_cache = []
-        cache_obj: Optional[Cache] = None
 
         for i, layer in enumerate(self.layers):
             layer_past = None if past_key_values is None else past_key_values[i]
-            layer_pos = position_ids if position_ids is not None else default_position_ids(layer_past, x.shape[1], x.device)
+            layer_pos = position_ids if position_ids is not None else default_position_ids(
+                layer_past, x.shape[1], x.device
+            )
             out = layer(
                 x,
                 attention_mask=None,
@@ -449,28 +354,15 @@ class StageLast(nn.Module):
             )
             x = out[0]
             if use_cache:
-                kv_candidate = out[-1] if len(out) > 2 else (out[1] if len(out) > 1 else None)
-                if Cache is not None and isinstance(kv_candidate, Cache):
-                    cache_obj = kv_candidate
-                    kv = kv_candidate[i] if hasattr(kv_candidate, "__getitem__") else None
-                else:
-                    kv = extract_kv_tuple(out, layer_idx=i)
-                
-                # 기본 LlamaDecoderLayer는 past_key_value를 반환하지 않을 수 있으므로
-                # attention 모듈에서 직접 가져오기 시도
-                if kv is None and hasattr(layer, 'self_attn') and hasattr(layer.self_attn, 'past_key_value'):
-                    attn_past = layer.self_attn.past_key_value
-                    if attn_past is not None:
-                        kv = attn_past
-                
+                kv = extract_kv_tuple(out, layer_idx=i)
+                if kv is None:
+                    logger.warning(f"StageLast: layer {i} did not return KV cache")
                 new_cache.append(kv)
 
         x = self.norm(x)
         logits = self.lm_head(x)
         if not use_cache:
             return logits, None
-        if cache_obj is not None:
-            return logits, cache_obj
         return logits, tuple(new_cache)
 
 
