@@ -19,6 +19,7 @@ model = AutoModelForCausalLM.from_pretrained(
     low_cpu_mem_usage=True,
     device_map=None,   # 단일 GPU
 )
+model.to(device)
 model.eval()
 
 with torch.inference_mode():
