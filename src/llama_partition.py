@@ -49,9 +49,10 @@ class Stage0(nn.Module):
                 elif isinstance(layer, LlamaDecoderLayer):
                     # Create OptimizedLlamaDecoderLayer and copy weights
                     opt_layer = OptimizedLlamaDecoderLayer(full.config)
-                    missing_keys, unexpected_keys = opt_layer.load_state_dict(layer.state_dict(), strict=False)
+                    original_state = layer.state_dict()
+                    missing_keys, unexpected_keys = opt_layer.load_state_dict(original_state, strict=False)
                     optimized_layers.append(opt_layer)
-                    # 디버깅: 가중치 복사 확인
+                    # 디버깅: 가중치 복사 확인 및 검증
                     if missing_keys or unexpected_keys:
                         logger.warning(f"Stage0 layer {i}: missing_keys={len(missing_keys)}, unexpected_keys={len(unexpected_keys)}")
                         if missing_keys:
@@ -60,6 +61,17 @@ class Stage0(nn.Module):
                             logger.warning(f"Stage0 layer {i} unexpected_keys: {list(unexpected_keys)[:5]}")
                     else:
                         logger.info(f"Stage0 layer {i}: Successfully converted to OptimizedLlamaDecoderLayer")
+                    
+                    # 가중치 복사 검증: 중요한 가중치가 제대로 복사되었는지 확인
+                    opt_state = opt_layer.state_dict()
+                    key_checks = ['self_attn.q_proj.weight', 'self_attn.k_proj.weight', 'self_attn.v_proj.weight', 
+                                 'self_attn.o_proj.weight', 'mlp.gate_proj.weight', 'mlp.up_proj.weight', 'mlp.down_proj.weight']
+                    for key in key_checks:
+                        if key in original_state and key in opt_state:
+                            if not torch.allclose(original_state[key], opt_state[key], atol=1e-6):
+                                logger.error(f"Stage0 layer {i}: Weight mismatch for {key}!")
+                        elif key in original_state:
+                            logger.error(f"Stage0 layer {i}: Missing key {key} in optimized layer!")
                 else:
                     optimized_layers.append(layer)
             self.layers = nn.ModuleList(optimized_layers)
@@ -138,7 +150,8 @@ class StageSegment(nn.Module):
                 elif isinstance(layer, LlamaDecoderLayer):
                     # Create OptimizedLlamaDecoderLayer and copy weights
                     opt_layer = OptimizedLlamaDecoderLayer(full.config)
-                    missing_keys, unexpected_keys = opt_layer.load_state_dict(layer.state_dict(), strict=False)
+                    original_state = layer.state_dict()
+                    missing_keys, unexpected_keys = opt_layer.load_state_dict(original_state, strict=False)
                     optimized_layers.append(opt_layer)
                     # 디버깅: 가중치 복사 확인
                     if missing_keys or unexpected_keys:
@@ -149,6 +162,17 @@ class StageSegment(nn.Module):
                             logger.warning(f"StageSegment layer {i} unexpected_keys: {list(unexpected_keys)[:5]}")
                     else:
                         logger.info(f"StageSegment layer {i}: Successfully converted to OptimizedLlamaDecoderLayer")
+                    
+                    # 가중치 복사 검증
+                    opt_state = opt_layer.state_dict()
+                    key_checks = ['self_attn.q_proj.weight', 'self_attn.k_proj.weight', 'self_attn.v_proj.weight', 
+                                 'self_attn.o_proj.weight', 'mlp.gate_proj.weight', 'mlp.up_proj.weight', 'mlp.down_proj.weight']
+                    for key in key_checks:
+                        if key in original_state and key in opt_state:
+                            if not torch.allclose(original_state[key], opt_state[key], atol=1e-6):
+                                logger.error(f"StageSegment layer {i}: Weight mismatch for {key}!")
+                        elif key in original_state:
+                            logger.error(f"StageSegment layer {i}: Missing key {key} in optimized layer!")
                 else:
                     optimized_layers.append(layer)
             self.layers = nn.ModuleList(optimized_layers)
@@ -228,7 +252,8 @@ class StageLast(nn.Module):
                 elif isinstance(layer, LlamaDecoderLayer):
                     # Create OptimizedLlamaDecoderLayer and copy weights
                     opt_layer = OptimizedLlamaDecoderLayer(full.config)
-                    missing_keys, unexpected_keys = opt_layer.load_state_dict(layer.state_dict(), strict=False)
+                    original_state = layer.state_dict()
+                    missing_keys, unexpected_keys = opt_layer.load_state_dict(original_state, strict=False)
                     optimized_layers.append(opt_layer)
                     # 디버깅: 가중치 복사 확인
                     if missing_keys or unexpected_keys:
@@ -239,6 +264,17 @@ class StageLast(nn.Module):
                             logger.warning(f"StageLast layer {i} unexpected_keys: {list(unexpected_keys)[:5]}")
                     else:
                         logger.info(f"StageLast layer {i}: Successfully converted to OptimizedLlamaDecoderLayer")
+                    
+                    # 가중치 복사 검증
+                    opt_state = opt_layer.state_dict()
+                    key_checks = ['self_attn.q_proj.weight', 'self_attn.k_proj.weight', 'self_attn.v_proj.weight', 
+                                 'self_attn.o_proj.weight', 'mlp.gate_proj.weight', 'mlp.up_proj.weight', 'mlp.down_proj.weight']
+                    for key in key_checks:
+                        if key in original_state and key in opt_state:
+                            if not torch.allclose(original_state[key], opt_state[key], atol=1e-6):
+                                logger.error(f"StageLast layer {i}: Weight mismatch for {key}!")
+                        elif key in original_state:
+                            logger.error(f"StageLast layer {i}: Missing key {key} in optimized layer!")
                 else:
                     optimized_layers.append(layer)
             self.layers = nn.ModuleList(optimized_layers)

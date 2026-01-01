@@ -134,6 +134,7 @@ def run_rank0(args, device, splits):
     hidden, past0 = s0(input_ids, pos, attn, past0, use_cache=True)  # [1, L, H]
     past0 = normalize_cache(past0)
     logger.info(f"Stage0 prefill: prompt_len={L}, past summary: {_describe_past(past0)}")
+    logger.info(f"Stage0 prefill hidden stats: shape={hidden.shape}, min={hidden.min().item():.4f}, max={hidden.max().item():.4f}, mean={hidden.mean().item():.4f}, std={hidden.std().item():.4f}")
 
     session_id = str(uuid4())
     max_length = L + args.max_new_tokens
