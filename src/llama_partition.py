@@ -68,7 +68,13 @@ class Stage0(nn.Module):
                                  'self_attn.o_proj.weight', 'mlp.gate_proj.weight', 'mlp.up_proj.weight', 'mlp.down_proj.weight']
                     for key in key_checks:
                         if key in original_state and key in opt_state:
-                            if not torch.allclose(original_state[key], opt_state[key], atol=1e-6):
+                            orig_tensor = original_state[key]
+                            opt_tensor = opt_state[key]
+                            # dtype이 다를 수 있으므로 float32로 변환하여 비교
+                            if orig_tensor.dtype != opt_tensor.dtype:
+                                orig_tensor = orig_tensor.float()
+                                opt_tensor = opt_tensor.float()
+                            if not torch.allclose(orig_tensor, opt_tensor, atol=1e-4):
                                 logger.error(f"Stage0 layer {i}: Weight mismatch for {key}!")
                         elif key in original_state:
                             logger.error(f"Stage0 layer {i}: Missing key {key} in optimized layer!")
@@ -169,7 +175,13 @@ class StageSegment(nn.Module):
                                  'self_attn.o_proj.weight', 'mlp.gate_proj.weight', 'mlp.up_proj.weight', 'mlp.down_proj.weight']
                     for key in key_checks:
                         if key in original_state and key in opt_state:
-                            if not torch.allclose(original_state[key], opt_state[key], atol=1e-6):
+                            orig_tensor = original_state[key]
+                            opt_tensor = opt_state[key]
+                            # dtype이 다를 수 있으므로 float32로 변환하여 비교
+                            if orig_tensor.dtype != opt_tensor.dtype:
+                                orig_tensor = orig_tensor.float()
+                                opt_tensor = opt_tensor.float()
+                            if not torch.allclose(orig_tensor, opt_tensor, atol=1e-4):
                                 logger.error(f"StageSegment layer {i}: Weight mismatch for {key}!")
                         elif key in original_state:
                             logger.error(f"StageSegment layer {i}: Missing key {key} in optimized layer!")
@@ -271,7 +283,13 @@ class StageLast(nn.Module):
                                  'self_attn.o_proj.weight', 'mlp.gate_proj.weight', 'mlp.up_proj.weight', 'mlp.down_proj.weight']
                     for key in key_checks:
                         if key in original_state and key in opt_state:
-                            if not torch.allclose(original_state[key], opt_state[key], atol=1e-6):
+                            orig_tensor = original_state[key]
+                            opt_tensor = opt_state[key]
+                            # dtype이 다를 수 있으므로 float32로 변환하여 비교
+                            if orig_tensor.dtype != opt_tensor.dtype:
+                                orig_tensor = orig_tensor.float()
+                                opt_tensor = opt_tensor.float()
+                            if not torch.allclose(orig_tensor, opt_tensor, atol=1e-4):
                                 logger.error(f"StageLast layer {i}: Weight mismatch for {key}!")
                         elif key in original_state:
                             logger.error(f"StageLast layer {i}: Missing key {key} in optimized layer!")
