@@ -182,13 +182,21 @@ class StageConnectionHandler(ConnectionHandler):
         with torch.inference_mode():
             model_dtype = next(self.stage_model.parameters()).dtype
             inputs = hidden_states.to(self.device, dtype=model_dtype)
-            outputs, new_past = self.stage_model(
-                inputs,
-                position_ids=pos_ids,
-                attention_mask=attn_mask,
-                past_key_values=past_key_values,
-                use_cache=True,
-            )
+            try:
+                outputs, new_past = self.stage_model(
+                    inputs,
+                    position_ids=pos_ids,
+                    attention_mask=attn_mask,
+                    past_key_values=past_key_values,
+                    use_cache=True,
+                )
+            except StopIteration as e:
+                logger.error(
+                    f"[{session_id[:8]}] StopIteration from stage_model: "
+                    f"inputs dtype={inputs.dtype}, shape={inputs.shape}, "
+                    f"pos_ids={pos_ids}, past_type={type(past_key_values)}"
+                )
+                raise RuntimeError("stage_model raised StopIteration") from e
 
         self._kv_cache[session_id] = new_past
 
