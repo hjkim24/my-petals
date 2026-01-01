@@ -9,7 +9,6 @@ except Exception:
 from typing import Optional, Tuple
 
 from .utils import extract_kv_tuple, default_position_ids
-from block import WrappedLlamaBlock
 
 
 class Stage0(nn.Module):
@@ -48,24 +47,15 @@ class Stage0(nn.Module):
 
         for i, layer in enumerate(self.layers):
             layer_past = None if past_key_values is None else past_key_values[i]
-            if isinstance(layer, WrappedLlamaBlock):
-                out = layer(
-                    x,
-                    attention_mask=None,
-                    position_ids=None,
-                    layer_past=layer_past,
-                    use_cache=use_cache,
-                )
-            else:
-                layer_pos = position_ids if position_ids is not None else default_position_ids(layer_past, x.shape[1], x.device)
-                out = layer(
-                    x,
-                    attention_mask=None,
-                    position_ids=layer_pos,
-                    past_key_value=layer_past,
-                    use_cache=use_cache,
-                    output_attentions=False,
-                )
+            layer_pos = position_ids if position_ids is not None else default_position_ids(layer_past, x.shape[1], x.device)
+            out = layer(
+                x,
+                attention_mask=None,
+                position_ids=layer_pos,
+                past_key_value=layer_past,
+                use_cache=use_cache,
+                output_attentions=False,
+            )
             x = out[0]
             if use_cache:
                 kv = extract_kv_tuple(out, layer_idx=i)
@@ -113,24 +103,15 @@ class StageSegment(nn.Module):
 
         for i, layer in enumerate(self.layers):
             layer_past = None if past_key_values is None else past_key_values[i]
-            if isinstance(layer, WrappedLlamaBlock):
-                out = layer(
-                    x,
-                    attention_mask=None,
-                    position_ids=None,
-                    layer_past=layer_past,
-                    use_cache=use_cache,
-                )
-            else:
-                layer_pos = position_ids if position_ids is not None else default_position_ids(layer_past, x.shape[1], x.device)
-                out = layer(
-                    x,
-                    attention_mask=None,
-                    position_ids=layer_pos,
-                    past_key_value=layer_past,
-                    use_cache=use_cache,
-                    output_attentions=False,
-                )
+            layer_pos = position_ids if position_ids is not None else default_position_ids(layer_past, x.shape[1], x.device)
+            out = layer(
+                x,
+                attention_mask=None,
+                position_ids=layer_pos,
+                past_key_value=layer_past,
+                use_cache=use_cache,
+                output_attentions=False,
+            )
             x = out[0]
             if use_cache:
                 kv = extract_kv_tuple(out, layer_idx=i)
@@ -187,24 +168,15 @@ class StageLast(nn.Module):
 
         for i, layer in enumerate(self.layers):
             layer_past = None if past_key_values is None else past_key_values[i]
-            if isinstance(layer, WrappedLlamaBlock):
-                out = layer(
-                    x,
-                    attention_mask=None,
-                    position_ids=None,
-                    layer_past=layer_past,
-                    use_cache=use_cache,
-                )
-            else:
-                layer_pos = position_ids if position_ids is not None else default_position_ids(layer_past, x.shape[1], x.device)
-                out = layer(
-                    x,
-                    attention_mask=None,
-                    position_ids=layer_pos,
-                    past_key_value=layer_past,
-                    use_cache=use_cache,
-                    output_attentions=False,
-                )
+            layer_pos = position_ids if position_ids is not None else default_position_ids(layer_past, x.shape[1], x.device)
+            out = layer(
+                x,
+                attention_mask=None,
+                position_ids=layer_pos,
+                past_key_value=layer_past,
+                use_cache=use_cache,
+                output_attentions=False,
+            )
             x = out[0]
             if use_cache:
                 kv = extract_kv_tuple(out, layer_idx=i)
@@ -248,22 +220,11 @@ def load_stage_model(
         pass
     full.eval()
 
-    def _wrap_layers(module_list: nn.ModuleList):
-        new_layers = []
-        for idx, layer in enumerate(module_list):
-            if isinstance(layer, LlamaDecoderLayer):
-                wrapped = WrappedLlamaBlock(full.config)
-                wrapped.load_state_dict(layer.state_dict())
-                new_layers.append(wrapped)
-            else:
-                new_layers.append(layer)
-        return nn.ModuleList(new_layers)
-
     def _prune_layers(obj, start_idx, end_idx):
         if hasattr(obj, "model") and hasattr(obj.model, "layers"):
-            obj.model.layers = _wrap_layers(nn.ModuleList(obj.model.layers[start_idx:end_idx]))
+            obj.model.layers = nn.ModuleList(obj.model.layers[start_idx:end_idx])
         elif hasattr(obj, "transformer") and hasattr(obj.transformer, "h"):
-            obj.transformer.h = _wrap_layers(nn.ModuleList(obj.transformer.h[start_idx:end_idx]))
+            obj.transformer.h = nn.ModuleList(obj.transformer.h[start_idx:end_idx])
         else:
             raise ValueError(f"Unsupported model architecture for pruning: {type(obj)}")
 
