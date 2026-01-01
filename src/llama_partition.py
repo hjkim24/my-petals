@@ -111,17 +111,33 @@ class Stage0(nn.Module):
             )
             x = out[0]
             if use_cache:
+                # 디버깅: 레이어 출력 구조 확인
+                if i == 0:
+                    logger.debug(f"Stage0 layer {i} output: type={type(out)}, len={len(out)}, "
+                               f"out[0] type={type(out[0])}, out[-1] type={type(out[-1]) if len(out) > 0 else 'N/A'}, "
+                               f"out[-1] value={out[-1] if len(out) > 0 else 'N/A'}")
+                
                 kv_candidate = out[-1] if len(out) > 2 else (out[1] if len(out) > 1 else None)
                 if Cache is not None and isinstance(kv_candidate, Cache):
                     cache_obj = kv_candidate
                     kv = kv_candidate[i] if hasattr(kv_candidate, "__getitem__") else None
                 else:
                     kv = extract_kv_tuple(out, layer_idx=i)
+                
+                # 기본 LlamaDecoderLayer는 past_key_value를 반환하지 않을 수 있으므로
+                # attention 모듈의 forward 결과에서 직접 가져오기 시도
+                if kv is None:
+                    # LlamaDecoderLayer는 self_attn을 호출하고 그 결과를 사용
+                    # self_attn의 forward가 (attn_output, attn_weights, past_key_value)를 반환
+                    # 하지만 이것은 내부적으로만 사용되므로 직접 접근 불가
+                    # 대신 레이어 출력에서 찾기
+                    if len(out) >= 2:
+                        # out[1]이 None이면, 실제로는 다른 위치에 있을 수 있음
+                        logger.warning(f"Stage0: layer {i} out[1] is None, checking all outputs")
+                        for idx, item in enumerate(out):
+                            logger.debug(f"Stage0: layer {i} out[{idx}] = {item} (type={type(item)})")
+                
                 new_cache.append(kv)
-                if kv is None:
-                    logger.warning(f"StageLast: layer {i} returned no KV (kv_candidate type={type(kv_candidate)}, out_len={len(out)})")
-                if kv is None:
-                    logger.warning(f"StageSegment: layer {i} returned no KV (kv_candidate type={type(kv_candidate)}, out_len={len(out)})")
                 if kv is None:
                     logger.warning(f"Stage0: layer {i} returned no KV (kv_candidate type={type(kv_candidate)}, out_len={len(out)})")
 
@@ -223,6 +239,14 @@ class StageSegment(nn.Module):
                     kv = kv_candidate[i] if hasattr(kv_candidate, "__getitem__") else None
                 else:
                     kv = extract_kv_tuple(out, layer_idx=i)
+                
+                # 기본 LlamaDecoderLayer는 past_key_value를 반환하지 않을 수 있으므로
+                # attention 모듈에서 직접 가져오기 시도
+                if kv is None and hasattr(layer, 'self_attn') and hasattr(layer.self_attn, 'past_key_value'):
+                    attn_past = layer.self_attn.past_key_value
+                    if attn_past is not None:
+                        kv = attn_past
+                
                 new_cache.append(kv)
 
         if not use_cache:
@@ -332,6 +356,14 @@ class StageLast(nn.Module):
                     kv = kv_candidate[i] if hasattr(kv_candidate, "__getitem__") else None
                 else:
                     kv = extract_kv_tuple(out, layer_idx=i)
+                
+                # 기본 LlamaDecoderLayer는 past_key_value를 반환하지 않을 수 있으므로
+                # attention 모듈에서 직접 가져오기 시도
+                if kv is None and hasattr(layer, 'self_attn') and hasattr(layer.self_attn, 'past_key_value'):
+                    attn_past = layer.self_attn.past_key_value
+                    if attn_past is not None:
+                        kv = attn_past
+                
                 new_cache.append(kv)
 
         x = self.norm(x)
