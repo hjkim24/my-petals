@@ -1,6 +1,10 @@
 import torch
 import torch.nn as nn
 from transformers import AutoModelForCausalLM
+try:
+    from transformers.cache_utils import Cache  # type: ignore
+except Exception:
+    Cache = None
 from typing import Optional, Tuple
 
 from .utils import extract_kv_tuple, default_position_ids
@@ -41,6 +45,7 @@ class Stage0(nn.Module):
     ):
         x = self.embed_tokens(input_ids)
         new_cache = []
+        cache_obj: Optional[Cache] = None
 
         for i, layer in enumerate(self.layers):
             layer_past = None if past_key_values is None else past_key_values[i]
@@ -55,9 +60,16 @@ class Stage0(nn.Module):
             )
             x = out[0]
             if use_cache:
-                new_cache.append(extract_kv_tuple(out, layer_idx=i))
+                kv = extract_kv_tuple(out, layer_idx=i)
+                new_cache.append(kv)
+                if Cache is not None and isinstance(out[-1] if len(out) > 1 else None, Cache):
+                    cache_obj = out[-1]
 
-        return x, tuple(new_cache) if use_cache else None
+        if not use_cache:
+            return x, None
+        if cache_obj is not None:
+            return x, cache_obj
+        return x, tuple(new_cache)
 
 
 class StageSegment(nn.Module):
@@ -92,6 +104,7 @@ class StageSegment(nn.Module):
     ):
         x = hidden_states
         new_cache = []
+        cache_obj: Optional[Cache] = None
 
         for i, layer in enumerate(self.layers):
             layer_past = None if past_key_values is None else past_key_values[i]
@@ -106,9 +119,16 @@ class StageSegment(nn.Module):
             )
             x = out[0]
             if use_cache:
-                new_cache.append(extract_kv_tuple(out, layer_idx=i))
+                kv = extract_kv_tuple(out, layer_idx=i)
+                new_cache.append(kv)
+                if Cache is not None and isinstance(out[-1] if len(out) > 1 else None, Cache):
+                    cache_obj = out[-1]
 
-        return x, tuple(new_cache) if use_cache else None
+        if not use_cache:
+            return x, None
+        if cache_obj is not None:
+            return x, cache_obj
+        return x, tuple(new_cache)
 
 
 class StageLast(nn.Module):
@@ -152,6 +172,7 @@ class StageLast(nn.Module):
     ):
         x = hidden_states
         new_cache = []
+        cache_obj: Optional[Cache] = None
 
         for i, layer in enumerate(self.layers):
             layer_past = None if past_key_values is None else past_key_values[i]
@@ -166,11 +187,18 @@ class StageLast(nn.Module):
             )
             x = out[0]
             if use_cache:
-                new_cache.append(extract_kv_tuple(out, layer_idx=i))
+                kv = extract_kv_tuple(out, layer_idx=i)
+                new_cache.append(kv)
+                if Cache is not None and isinstance(out[-1] if len(out) > 1 else None, Cache):
+                    cache_obj = out[-1]
 
         x = self.norm(x)
         logits = self.lm_head(x)
-        return logits, tuple(new_cache) if use_cache else None
+        if not use_cache:
+            return logits, None
+        if cache_obj is not None:
+            return logits, cache_obj
+        return logits, tuple(new_cache)
 
 
 def load_stage_model(
