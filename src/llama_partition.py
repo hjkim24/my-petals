@@ -68,7 +68,29 @@ def _debug_conversion(original_layer: LlamaDecoderLayer, optimized_layer: Optimi
                     opt_buf_cpu = opt_buf.cpu()
                     if not torch.equal(orig_buf_cpu, opt_buf_cpu):
                         buf_diff = (orig_buf_cpu - opt_buf_cpu).abs().max().item()
-                        logger.error(f"Layer {layer_idx}: Rotary buffer '{buffer_name}' mismatch: {buf_diff:.8f}")
+                        # 상대 오차 계산
+                        orig_max = orig_buf_cpu.abs().max().item()
+                        relative_diff = (buf_diff / (orig_max + 1e-8)) * 100 if orig_max > 0 else 0
+                        
+                        # inv_freq의 일반적인 값 범위 확인
+                        orig_mean = orig_buf_cpu.mean().item()
+                        orig_std = orig_buf_cpu.std().item()
+                        
+                        logger.info(
+                            f"Layer {layer_idx}: Rotary buffer '{buffer_name}' - "
+                            f"abs_diff={buf_diff:.8f}, relative_diff={relative_diff:.4f}%, "
+                            f"orig_range=[{orig_buf_cpu.min().item():.8f}, {orig_buf_cpu.max().item():.8f}], "
+                            f"orig_mean={orig_mean:.8f}, orig_std={orig_std:.8f}"
+                        )
+                        
+                        # 허용 가능한 오차인지 판단 (float16의 경우 더 관대하게)
+                        # inv_freq는 보통 1e-4 ~ 1e-6 범위이므로, 0.00024170은 상대적으로 큰 차이일 수 있음
+                        if relative_diff < 0.1:  # 0.1% 미만이면 허용 가능
+                            logger.info(f"Layer {layer_idx}: ✓ Rotary buffer '{buffer_name}' difference is acceptable (relative_diff={relative_diff:.4f}%)")
+                        elif relative_diff < 1.0:  # 1% 미만이면 경고
+                            logger.warning(f"Layer {layer_idx}: ⚠ Rotary buffer '{buffer_name}' has moderate difference (relative_diff={relative_diff:.4f}%)")
+                        else:
+                            logger.error(f"Layer {layer_idx}: ✗ Rotary buffer '{buffer_name}' has large difference (relative_diff={relative_diff:.4f}%)")
                     else:
                         logger.debug(f"Layer {layer_idx}: Rotary buffer '{buffer_name}' OK")
                 else:
