@@ -2,7 +2,7 @@ import logging
 import torch
 import torch.nn as nn
 from transformers import AutoModelForCausalLM
-from transformers.models.llama.modeling_llama import LlamaDecoderLayer
+from transformers.models.llama.modeling_llama import LlamaDecoderLayer, apply_rotary_pos_emb
 try:
     from transformers.cache_utils import Cache  # type: ignore
 except Exception:
@@ -64,9 +64,23 @@ class LlamaDecoderLayerWrapper(nn.Module):
                 raise ValueError(f"Unexpected self_attn output length: {len(attn_out)}")
 
             if present_key_value is None:
-                # 마지막 수단: 현재 key/value를 past_key_value에서 가져와 넘겨준다
-                present_key_value = present_key_value if present_key_value is not None else past_key_value
-                logger.warning("LlamaDecoderLayerWrapper: present_key_value is None, falling back to past_key_value")
+                # 마지막 수단: 직접 key/value를 계산하여 반환
+                attn = self.layer.self_attn
+                bsz, q_len, _ = hidden_states.size()
+                query_states = attn.q_proj(hidden_states)
+                key_states = attn.k_proj(hidden_states)
+                value_states = attn.v_proj(hidden_states)
+                query_states = query_states.view(bsz, q_len, attn.num_heads, attn.head_dim).transpose(1, 2)
+                key_states = key_states.view(bsz, q_len, attn.num_key_value_heads, attn.head_dim).transpose(1, 2)
+                value_states = value_states.view(bsz, q_len, attn.num_key_value_heads, attn.head_dim).transpose(1, 2)
+                cos, sin = attn.rotary_emb(value_states, position_ids)
+                cos, sin = cos.unsqueeze(1), sin.unsqueeze(1)
+                query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+                if past_key_value is not None:
+                    key_states = torch.cat([past_key_value[0], key_states], dim=2)
+                    value_states = torch.cat([past_key_value[1], value_states], dim=2)
+                present_key_value = (key_states, value_states)
+                logger.warning("LlamaDecoderLayerWrapper: present_key_value was None; recomputed manually.")
 
             hidden_states = residual + attn_output
             residual = hidden_states
