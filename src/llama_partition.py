@@ -113,7 +113,7 @@ class Stage0(nn.Module):
             if use_cache:
                 # 디버깅: 레이어 출력 구조 확인
                 if i == 0:
-                    logger.debug(f"Stage0 layer {i} output: type={type(out)}, len={len(out)}, "
+                    logger.info(f"Stage0 layer {i} output: type={type(out)}, len={len(out)}, "
                                f"out[0] type={type(out[0])}, out[-1] type={type(out[-1]) if len(out) > 0 else 'N/A'}, "
                                f"out[-1] value={out[-1] if len(out) > 0 else 'N/A'}")
                 
@@ -135,7 +135,7 @@ class Stage0(nn.Module):
                         # out[1]이 None이면, 실제로는 다른 위치에 있을 수 있음
                         logger.warning(f"Stage0: layer {i} out[1] is None, checking all outputs")
                         for idx, item in enumerate(out):
-                            logger.debug(f"Stage0: layer {i} out[{idx}] = {item} (type={type(item)})")
+                            logger.info(f"Stage0: layer {i} out[{idx}] = {item} (type={type(item)})")
                 
                 new_cache.append(kv)
                 if kv is None:
