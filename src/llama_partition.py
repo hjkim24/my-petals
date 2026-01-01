@@ -70,10 +70,9 @@ class Stage0(nn.Module):
                         if key in original_state and key in opt_state:
                             orig_tensor = original_state[key]
                             opt_tensor = opt_state[key]
-                            # dtype이 다를 수 있으므로 float32로 변환하여 비교
-                            if orig_tensor.dtype != opt_tensor.dtype:
-                                orig_tensor = orig_tensor.float()
-                                opt_tensor = opt_tensor.float()
+                            # device와 dtype이 다를 수 있으므로 CPU, float32로 변환하여 비교
+                            orig_tensor = orig_tensor.cpu().float()
+                            opt_tensor = opt_tensor.cpu().float()
                             if not torch.allclose(orig_tensor, opt_tensor, atol=1e-4):
                                 logger.error(f"Stage0 layer {i}: Weight mismatch for {key}!")
                         elif key in original_state:
@@ -177,10 +176,9 @@ class StageSegment(nn.Module):
                         if key in original_state and key in opt_state:
                             orig_tensor = original_state[key]
                             opt_tensor = opt_state[key]
-                            # dtype이 다를 수 있으므로 float32로 변환하여 비교
-                            if orig_tensor.dtype != opt_tensor.dtype:
-                                orig_tensor = orig_tensor.float()
-                                opt_tensor = opt_tensor.float()
+                            # device와 dtype이 다를 수 있으므로 CPU, float32로 변환하여 비교
+                            orig_tensor = orig_tensor.cpu().float()
+                            opt_tensor = opt_tensor.cpu().float()
                             if not torch.allclose(orig_tensor, opt_tensor, atol=1e-4):
                                 logger.error(f"StageSegment layer {i}: Weight mismatch for {key}!")
                         elif key in original_state:
@@ -285,10 +283,9 @@ class StageLast(nn.Module):
                         if key in original_state and key in opt_state:
                             orig_tensor = original_state[key]
                             opt_tensor = opt_state[key]
-                            # dtype이 다를 수 있으므로 float32로 변환하여 비교
-                            if orig_tensor.dtype != opt_tensor.dtype:
-                                orig_tensor = orig_tensor.float()
-                                opt_tensor = opt_tensor.float()
+                            # device와 dtype이 다를 수 있으므로 CPU, float32로 변환하여 비교
+                            orig_tensor = orig_tensor.cpu().float()
+                            opt_tensor = opt_tensor.cpu().float()
                             if not torch.allclose(orig_tensor, opt_tensor, atol=1e-4):
                                 logger.error(f"StageLast layer {i}: Weight mismatch for {key}!")
                         elif key in original_state:
