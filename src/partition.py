@@ -17,28 +17,41 @@ def _get_past_from_output(out):
     
     # 방법 2: 튜플/리스트인 경우
     if isinstance(out, (tuple, list)):
-        # GPT-2: (hidden_states, present) where present is (key, value) tuple
-        # LLaMA/Qwen: (hidden_states, past_key_value) where past_key_value is (key, value) tuple
+        # LLaMA 레이어 출력 구조:
+        # - output_attentions=False, use_cache=False: (hidden_states,)
+        # - output_attentions=False, use_cache=True: (hidden_states, past_key_value)
+        # - output_attentions=True, use_cache=False: (hidden_states, attentions)
+        # - output_attentions=True, use_cache=True: (hidden_states, attentions, past_key_value)
+        # 따라서 마지막 요소가 past_key_value일 수 있음
+        
+        # 먼저 out[1] 확인 (output_attentions=False인 경우)
         if len(out) >= 2:
-            # out[1]이 KV cache일 수 있음
             cache = out[1]
             if cache is not None:
                 # GPT-2의 경우 present는 (key, value) 튜플
                 # LLaMA의 경우 past_key_value는 (key, value) 튜플
                 if isinstance(cache, (tuple, list)) and len(cache) == 2:
                     # (key, value) 형태인지 확인
-                    return cache
+                    # key와 value가 Tensor인지 확인
+                    if all(isinstance(t, torch.Tensor) for t in cache):
+                        return cache
                 # 이미 올바른 형태일 수도 있음
-                return cache
+                if isinstance(cache, torch.Tensor):
+                    # 단일 Tensor는 아닐 것
+                    pass
+                elif not isinstance(cache, torch.Tensor):
+                    # Tensor가 아닌 경우 (예: tuple of (key, value))
+                    return cache
         
-        # 일부 모델은 더 많은 요소를 반환할 수 있음 (예: attention weights)
-        # 마지막 요소가 cache일 수도 있음
+        # output_attentions=True인 경우: 마지막 요소가 past_key_value
         if len(out) > 2:
             cache = out[-1]
             if cache is not None:
                 # 마지막 요소가 (key, value) 튜플인지 확인
                 if isinstance(cache, (tuple, list)) and len(cache) == 2:
-                    return cache
+                    # key와 value가 Tensor인지 확인
+                    if all(isinstance(t, torch.Tensor) for t in cache):
+                        return cache
                 # Tensor가 아닌 경우 (예: tuple of (key, value))
                 if not isinstance(cache, torch.Tensor):
                     return cache
@@ -73,6 +86,10 @@ class LLaMALayerWrapper(nn.Module):
         # LLaMA는 position_ids만 받아서 내부적으로 RoPE를 계산함
         filtered_kwargs = {k: v for k, v in kwargs.items() 
                           if k not in ('position_embeddings', 'cache_position')}
+        
+        # output_attentions가 명시되지 않으면 False로 설정 (LLaMA 레이어 출력 구조 일관성)
+        if 'output_attentions' not in filtered_kwargs:
+            filtered_kwargs['output_attentions'] = False
         
         # position_ids가 None인 경우 자동 계산 (block.py 방식 차용)
         position_ids = filtered_kwargs.get('position_ids')
@@ -350,16 +367,17 @@ class Stage0(nn.Module):
             # 출력 구조 확인 및 hidden states 추출
             if isinstance(out, (tuple, list)):
                 x = out[0]
-                # GPT-2의 경우: use_cache=True일 때 (hidden_states, present) 반환해야 함
-                # 하지만 현재 len=1이므로, 레이어 내부에서 present를 추출해야 할 수도 있음
-                if i == 0 and use_cache:
+                # LLaMA 레이어 디버깅: 출력 구조 확인
+                if i == 0 and use_cache and isinstance(layer, LLaMALayerWrapper):
                     import warnings
                     warnings.warn(
-                        f"Layer {i} output structure: type={type(out)}, len={len(out)}, "
+                        f"Layer {i} (LLaMA) output structure: type={type(out)}, len={len(out)}, "
                         f"out[0] type={type(out[0])}, out[0] shape={out[0].shape if hasattr(out[0], 'shape') else 'N/A'}, "
                         f"out[1] type={type(out[1]) if len(out) > 1 else 'N/A'}, "
                         f"out[1] value={out[1] if len(out) > 1 else 'N/A'}, "
-                        f"kwargs: {kwargs}"
+                        f"out[-1] type={type(out[-1]) if len(out) > 0 else 'N/A'}, "
+                        f"out[-1] value={out[-1] if len(out) > 0 else 'N/A'}, "
+                        f"kwargs: {list(kwargs.keys())}"
                     )
             elif hasattr(out, "last_hidden_state"):
                 x = out.last_hidden_state
@@ -371,6 +389,17 @@ class Stage0(nn.Module):
             # KV 캐시 저장
             if use_cache:
                 kv_cache = _get_past_from_output(out)
+                
+                # LLaMA 레이어 특별 처리: out[1]이 None인 경우 마지막 요소 확인
+                if kv_cache is None and isinstance(out, (tuple, list)) and len(out) >= 2:
+                    # LLaMA 레이어는 output_attentions=False일 때 (hidden_states, past_key_value) 형태
+                    # 하지만 output_attentions=True일 때 (hidden_states, attentions, past_key_value) 형태
+                    # 마지막 요소가 past_key_value일 수 있음
+                    if len(out) > 2:
+                        # output_attentions=True인 경우: 마지막 요소가 past_key_value
+                        potential_cache = out[-1]
+                        if potential_cache is not None and isinstance(potential_cache, (tuple, list)) and len(potential_cache) == 2:
+                            kv_cache = potential_cache
                 
                 # GPT-2 특별 처리: 출력이 len=1인 경우, 레이어 내부에서 present 추출 시도
                 if kv_cache is None and isinstance(out, (tuple, list)) and len(out) == 1:
