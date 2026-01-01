@@ -58,10 +58,13 @@ class Stage0(nn.Module):
             )
             x = out[0]
             if use_cache:
-                kv = extract_kv_tuple(out, layer_idx=i)
+                kv_candidate = out[-1] if len(out) > 2 else (out[1] if len(out) > 1 else None)
+                if Cache is not None and isinstance(kv_candidate, Cache):
+                    cache_obj = kv_candidate
+                    kv = kv_candidate[i] if hasattr(kv_candidate, "__getitem__") else None
+                else:
+                    kv = extract_kv_tuple(out, layer_idx=i)
                 new_cache.append(kv)
-                if Cache is not None and isinstance(out[-1] if len(out) > 1 else None, Cache):
-                    cache_obj = out[-1]
 
         if not use_cache:
             return x, None
@@ -114,10 +117,13 @@ class StageSegment(nn.Module):
             )
             x = out[0]
             if use_cache:
-                kv = extract_kv_tuple(out, layer_idx=i)
+                kv_candidate = out[-1] if len(out) > 2 else (out[1] if len(out) > 1 else None)
+                if Cache is not None and isinstance(kv_candidate, Cache):
+                    cache_obj = kv_candidate
+                    kv = kv_candidate[i] if hasattr(kv_candidate, "__getitem__") else None
+                else:
+                    kv = extract_kv_tuple(out, layer_idx=i)
                 new_cache.append(kv)
-                if Cache is not None and isinstance(out[-1] if len(out) > 1 else None, Cache):
-                    cache_obj = out[-1]
 
         if not use_cache:
             return x, None
@@ -179,10 +185,13 @@ class StageLast(nn.Module):
             )
             x = out[0]
             if use_cache:
-                kv = extract_kv_tuple(out, layer_idx=i)
+                kv_candidate = out[-1] if len(out) > 2 else (out[1] if len(out) > 1 else None)
+                if Cache is not None and isinstance(kv_candidate, Cache):
+                    cache_obj = kv_candidate
+                    kv = kv_candidate[i] if hasattr(kv_candidate, "__getitem__") else None
+                else:
+                    kv = extract_kv_tuple(out, layer_idx=i)
                 new_cache.append(kv)
-                if Cache is not None and isinstance(out[-1] if len(out) > 1 else None, Cache):
-                    cache_obj = out[-1]
 
         x = self.norm(x)
         logits = self.lm_head(x)
