@@ -55,7 +55,7 @@ class Stage0(nn.Module):
             )
             x = out[0]
             if use_cache:
-                new_cache.append(extract_kv_tuple(out))
+                new_cache.append(extract_kv_tuple(out, layer_idx=i))
 
         return x, tuple(new_cache) if use_cache else None
 
@@ -106,7 +106,7 @@ class StageSegment(nn.Module):
             )
             x = out[0]
             if use_cache:
-                new_cache.append(extract_kv_tuple(out))
+                new_cache.append(extract_kv_tuple(out, layer_idx=i))
 
         return x, tuple(new_cache) if use_cache else None
 
@@ -166,7 +166,7 @@ class StageLast(nn.Module):
             )
             x = out[0]
             if use_cache:
-                new_cache.append(extract_kv_tuple(out))
+                new_cache.append(extract_kv_tuple(out, layer_idx=i))
 
         x = self.norm(x)
         logits = self.lm_head(x)

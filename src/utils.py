@@ -2,16 +2,35 @@ import torch
 from typing import Optional, Tuple, Iterable
 
 
-def extract_kv_tuple(output: Iterable) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+def extract_kv_tuple(output: Iterable, layer_idx: Optional[int] = None) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
     """
     Given a transformer layer output, return (key, value) tuple if present.
+    Handles both legacy tuple caches and transformers Cache/DynamicCache objects.
     Expected LLaMA-style outputs:
       - (hidden_states, past_key_value)
       - (hidden_states, attentions, past_key_value) when output_attentions=True
     """
+    try:
+        from transformers.cache_utils import Cache  # type: ignore
+    except Exception:
+        Cache = None
+
     if not isinstance(output, (tuple, list)) or len(output) < 2:
         return None
     candidate = output[-1] if len(output) > 2 else output[1]
+
+    # Handle new transformers Cache objects
+    if Cache is not None and isinstance(candidate, Cache):
+        try:
+            if layer_idx is not None:
+                return candidate[layer_idx]
+            # Fallback to legacy conversion if no layer index provided
+            legacy = candidate.to_legacy_cache()
+            if layer_idx is None and len(legacy) > 0:
+                return legacy[-1]
+        except Exception:
+            return None
+
     if isinstance(candidate, (tuple, list)) and len(candidate) == 2:
         if all(isinstance(t, torch.Tensor) for t in candidate):
             return candidate  # (key, value)
