@@ -3,24 +3,12 @@ import torch.nn as nn
 from transformers import AutoModelForCausalLM
 from typing import Optional, Tuple
 
-
-def _extract_kv_tuple(output):
-    """
-    Expect LLaMA-style outputs:
-    - (hidden_states, past_key_value)
-    - or (hidden_states, attentions, past_key_value) if output_attentions=True
-    Return (key, value) tuple or None.
-    """
-    if not isinstance(output, (tuple, list)) or len(output) < 2:
-        return None
-    candidate = output[-1] if len(output) > 2 else output[1]
-    if isinstance(candidate, (tuple, list)) and len(candidate) == 2 and all(isinstance(t, torch.Tensor) for t in candidate):
-        return candidate
-    return None
+from .utils import extract_kv_tuple, default_position_ids
 
 
 class Stage0(nn.Module):
-    """LLaMA-only Stage0 with tuple KV cache."""
+    """LLaMA-only Stage0 using tuple KV cache."""
+
     def __init__(self, full, end: int):
         super().__init__()
         model_type = getattr(full.config, "model_type", "").lower()
@@ -52,18 +40,11 @@ class Stage0(nn.Module):
         use_cache: bool = True,
     ):
         x = self.embed_tokens(input_ids)
-        cache = [] if past_key_values is None else list(past_key_values)
+        new_cache = []
 
         for i, layer in enumerate(self.layers):
             layer_past = None if past_key_values is None else past_key_values[i]
-            # 기본 position_ids 사용, 없으면 past 길이 기준 생성
-            if position_ids is not None:
-                layer_pos = position_ids
-            elif layer_past is not None and isinstance(layer_past, (tuple, list)) and len(layer_past) == 2:
-                past_len = layer_past[0].shape[2]
-                layer_pos = torch.arange(past_len, past_len + x.shape[1], device=x.device).unsqueeze(0)
-            else:
-                layer_pos = torch.arange(0, x.shape[1], device=x.device).unsqueeze(0)
+            layer_pos = position_ids if position_ids is not None else default_position_ids(layer_past, x.shape[1], x.device)
             out = layer(
                 x,
                 attention_mask=None,
@@ -74,13 +55,14 @@ class Stage0(nn.Module):
             )
             x = out[0]
             if use_cache:
-                cache.append(_extract_kv_tuple(out))
+                new_cache.append(extract_kv_tuple(out))
 
-        return x, tuple(cache) if use_cache else None
+        return x, tuple(new_cache) if use_cache else None
 
 
 class StageSegment(nn.Module):
-    """LLaMA-only middle segment with tuple KV cache."""
+    """LLaMA-only middle segment using tuple KV cache."""
+
     def __init__(self, full, start: int, end: int):
         super().__init__()
         model_type = getattr(full.config, "model_type", "").lower()
@@ -109,17 +91,11 @@ class StageSegment(nn.Module):
         use_cache: bool = True,
     ):
         x = hidden_states
-        cache = [] if past_key_values is None else list(past_key_values)
+        new_cache = []
 
         for i, layer in enumerate(self.layers):
             layer_past = None if past_key_values is None else past_key_values[i]
-            if position_ids is not None:
-                layer_pos = position_ids
-            elif layer_past is not None and isinstance(layer_past, (tuple, list)) and len(layer_past) == 2:
-                past_len = layer_past[0].shape[2]
-                layer_pos = torch.arange(past_len, past_len + x.shape[1], device=x.device).unsqueeze(0)
-            else:
-                layer_pos = torch.arange(0, x.shape[1], device=x.device).unsqueeze(0)
+            layer_pos = position_ids if position_ids is not None else default_position_ids(layer_past, x.shape[1], x.device)
             out = layer(
                 x,
                 attention_mask=None,
@@ -130,13 +106,14 @@ class StageSegment(nn.Module):
             )
             x = out[0]
             if use_cache:
-                cache.append(_extract_kv_tuple(out))
+                new_cache.append(extract_kv_tuple(out))
 
-        return x, tuple(cache) if use_cache else None
+        return x, tuple(new_cache) if use_cache else None
 
 
 class StageLast(nn.Module):
-    """LLaMA-only last stage with tuple KV cache."""
+    """LLaMA-only last stage using tuple KV cache."""
+
     def __init__(self, full, start: int):
         super().__init__()
         model_type = getattr(full.config, "model_type", "").lower()
@@ -174,17 +151,11 @@ class StageLast(nn.Module):
         use_cache: bool = True,
     ):
         x = hidden_states
-        cache = [] if past_key_values is None else list(past_key_values)
+        new_cache = []
 
         for i, layer in enumerate(self.layers):
             layer_past = None if past_key_values is None else past_key_values[i]
-            if position_ids is not None:
-                layer_pos = position_ids
-            elif layer_past is not None and isinstance(layer_past, (tuple, list)) and len(layer_past) == 2:
-                past_len = layer_past[0].shape[2]
-                layer_pos = torch.arange(past_len, past_len + x.shape[1], device=x.device).unsqueeze(0)
-            else:
-                layer_pos = torch.arange(0, x.shape[1], device=x.device).unsqueeze(0)
+            layer_pos = position_ids if position_ids is not None else default_position_ids(layer_past, x.shape[1], x.device)
             out = layer(
                 x,
                 attention_mask=None,
@@ -195,11 +166,11 @@ class StageLast(nn.Module):
             )
             x = out[0]
             if use_cache:
-                cache.append(_extract_kv_tuple(out))
+                new_cache.append(extract_kv_tuple(out))
 
         x = self.norm(x)
         logits = self.lm_head(x)
-        return logits, tuple(cache) if use_cache else None
+        return logits, tuple(new_cache) if use_cache else None
 
 
 def load_stage_model(
@@ -212,8 +183,7 @@ def load_stage_model(
     dtype=torch.float16,
 ):
     """
-    Load only the layers needed for a stage to reduce memory.
-    LLaMA-only implementation with tuple KV cache.
+    Load only the layers needed for a stage to reduce memory (LLaMA-only).
     role:
       - 'stage0': keep embeddings + layers[:end], drop head/norm
       - 'segment': keep layers[start:end], drop embeddings/head/norm

@@ -14,7 +14,7 @@ from hivemind.utils.logging import get_logger
 # Import 경로 처리: 패키지로 실행되거나 직접 실행될 때 모두 지원
 try:
     # 패키지로 실행될 때 (python -m src.main)
-    from .partition import load_stage_model, Stage0, StageSegment, StageLast
+    from .llama_partition import load_stage_model, Stage0, StageSegment, StageLast
     from .rpc_transport import RpcTransport
     from .rpc_handler import StageConnectionHandler
 except ImportError:
@@ -23,7 +23,7 @@ except ImportError:
     from pathlib import Path
     project_root = Path(__file__).parent.parent
     sys.path.insert(0, str(project_root))
-    from src.partition import load_stage_model, Stage0, StageSegment, StageLast
+    from src.llama_partition import load_stage_model, Stage0, StageSegment, StageLast
     from src.rpc_transport import RpcTransport
     from src.rpc_handler import StageConnectionHandler
 
@@ -429,4 +429,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
