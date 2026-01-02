@@ -3,7 +3,7 @@ import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 model_name = "meta-llama/Llama-2-7b-hf"  # 여러분이 쓰는 모델 경로로 교체
-prompt = "Hello, how are you?"           # 비교할 프롬프트
+prompt = "What is the captial of Korea?"           # 비교할 프롬프트
 dtype = torch.float16                    # fp16/bf16/fp32 선택
 max_new_tokens = 64                      # 생성할 최대 토큰 수
 temperature = 1.0                        # 샘플링 temperature
