@@ -199,7 +199,11 @@ def run_rank0(args, device, splits):
         # send_prefill과 동일 (generated_tokens 전달)
         tx.send_decode_step(cur_len, hidden, session_id=session_id, max_length=max_length, generated_tokens=generated)  # [1,1,H]
         next_id = tx.recv_token()
-        logger.info(f"Stage0: received token={next_id}")
+        
+        # 출력 품질 확인: 각 토큰 디코딩 및 부분 텍스트 출력
+        next_token_text = tok.decode([next_id], skip_special_tokens=True)
+        partial_text = tok.decode(generated + [next_id], skip_special_tokens=True)
+        logger.info(f"Stage0: received token={next_id} ('{next_token_text}') | Partial: '{partial_text[-50:]}'")
 
         # EOS 토큰 체크 - 생성 중단
         if eos_token_id is not None and next_id == eos_token_id:
@@ -210,7 +214,7 @@ def run_rank0(args, device, splits):
         if next_id == last_token:
             consecutive_repeat_count += 1
             if consecutive_repeat_count >= 5:
-                logger.warning(f"Consecutive repetition detected (token {next_id}), stopping generation")
+                logger.warning(f"Consecutive repetition detected (token {next_id}='{next_token_text}'), stopping generation")
                 break
         else:
             consecutive_repeat_count = 0
@@ -228,11 +232,41 @@ def run_rank0(args, device, splits):
 
     # 생성된 모든 토큰을 한 번에 디코딩하여 출력
     generated_text = tok.decode(generated, skip_special_tokens=True)
-    print(f"\nGenerated: {generated_text}")
+    
+    # ========== 출력 품질 평가 ==========
+    print(f"\n{'='*80}")
+    print(f"PROMPT: {prompt}")
+    print(f"GENERATED: {generated_text}")
+    print(f"{'='*80}\n")
+    
+    # 품질 메트릭 계산
+    prompt_tokens = len(input_ids[0])
+    generated_tokens = len(generated) - prompt_tokens  # generated에는 prompt도 포함될 수 있음
+    actual_generated = generated[prompt_tokens:] if len(generated) > prompt_tokens else generated
+    actual_generated_text = tok.decode(actual_generated, skip_special_tokens=True)
+    
+    # 반복 토큰 비율 계산
+    unique_tokens = len(set(actual_generated))
+    repetition_ratio = 1.0 - (unique_tokens / len(actual_generated)) if len(actual_generated) > 0 else 0.0
+    
+    # EOS 전에 끝났는지 확인
+    ended_with_eos = eos_token_id is not None and generated[-1] == eos_token_id if generated else False
+    
+    logger.info(f"\n{'='*80}")
+    logger.info(f"OUTPUT QUALITY METRICS:")
+    logger.info(f"  Prompt: '{prompt}'")
+    logger.info(f"  Generated text: '{actual_generated_text}'")
+    logger.info(f"  Generated tokens: {len(actual_generated)}")
+    logger.info(f"  Unique tokens: {unique_tokens}")
+    logger.info(f"  Repetition ratio: {repetition_ratio:.2%}")
+    logger.info(f"  Ended with EOS: {ended_with_eos}")
+    logger.info(f"  Consecutive repeats detected: {consecutive_repeat_count >= 5}")
+    logger.info(f"{'='*80}")
+    
     logger.info(f"\nDecode completed in {decode_time:.3f}s")
     logger.info(f"Total time: {total_time:.3f}s")
     logger.info(f"TTFT (Time to First Token): {prefill_time:.3f}s")
-    logger.info(f"Throughput: {len(generated) / total_time:.2f} tokens/s")
+    logger.info(f"Throughput: {len(actual_generated) / total_time:.2f} tokens/s")
 
     # 성능 통계 출력
     if hasattr(tx, 'decode_stage_times') and tx.decode_stage_times:

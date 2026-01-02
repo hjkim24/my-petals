@@ -275,7 +275,11 @@ class StageConnectionHandler(ConnectionHandler):
                 repetition_penalty=repetition_penalty,
                 generated_tokens=generated_tokens
             ))
-            logger.info(f"[{session_id[:8]}] {stage_name} [FINAL]: Sampled token={next_token_id}, logits shape={next_token_logits.shape}")
+            # 샘플링된 토큰의 확률 확인
+            probs = torch.softmax(next_token_logits / max(temperature, 1e-5), dim=-1)
+            sampled_prob = probs[0, next_token_id].item()
+            logger.info(f"[{session_id[:8]}] {stage_name} [FINAL]: Sampled token={next_token_id}, "
+                       f"probability={sampled_prob:.4f}, logits shape={next_token_logits.shape}")
             response_metadata = {"token_id": next_token_id, "session_id": session_id}
             token_tensor = torch.tensor([[next_token_id]], device=self.device, dtype=torch.long)
             serialized_token = serialize_torch_tensor(token_tensor.cpu())
