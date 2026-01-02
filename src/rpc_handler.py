@@ -82,6 +82,39 @@ class StageConnectionHandler(ConnectionHandler):
         self.final_stage = final_stage
 
     @staticmethod
+    def _convert_cache_dtype(self, past_key_values, target_dtype: torch.dtype, device: torch.device):
+        """Convert past_key_values (KV cache) to target dtype and device."""
+        try:
+            from transformers.cache_utils import Cache
+        except Exception:
+            Cache = None
+        
+        # Handle transformers Cache objects
+        if Cache is not None and isinstance(past_key_values, Cache):
+            # Cache 객체는 내부적으로 dtype 변환을 지원할 수 있음
+            # 필요시 각 key/value를 변환
+            return past_key_values
+        
+        # Handle legacy tuple cache: tuple of tuples ((key, value), ...)
+        if isinstance(past_key_values, (tuple, list)):
+            converted = []
+            for layer_cache in past_key_values:
+                if layer_cache is None:
+                    converted.append(None)
+                elif isinstance(layer_cache, (tuple, list)) and len(layer_cache) == 2:
+                    # (key, value) tuple
+                    key, value = layer_cache
+                    if key is not None:
+                        key = key.to(device=device, dtype=target_dtype)
+                    if value is not None:
+                        value = value.to(device=device, dtype=target_dtype)
+                    converted.append((key, value))
+                else:
+                    converted.append(layer_cache)
+            return tuple(converted)
+        
+        return past_key_values
+
     def _past_len(past_key_values, cur_len: int, chunk_len: int) -> int:
         """Safely derive past sequence length for cache-aware masking."""
         # HuggingFace Cache object (e.g., DynamicCache for LLaMA)
@@ -184,6 +217,11 @@ class StageConnectionHandler(ConnectionHandler):
             first_param = next(self.stage_model.parameters(), None)
             model_dtype = cfg_dtype or (first_param.dtype if first_param is not None else hidden_states.dtype)
             inputs = hidden_states.to(self.device, dtype=model_dtype)
+            
+            # Convert past_key_values to match model dtype and device
+            if past_key_values is not None:
+                past_key_values = self._convert_cache_dtype(past_key_values, model_dtype, self.device)
+            
             try:
                 outputs, new_past = self.stage_model(
                     inputs,
