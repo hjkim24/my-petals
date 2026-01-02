@@ -4,17 +4,64 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 from transformers import AutoModelForCausalLM
+try:
+    from transformers.cache_utils import Cache  # type: ignore
+except Exception:
+    Cache = None
 
 from .utils import extract_kv_tuple, default_position_ids
 
 logger = logging.getLogger(__name__)
 
 
-def _convert_layers(raw_layers: nn.ModuleList, config) -> nn.ModuleList:
+class LlamaDecoderLayerWrapper(nn.Module):
     """
-    Stay bit-identical to the HF reference: do NOT wrap/convert layers.
+    Minimal wrapper to force returning present_key_value when use_cache=True.
     """
-    return nn.ModuleList(raw_layers)
+
+    def __init__(self, layer: nn.Module):
+        super().__init__()
+        self.layer = layer
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
+        past_key_value: Optional[Tuple] = None,
+        output_attentions: bool = False,
+        use_cache: bool = True,
+    ):
+        outputs = self.layer(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_value=past_key_value,
+            output_attentions=output_attentions,
+            use_cache=True,  # force cache
+        )
+        if use_cache:
+            if len(outputs) < 2:
+                raise ValueError("LlamaDecoderLayerWrapper: outputs missing present_key_value")
+            present = outputs[2] if (output_attentions and len(outputs) > 2) else outputs[1]
+            if present is None:
+                logger.warning("LlamaDecoderLayerWrapper: present_key_value is None, falling back to past_key_value")
+                present = past_key_value
+            if output_attentions:
+                return outputs[0], outputs[1], present
+            return outputs[0], present
+        return outputs
+
+
+def _convert_layers(raw_layers: nn.ModuleList) -> nn.ModuleList:
+    """Wrap HF layers to ensure KV is returned."""
+    wrapped = []
+    for layer in raw_layers:
+        if isinstance(layer, LlamaDecoderLayer):
+            wrapped.append(LlamaDecoderLayerWrapper(layer))
+        else:
+            wrapped.append(layer)
+    return nn.ModuleList(wrapped)
 
 
 class Stage0(nn.Module):
@@ -36,7 +83,7 @@ class Stage0(nn.Module):
         else:
             raise ValueError(f"Unsupported LLaMA architecture: {type(full)}.")
 
-        self.layers = _convert_layers(raw_layers, full.config)
+        self.layers = _convert_layers(raw_layers)
         self.config = full.config
 
     def forward(
@@ -91,7 +138,7 @@ class StageSegment(nn.Module):
         else:
             raise ValueError(f"Unsupported LLaMA architecture: {type(full)}.")
 
-        self.layers = _convert_layers(raw_layers, full.config)
+        self.layers = _convert_layers(raw_layers)
         self.config = full.config
 
     def forward(
@@ -153,7 +200,7 @@ class StageLast(nn.Module):
         else:
             raise ValueError(f"Unsupported LLaMA architecture: {type(full)}.")
 
-        self.layers = _convert_layers(raw_layers, full.config)
+        self.layers = _convert_layers(raw_layers)
         self.lm_head = full.lm_head
         self.config = full.config
 
