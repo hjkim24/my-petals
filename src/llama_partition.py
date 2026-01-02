@@ -94,10 +94,6 @@ class Stage0(nn.Module):
 
         self.layers = _convert_layers(nn.ModuleList(raw_layers), full.config)
         self.config = full.config
-        if len(self.layers) == 0:
-            logger.warning(f"StageSegment initialized with 0 layers (start={start}, end={end})")
-        else:
-            logger.info(f"StageSegment initialized with {len(self.layers)} layers (start={start}, end={end})")
         logger.info(f"Stage0 initialized with {len(self.layers)} layers (end={end})")
 
     def forward(
@@ -159,6 +155,10 @@ class StageSegment(nn.Module):
 
         self.layers = _convert_layers(nn.ModuleList(raw_layers), full.config)
         self.config = full.config
+        if len(self.layers) == 0:
+            logger.warning(f"StageSegment initialized with 0 layers (start={start}, end={end})")
+        else:
+            logger.info(f"StageSegment initialized with {len(self.layers)} layers (start={start}, end={end})")
 
     def forward(
         self,
