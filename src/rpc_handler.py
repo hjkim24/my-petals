@@ -81,7 +81,6 @@ class StageConnectionHandler(ConnectionHandler):
         self._default_top_k = 0
         self.final_stage = final_stage
 
-    @staticmethod
     def _convert_cache_dtype(self, past_key_values, target_dtype: torch.dtype, device: torch.device):
         """Convert past_key_values (KV cache) to target dtype and device."""
         try:
@@ -115,6 +114,7 @@ class StageConnectionHandler(ConnectionHandler):
         
         return past_key_values
 
+    @staticmethod
     def _past_len(past_key_values, cur_len: int, chunk_len: int) -> int:
         """Safely derive past sequence length for cache-aware masking."""
         # HuggingFace Cache object (e.g., DynamicCache for LLaMA)
@@ -178,7 +178,7 @@ class StageConnectionHandler(ConnectionHandler):
             past_key_values = self._kv_cache.get(session_id)
             if past_key_values is None:
                 raise ValueError(f"Missing past_key_values for session_id={session_id}")
-            past_len = self._past_len(past_key_values, cur_len, hidden_states.shape[1])
+            past_len = StageConnectionHandler._past_len(past_key_values, cur_len, hidden_states.shape[1])
             # 디버깅: past_len이 올바른지 확인 (INFO 레벨로 변경하여 항상 출력)
             expected_past_len = cur_len - hidden_states.shape[1]
             if past_len != expected_past_len:
