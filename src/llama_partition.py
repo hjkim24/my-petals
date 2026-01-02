@@ -264,6 +264,9 @@ class StageLast(nn.Module):
                 tuple_cache.append(present)
 
         x = self.norm(x)
+        # Ensure x dtype matches lm_head weight dtype to avoid dtype mismatch
+        if hasattr(self.lm_head, 'weight') and self.lm_head.weight is not None:
+            x = x.to(dtype=self.lm_head.weight.dtype)
         logits = self.lm_head(x)
         if not use_cache:
             return logits, None
