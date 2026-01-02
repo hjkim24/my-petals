@@ -94,7 +94,6 @@ class Stage0(nn.Module):
 
         self.layers = _convert_layers(nn.ModuleList(raw_layers), full.config)
         self.config = full.config
-        logger.info(f"StageSegment initialized with {len(self.layers)} layers (start={start}, end={end})")
         logger.info(f"Stage0 initialized with {len(self.layers)} layers")
 
     def forward(
