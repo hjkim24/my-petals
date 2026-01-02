@@ -4,6 +4,7 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 from transformers import AutoModelForCausalLM
+from transformers.models.llama.modeling_llama import LlamaDecoderLayer
 try:
     from transformers.cache_utils import Cache  # type: ignore
 except Exception:
