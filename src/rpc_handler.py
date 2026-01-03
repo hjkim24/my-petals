@@ -37,14 +37,6 @@ from hivemind.moe.server.connection_handler import ConnectionHandler
 from hivemind.proto import runtime_pb2
 from hivemind.utils.logging import get_logger
 
-try:
-    from .llama_partition import StageSegment, StageLast
-except ImportError:
-    import sys
-    from pathlib import Path
-    sys.path.insert(0, str(Path(__file__).parent.parent))
-    from src.llama_partition import StageSegment, StageLast
-
 logger = get_logger(__name__)
 
 
