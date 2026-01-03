@@ -328,7 +328,22 @@ class RpcTransport:
         for attempt in range(max_recovery_attempts):
             try:
                 # 기존 RPC 호출
-                size = len(serialized_tensors[0]) if serialized_tensors else 0
+                # serialized_tensors[0]는 runtime_pb2.Tensor protobuf 메시지이므로 크기 계산 방법이 다름
+                if serialized_tensors:
+                    first_tensor = serialized_tensors[0]
+                    # runtime_pb2.Tensor인 경우 ByteSize() 사용, bytes인 경우 len() 사용
+                    if hasattr(first_tensor, 'ByteSize'):
+                        size = first_tensor.ByteSize()
+                    elif isinstance(first_tensor, bytes):
+                        size = len(first_tensor)
+                    else:
+                        # fallback: SerializeToString()으로 변환 후 크기 확인
+                        try:
+                            size = len(first_tensor.SerializeToString())
+                        except AttributeError:
+                            size = 0
+                else:
+                    size = 0
                 forward_fn = self._call_stage_stream if size > MAX_UNARY_PAYLOAD_SIZE // 2 else self._call_stage_unary
                 return await forward_fn(stage_key, serialized_tensors, metadata, timeout, expect_hidden)
             except (asyncio.TimeoutError, ConnectionError, RuntimeError, ValueError) as e:
