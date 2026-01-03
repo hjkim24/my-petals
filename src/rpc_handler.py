@@ -436,3 +436,146 @@ class StageConnectionHandler(ConnectionHandler):
             except Exception as e:
                 logger.error(f"Error in rpc_forward_stream: {e}", exc_info=True)
                 raise
+
+    async def rpc_restore_cache_stream(
+        self, requests: AsyncIterator[runtime_pb2.ExpertRequest], context: P2PContext
+    ) -> AsyncIterator[runtime_pb2.ExpertResponse]:
+        """
+        Restore KV cache by replaying past inputs (activations).
+        
+        논문에서 말한 복구 방식: client-side cache(past inputs)로 서버 상태를 restore.
+        
+        Expected request format:
+        - First request: metadata with 'session_id', 'mode': 'restore', 'num_activations': N
+        - Subsequent requests: tensors containing activations in chronological order
+        """
+        async with timeout(self.request_timeout * 10):  # Restore can take longer
+            try:
+                # Collect all activation tensors from stream
+                tensor_parts = []
+                metadata = None
+                num_activations = 0
+
+                async for req in requests:
+                    if metadata is None:
+                        metadata = MSGPackSerializer.loads(req.metadata) if req.metadata else {}
+                        num_activations = int(metadata.get("num_activations", 0))
+                        if metadata.get("mode") != "restore":
+                            raise ValueError("rpc_restore_cache_stream requires mode='restore'")
+                    tensor_parts.extend(req.tensors)
+
+                if not tensor_parts:
+                    raise ValueError("rpc_restore_cache_stream received no tensors")
+                if metadata is None:
+                    raise ValueError("rpc_restore_cache_stream missing metadata")
+
+                session_id = metadata.get("session_id")
+                if session_id is None:
+                    raise ValueError("request.metadata must contain session_id")
+
+                # Deserialize all activations
+                async def tensor_iter():
+                    for tensor in tensor_parts:
+                        yield tensor
+
+                tensors = await deserialize_tensor_stream(tensor_iter())
+                if not tensors:
+                    raise ValueError("Failed to deserialize tensors from stream")
+
+                past_inputs = tensors  # List of activation tensors [h_0, h_1, ..., h_{t-1}]
+
+                logger.info(
+                    f"[{session_id[:8]}] Restoring KV cache: session_id={session_id}, "
+                    f"num_activations={len(past_inputs)}"
+                )
+
+                # Clear existing cache for this session
+                if session_id in self._kv_cache:
+                    del self._kv_cache[session_id]
+
+                # Replay activations to rebuild KV cache
+                # 논문: "서버가 죽으면 새 서버에 그 activation들을 한 번에 O(t)로 replay해서 서버 KV cache를 다시 쌓게 만들어야 해"
+                with torch.inference_mode():
+                    cfg_dtype = getattr(getattr(self.stage_model, "config", None), "torch_dtype", None)
+                    first_param = next(self.stage_model.parameters(), None)
+                    model_dtype = cfg_dtype or (first_param.dtype if first_param is not None else torch.float32)
+
+                    past_key_values = None
+                    cur_len = 0
+
+                    for i, hidden_states in enumerate(past_inputs):
+                        # Convert to model dtype and device
+                        inputs = hidden_states.to(self.device, dtype=model_dtype)
+                        
+                        # Determine if this is prefill (first activation) or decode
+                        seq_len = inputs.shape[1]
+                        is_prefill = (i == 0 and seq_len > 1)
+                        
+                        if is_prefill:
+                            # Prefill: full sequence
+                            past_len = 0
+                            pos_ids = torch.arange(seq_len, device=self.device, dtype=torch.long).unsqueeze(0)
+                        else:
+                            # Decode: single token
+                            past_len = StageConnectionHandler._past_len(past_key_values, cur_len, seq_len)
+                            pos_ids = torch.tensor([[past_len]], device=self.device, dtype=torch.long)
+                        
+                        attn_mask = None
+                        
+                        # Convert past_key_values to match model dtype and device
+                        if past_key_values is not None:
+                            past_key_values = self._convert_cache_dtype(past_key_values, model_dtype, self.device)
+                        
+                        # Forward pass to accumulate KV cache (no logits/token generation needed)
+                        outputs, past_key_values = self.stage_model(
+                            inputs,
+                            position_ids=pos_ids,
+                            attention_mask=attn_mask,
+                            past_key_values=past_key_values,
+                            use_cache=True,
+                        )
+                        
+                        cur_len += seq_len
+
+                # Store the rebuilt cache
+                self._kv_cache[session_id] = past_key_values
+
+                logger.info(
+                    f"[{session_id[:8]}] KV cache restored successfully: "
+                    f"past_len={StageConnectionHandler._past_len(past_key_values, cur_len, 1)}"
+                )
+
+                # Return success response with optional last hidden state
+                response_metadata = {
+                    "session_id": session_id,
+                    "status": "success",
+                    "restored_len": cur_len,
+                }
+                
+                # Optionally return last hidden state (for optimization)
+                if not self.final_stage and len(past_inputs) > 0:
+                    last_hidden = past_inputs[-1]
+                    serialized_hidden = serialize_torch_tensor(last_hidden.cpu())
+                    yield runtime_pb2.ExpertResponse(
+                        tensors=[serialized_hidden],
+                        metadata=MSGPackSerializer.dumps(response_metadata),
+                    )
+                else:
+                    # Just return metadata
+                    yield runtime_pb2.ExpertResponse(
+                        tensors=[],
+                        metadata=MSGPackSerializer.dumps(response_metadata),
+                    )
+
+            except Exception as e:
+                logger.error(f"Error in rpc_restore_cache_stream: {e}", exc_info=True)
+                # Return error response
+                error_metadata = {
+                    "status": "error",
+                    "error": str(e),
+                }
+                yield runtime_pb2.ExpertResponse(
+                    tensors=[],
+                    metadata=MSGPackSerializer.dumps(error_metadata),
+                )
+                raise
