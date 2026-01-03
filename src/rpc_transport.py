@@ -14,6 +14,11 @@ from hivemind import DHT, PeerID, serialize_torch_tensor, MSGPackSerializer
 from hivemind.compression.serialization import deserialize_torch_tensor
 from hivemind.p2p import P2P
 from hivemind.p2p.p2p_daemon_bindings.control import DEFAULT_MAX_MSG_SIZE, MAX_UNARY_PAYLOAD_SIZE
+try:
+    from hivemind.p2p.p2p_daemon_bindings.utils import P2PDaemonError, P2PHandlerError
+except ImportError:
+    # Fallback for different hivemind versions
+    from hivemind.p2p.p2p_daemon_bindings import P2PDaemonError, P2PHandlerError
 from hivemind.proto import runtime_pb2
 from hivemind.utils.asyncio import aiter_with_timeout, iter_as_aiter
 from hivemind.utils.logging import get_logger
@@ -346,7 +351,7 @@ class RpcTransport:
                     size = 0
                 forward_fn = self._call_stage_stream if size > MAX_UNARY_PAYLOAD_SIZE // 2 else self._call_stage_unary
                 return await forward_fn(stage_key, serialized_tensors, metadata, timeout, expect_hidden)
-            except (asyncio.TimeoutError, ConnectionError, RuntimeError, ValueError) as e:
+            except (asyncio.TimeoutError, ConnectionError, RuntimeError, ValueError, P2PDaemonError, P2PHandlerError) as e:
                 if is_replay:
                     # Replay 중 실패는 복구 불가
                     logger.error(f"Replay failed for {stage_key}: {e}")
