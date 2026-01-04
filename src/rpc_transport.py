@@ -19,7 +19,27 @@ from hivemind.utils.asyncio import aiter_with_timeout, iter_as_aiter
 from hivemind.utils.logging import get_logger
 from hivemind.utils.streaming import split_for_streaming
 
+# Import 경로 처리: 패키지로 실행되거나 직접 실행될 때 모두 지원
+try:
+    from .activation_cache import ActivationCache, get_cache
+except ImportError:
+    # 직접 실행될 때 (python src/rpc_transport.py)
+    import sys
+    from pathlib import Path
+    project_root = Path(__file__).parent.parent
+    sys.path.insert(0, str(project_root))
+    from src.activation_cache import ActivationCache, get_cache
+
 logger = get_logger(__name__)
+
+
+class ServerFailed(Exception):
+    """Exception raised when a server fails during RPC call."""
+    def __init__(self, stage_key: str, session_id: str, original_exception: Exception):
+        self.stage_key = stage_key
+        self.session_id = session_id
+        self.original_exception = original_exception
+        super().__init__(f"Server {stage_key} failed: {original_exception}")
 
 
 class RpcTransport:
@@ -65,6 +85,9 @@ class RpcTransport:
         self.last_decode_total: Optional[float] = None # 마지막 Decode Step 전체 소요 시간
         self.decode_stage_history: List[List[Tuple[str, float]]] = [] # 모든 Decode Step의 Stage별 소요 시간 히스토리
         self.decode_total_times: List[float] = [] # 모든 Decode Step의 전체 소요 시간 리스트
+
+        # Activation cache for fault tolerance (C-2: Dual Cache)
+        self.activation_cache: ActivationCache = get_cache()
 
         initial_peers_list = self._format_initial_peers(dht_initial_peers)
 
@@ -206,72 +229,84 @@ class RpcTransport:
         return None
 
     async def _call_stage_unary(
-        self, stage_key: str, serialized_tensors: list, metadata: bytes, timeout: float, expect_hidden: bool
+        self, stage_key: str, serialized_tensors: list, metadata: bytes, timeout: float, expect_hidden: bool, session_id: Optional[str] = None
     ):
         """Unary RPC call for a given stage."""
-        await self._ensure_ready(stage_key)
-        peer_id = self.remote_info[stage_key]["peer_id"]
-        request = runtime_pb2.ExpertRequest(uid=stage_key, tensors=serialized_tensors, metadata=metadata)
-        response = await asyncio.wait_for(
-            self.p2p.call_protobuf_handler(
-                peer_id,
-                "StageConnectionHandler.rpc_forward",
-                request,
-                runtime_pb2.ExpertResponse,
-            ),
-            timeout=timeout,
-        )
+        try:
+            await self._ensure_ready(stage_key)
+            peer_id = self.remote_info[stage_key]["peer_id"]
+            request = runtime_pb2.ExpertRequest(uid=stage_key, tensors=serialized_tensors, metadata=metadata)
+            response = await asyncio.wait_for(
+                self.p2p.call_protobuf_handler(
+                    peer_id,
+                    "StageConnectionHandler.rpc_forward",
+                    request,
+                    runtime_pb2.ExpertResponse,
+                ),
+                timeout=timeout,
+            )
 
-        if expect_hidden:
-            if not response.tensors:
-                raise ValueError(f"{stage_key} returned no tensors")
-            return deserialize_torch_tensor(response.tensors[0])
-        token_id = self._extract_token_id(response)
-        if token_id is None:
-            raise ValueError(f"{stage_key} returned no token")
-        return token_id
+            if expect_hidden:
+                if not response.tensors:
+                    raise ValueError(f"{stage_key} returned no tensors")
+                return deserialize_torch_tensor(response.tensors[0])
+            token_id = self._extract_token_id(response)
+            if token_id is None:
+                raise ValueError(f"{stage_key} returned no token")
+            return token_id
+        except (asyncio.TimeoutError, ConnectionError, RuntimeError, ValueError) as e:
+            # Server failure detected - raise ServerFailed for handling
+            if session_id:
+                raise ServerFailed(stage_key, session_id, e)
+            raise
 
     async def _call_stage_stream(
-        self, stage_key: str, serialized_tensors: list, metadata: bytes, timeout: float, expect_hidden: bool
+        self, stage_key: str, serialized_tensors: list, metadata: bytes, timeout: float, expect_hidden: bool, session_id: Optional[str] = None
     ):
         """Stream RPC call for a given stage."""
-        await self._ensure_ready(stage_key)
-        peer_id = self.remote_info[stage_key]["peer_id"]
-        parts = (
-            runtime_pb2.ExpertRequest(uid=stage_key, tensors=[part], metadata=metadata)
-            for tensor in serialized_tensors
-            for part in split_for_streaming(tensor, DEFAULT_MAX_MSG_SIZE)
-        )
+        try:
+            await self._ensure_ready(stage_key)
+            peer_id = self.remote_info[stage_key]["peer_id"]
+            parts = (
+                runtime_pb2.ExpertRequest(uid=stage_key, tensors=[part], metadata=metadata)
+                for tensor in serialized_tensors
+                for part in split_for_streaming(tensor, DEFAULT_MAX_MSG_SIZE)
+            )
 
-        outputs = self.p2p.iterate_protobuf_handler(
-            peer_id,
-            "StageConnectionHandler.rpc_forward_stream",
-            iter_as_aiter(parts),
-            runtime_pb2.ExpertResponse,
-        )
+            outputs = self.p2p.iterate_protobuf_handler(
+                peer_id,
+                "StageConnectionHandler.rpc_forward_stream",
+                iter_as_aiter(parts),
+                runtime_pb2.ExpertResponse,
+            )
 
-        tensors = []
-        token_id: Optional[int] = None
-        async for response in aiter_with_timeout(outputs, timeout):
-            if expect_hidden:
-                tensors.extend(response.tensors)
-            else:
-                token_id = self._extract_token_id(response)
-                if token_id is not None:
-                    break
-                tensors.extend(response.tensors)
-
-        if expect_hidden:
-            if not tensors:
-                raise ValueError(f"{stage_key} stream returned no tensors")
-            return deserialize_torch_tensor(tensors[0])
-        else:
-            if token_id is None:
-                if tensors:
-                    token_id = int(deserialize_torch_tensor(tensors[0]).item())
+            tensors = []
+            token_id: Optional[int] = None
+            async for response in aiter_with_timeout(outputs, timeout):
+                if expect_hidden:
+                    tensors.extend(response.tensors)
                 else:
-                    raise ValueError(f"{stage_key} stream returned no token")
-            return token_id
+                    token_id = self._extract_token_id(response)
+                    if token_id is not None:
+                        break
+                    tensors.extend(response.tensors)
+
+            if expect_hidden:
+                if not tensors:
+                    raise ValueError(f"{stage_key} stream returned no tensors")
+                return deserialize_torch_tensor(tensors[0])
+            else:
+                if token_id is None:
+                    if tensors:
+                        token_id = int(deserialize_torch_tensor(tensors[0]).item())
+                    else:
+                        raise ValueError(f"{stage_key} stream returned no token")
+                return token_id
+        except (asyncio.TimeoutError, ConnectionError, RuntimeError, ValueError) as e:
+            # Server failure detected - raise ServerFailed for handling
+            if session_id:
+                raise ServerFailed(stage_key, session_id, e)
+            raise
 
     def send_prefill(self, L: int, hidden: torch.Tensor, session_id: str, max_length: int):
         """Send prefill hidden states through all remote stages."""
@@ -298,10 +333,24 @@ class RpcTransport:
             for idx, stage_key in enumerate(self.stage_keys):
                 expect_hidden = idx < len(self.stage_keys) - 1
                 stage_start = time.perf_counter()
+                
+                # 논문 Algorithm 1 line 18: cache[server].append(inputs)
+                # RPC 보내기 직전에 activation을 캐시에 저장
+                self.activation_cache.append(session_id, stage_key, cur)
+                
                 serialized = serialize_torch_tensor(cur) # 1. Serialize Tensor
                 size = cur.element_size() * cur.nelement()
                 forward_fn = self._call_stage_stream if size > MAX_UNARY_PAYLOAD_SIZE // 2 else self._call_stage_unary # 2. Select RPC mode depending on size (unary / stream)
-                result = await forward_fn(stage_key, [serialized], metadata, self.timeout, expect_hidden=expect_hidden) # 3. Call RPC await
+                
+                try:
+                    result = await forward_fn(stage_key, [serialized], metadata, self.timeout, expect_hidden=expect_hidden, session_id=session_id) # 3. Call RPC await
+                except ServerFailed as e:
+                    # 실패 감지: 서버 교체 및 복구
+                    logger.warning(f"Server {stage_key} failed, attempting recovery...")
+                    await self._recover_server(stage_key, session_id)
+                    # 재시도
+                    result = await forward_fn(stage_key, [serialized], metadata, self.timeout, expect_hidden=expect_hidden, session_id=session_id)
+                
                 stage_times.append((stage_key, time.perf_counter() - stage_start)) # 4. Record time
                 if expect_hidden: # Not last stage
                     cur = result
@@ -342,10 +391,24 @@ class RpcTransport:
             for idx, stage_key in enumerate(self.stage_keys):
                 expect_hidden = idx < len(self.stage_keys) - 1
                 stage_start = time.perf_counter()
+                
+                # 논문 Algorithm 1 line 18: cache[server].append(inputs)
+                # RPC 보내기 직전에 activation을 캐시에 저장
+                self.activation_cache.append(session_id, stage_key, cur)
+                
                 serialized = serialize_torch_tensor(cur)
                 size = cur.element_size() * cur.nelement()
                 forward_fn = self._call_stage_stream if size > MAX_UNARY_PAYLOAD_SIZE // 2 else self._call_stage_unary
-                result = await forward_fn(stage_key, [serialized], metadata, self.timeout, expect_hidden=expect_hidden)
+                
+                try:
+                    result = await forward_fn(stage_key, [serialized], metadata, self.timeout, expect_hidden=expect_hidden, session_id=session_id)
+                except ServerFailed as e:
+                    # 실패 감지: 서버 교체 및 복구
+                    logger.warning(f"Server {stage_key} failed, attempting recovery...")
+                    await self._recover_server(stage_key, session_id)
+                    # 재시도
+                    result = await forward_fn(stage_key, [serialized], metadata, self.timeout, expect_hidden=expect_hidden, session_id=session_id)
+                
                 stage_times.append((stage_key, time.perf_counter() - stage_start))
                 if expect_hidden:
                     cur = result
@@ -387,6 +450,117 @@ class RpcTransport:
         token_id = self._last_token
         self._last_token = None
         return token_id
+
+    async def _recover_server(self, stage_key: str, session_id: str):
+        """
+        Recover from server failure: find new server and restore KV cache.
+        
+        논문: "서버가 죽으면 새 서버에 그 activation들을 한 번에 O(t)로 replay해서 서버 KV cache를 다시 쌓게 만들어야 해"
+        """
+        logger.info(f"Recovering server {stage_key} for session {session_id[:8]}...")
+        
+        # 1. 기존 연결 정보 제거 (새 서버를 찾기 위해)
+        if stage_key in self.remote_info:
+            del self.remote_info[stage_key]
+        
+        # 2. 새 서버 발견 (DHT에서 최신 peer 찾기)
+        try:
+            peer_id, maddrs = await self._discover_peer(stage_key, max_retries=20, retry_delay=2.0)
+            logger.info(f"Found new server for {stage_key}: {peer_id}")
+        except Exception as e:
+            logger.error(f"Failed to discover new server for {stage_key}: {e}")
+            raise RuntimeError(f"Could not find replacement server for {stage_key}") from e
+        
+        # 3. 새 서버 연결 준비
+        await self._ensure_ready(stage_key)
+        
+        # 4. 캐시된 activations 가져오기
+        cached_activations = self.activation_cache.get(session_id, stage_key)
+        if not cached_activations:
+            logger.warning(f"No cached activations for {stage_key}, session {session_id[:8]}. Starting fresh.")
+            return
+        
+        logger.info(f"Restoring KV cache with {len(cached_activations)} activations...")
+        
+        # 5. restore RPC 호출 (streaming)
+        try:
+            await self._call_restore_cache_stream(stage_key, session_id, cached_activations)
+            logger.info(f"Successfully restored KV cache for {stage_key}, session {session_id[:8]}")
+        except Exception as e:
+            logger.error(f"Failed to restore KV cache for {stage_key}: {e}")
+            raise RuntimeError(f"KV cache restoration failed for {stage_key}") from e
+    
+    async def _call_restore_cache_stream(
+        self, stage_key: str, session_id: str, activations: List[torch.Tensor]
+    ):
+        """
+        Call restore_cache_stream RPC to rebuild server-side KV cache.
+        
+        Args:
+            stage_key: Stage key (e.g., "mini_petals:stage1")
+            session_id: Session identifier
+            activations: List of activation tensors in chronological order
+        """
+        await self._ensure_ready(stage_key)
+        peer_id = self.remote_info[stage_key]["peer_id"]
+        
+        # Prepare metadata
+        metadata = MSGPackSerializer.dumps({
+            "session_id": session_id,
+            "mode": "restore",
+            "num_activations": len(activations),
+        })
+        
+        # Serialize all activations and split for streaming
+        serialized_parts = []
+        for activation in activations:
+            serialized = serialize_torch_tensor(activation)
+            # Split large tensors for streaming
+            parts = list(split_for_streaming(serialized, DEFAULT_MAX_MSG_SIZE))
+            serialized_parts.extend(parts)
+        
+        # Create request stream
+        # First request has metadata, subsequent requests only have tensors
+        def request_generator():
+            for i, part in enumerate(serialized_parts):
+                if i == 0:
+                    yield runtime_pb2.ExpertRequest(
+                        uid=stage_key,
+                        tensors=[part],
+                        metadata=metadata,
+                    )
+                else:
+                    yield runtime_pb2.ExpertRequest(
+                        uid=stage_key,
+                        tensors=[part],
+                        metadata=b"",
+                    )
+        
+        parts = request_generator()
+        
+        # Call restore RPC
+        outputs = self.p2p.iterate_protobuf_handler(
+            peer_id,
+            "StageConnectionHandler.rpc_restore_cache_stream",
+            iter_as_aiter(parts),
+            runtime_pb2.ExpertResponse,
+        )
+        
+        # Wait for response
+        async for response in aiter_with_timeout(outputs, self.timeout * 10):
+            response_metadata = MSGPackSerializer.loads(response.metadata) if response.metadata else {}
+            status = response_metadata.get("status")
+            if status == "success":
+                logger.info(
+                    f"Restore successful: {stage_key}, session {session_id[:8]}, "
+                    f"restored_len={response_metadata.get('restored_len', 'N/A')}"
+                )
+                return
+            elif status == "error":
+                error_msg = response_metadata.get("error", "Unknown error")
+                raise RuntimeError(f"Restore failed: {error_msg}")
+        
+        raise RuntimeError("Restore RPC did not return a response")
 
     def shutdown(self):
         """Shutdown P2P and DHT."""

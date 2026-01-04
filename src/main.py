@@ -15,7 +15,7 @@ from hivemind.utils.logging import get_logger
 try:
     # 패키지로 실행될 때 (python -m src.main)
     from .llama_partition import load_stage_model, Stage0, StageSegment, StageLast
-    from .rpc_transport import RpcTransport
+    from .rpc_transport import RpcTransport, ServerFailed
     from .rpc_handler import StageConnectionHandler
 except ImportError:
     # 직접 실행될 때 (python src/main.py)
@@ -24,7 +24,7 @@ except ImportError:
     project_root = Path(__file__).parent.parent
     sys.path.insert(0, str(project_root))
     from src.llama_partition import load_stage_model, Stage0, StageSegment, StageLast
-    from src.rpc_transport import RpcTransport
+    from src.rpc_transport import RpcTransport, ServerFailed
     from src.rpc_handler import StageConnectionHandler
 
 logger = get_logger(__name__)
@@ -139,8 +139,17 @@ def run_rank0(args, device, splits):
     session_id = str(uuid4())
     max_length = L + args.max_new_tokens
 
-    tx.send_prefill(L, hidden, session_id=session_id, max_length=max_length)  # [1, L, H]
-    next_id = tx.recv_token()
+    # Prefill with fault tolerance: 실패 시 자동 복구 및 재시도 (rpc_transport 내부에서 처리)
+    try:
+        tx.send_prefill(L, hidden, session_id=session_id, max_length=max_length)  # [1, L, H]
+        next_id = tx.recv_token()
+    except ServerFailed as e:
+        logger.error(f"Prefill failed after recovery attempts: {e}")
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error during prefill: {e}")
+        raise
+    
     generated = [next_id]
     t_prefill_end = time.perf_counter()
     prefill_time = t_prefill_end - t_prefill_start
@@ -197,8 +206,26 @@ def run_rank0(args, device, splits):
             # logger.info(f"Stage0: hidden shape={hidden.shape}, new_past_len={new_past_len}, past summary: {_describe_past(past0)}")
 
         # send_prefill과 동일 (generated_tokens 전달)
-        tx.send_decode_step(cur_len, hidden, session_id=session_id, max_length=max_length, generated_tokens=generated)  # [1,1,H]
-        next_id = tx.recv_token()
+        # 실패 시 자동 복구 및 재시도 (rpc_transport 내부에서 처리)
+        try:
+            tx.send_decode_step(cur_len, hidden, session_id=session_id, max_length=max_length, generated_tokens=generated)  # [1,1,H]
+            next_id = tx.recv_token()
+        except ServerFailed as e:
+            # rpc_transport에서 이미 복구 시도했지만 실패한 경우
+            logger.error(f"Decode step failed after recovery attempts: {e}")
+            # 논문: "실패 시 이전 step 버리고, 복구하고, 이어서 진행"
+            # 여기서는 재시도하거나 중단 (사용자 선택에 따라)
+            logger.warning("Retrying decode step after server recovery...")
+            # 한 번 더 재시도
+            try:
+                tx.send_decode_step(cur_len, hidden, session_id=session_id, max_length=max_length, generated_tokens=generated)
+                next_id = tx.recv_token()
+            except Exception as retry_e:
+                logger.error(f"Decode step retry also failed: {retry_e}")
+                raise
+        except Exception as e:
+            logger.error(f"Unexpected error during decode step: {e}")
+            raise
         
         # 출력 품질 확인: 각 토큰 디코딩 및 부분 텍스트 출력
         # next_token_text = tok.decode([next_id], skip_special_tokens=True)
