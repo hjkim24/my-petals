@@ -179,6 +179,7 @@ class RpcTransport:
                     res = self.dht.get(stage_key)
             
             if res is None:
+                logger.warning(f"{stage_key}: DHT.get returned None (no value for this key)")
                 return []
             
             # res가 다양한 형태일 수 있음
@@ -192,11 +193,13 @@ class RpcTransport:
                 value = res[0] if isinstance(res[0], dict) else res
             
             if value is None:
+                logger.warning(f"{stage_key}: DHT.get returned object without usable value (type={type(res).__name__})")
                 return []
 
             # hivemind 버전에 따라 value가 dict(subkey->entry)일 수 있음
             if isinstance(value, dict):
                 # subkey가 있는 경우 (여러 서버)
+                debug_entries = []
                 for subk, v in value.items():
                     entry = v
                     # 어떤 버전은 (entry, expiration, ...) 튜플로 줄 때가 있음
@@ -222,12 +225,35 @@ class RpcTransport:
                     ts = entry.get("timestamp", 0)
 
                     candidates.append((peer_id_str, maddrs, ts))
+                    debug_entries.append(
+                        {
+                            "subkey": str(subk),
+                            "peer_id": peer_id_str,
+                            "maddrs": maddrs,
+                            "timestamp": ts,
+                        }
+                    )
+
+                if debug_entries:
+                    logger.info(f"{stage_key}: DHT entries={debug_entries}")
+                else:
+                    logger.warning(f"{stage_key}: DHT dict value has no usable entries: {value}")
             else:
                 # 단일 entry 형태 (subkey 없음)
                 if isinstance(value, dict):
                     peer_id_str = value.get("peer_id")
                     if peer_id_str and peer_id_str not in exclude_peer_ids:
-                        candidates.append((peer_id_str, value.get("p2p_maddrs") or [], value.get("timestamp", 0)))
+                        maddrs = value.get("p2p_maddrs") or []
+                        ts = value.get("timestamp", 0)
+                        candidates.append((peer_id_str, maddrs, ts))
+                        logger.info(
+                            f"{stage_key}: DHT single entry="
+                            f"{{'peer_id': {peer_id_str}, 'maddrs': {maddrs}, 'timestamp': {ts}}}"
+                        )
+                else:
+                    logger.warning(
+                        f"{stage_key}: Unexpected DHT value type {type(value).__name__}, raw value={value}"
+                    )
 
             return candidates
 
