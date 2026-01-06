@@ -145,65 +145,110 @@ class RpcTransport:
         return await P2P.create()
 
     async def _discover_peer(
-        self, 
-        stage_key: str, 
-        max_retries: int = 10, 
+        self,
+        stage_key: str,
+        max_retries: int = 10,
         retry_delay: float = 1.0,
         exclude_peer_ids: Optional[Set[str]] = None
     ) -> Tuple[PeerID, List[str]]:
         """
         Find server peer_id via DHT for a given stage key.
-        
-        Args:
-            stage_key: DHT key for the stage (e.g., "mini_petals:stage2")
-            max_retries: Maximum number of retry attempts
-            retry_delay: Delay between retries in seconds
-            exclude_peer_ids: Set of peer IDs to exclude (failed servers)
+        - ✅ 여러 후보(subkey들)를 가져와서
+        - ✅ exclude_peer_ids(실패 서버) 제외하고
+        - ✅ 그 중 하나를 선택해서 반환
         """
         if exclude_peer_ids is None:
             exclude_peer_ids = set()
-        
+
         loop = asyncio.get_running_loop()
+
+        def _get_candidates_sync():
+            # ✅ 핵심: return_metadata=True 로 subkey별 entry를 얻는다
+            res = self.dht.get(stage_key, return_metadata=True)
+            if res is None or getattr(res, "value", None) is None:
+                return []
+
+            value = res.value
+
+            candidates = []
+
+            # hivemind 버전에 따라 value가 dict(subkey->entry)일 수 있음
+            if isinstance(value, dict):
+                for subk, v in value.items():
+                    entry = v
+                    # 어떤 버전은 (entry, expiration, ...) 튜플로 줄 때가 있음
+                    if isinstance(v, tuple) and len(v) > 0:
+                        entry = v[0]
+
+                    if not isinstance(entry, dict):
+                        continue
+
+                    peer_id_str = entry.get("peer_id") or str(subk)
+                    if not peer_id_str:
+                        continue
+
+                    # 실패한 peer 제외
+                    if peer_id_str in exclude_peer_ids:
+                        continue
+
+                    # maddrs
+                    maddrs = entry.get("p2p_maddrs") or []
+                    ts = entry.get("timestamp", 0)
+
+                    candidates.append((peer_id_str, maddrs, ts))
+            elif isinstance(value, dict):
+                # 단일 entry 형태
+                peer_id_str = value.get("peer_id")
+                if peer_id_str and peer_id_str not in exclude_peer_ids:
+                    candidates.append((peer_id_str, value.get("p2p_maddrs") or [], value.get("timestamp", 0)))
+
+            return candidates
+
         for attempt in range(max_retries):
             try:
-                # DHT에서 여러 후보를 가져오기 위해 latest=False로 시도
-                # 또는 여러 번 시도하여 다른 서버 찾기
-                result = await loop.run_in_executor(None, lambda: self.dht.get(stage_key, latest=True))
-                if result is not None and result.value is not None:
-                    entry = result.value
-                    if isinstance(entry, dict):
-                        peer_id_str = entry.get("peer_id")
-                        if peer_id_str:
-                            # 실패한 서버는 제외
-                            if peer_id_str in exclude_peer_ids:
-                                logger.warning(f"{stage_key} found excluded peer {peer_id_str[:8]}..., retrying...")
-                                if attempt < max_retries - 1:
-                                    await asyncio.sleep(retry_delay)
-                                    continue
-                            
-                            peer_id = PeerID.from_base58(peer_id_str)
-                            maddrs = entry.get("p2p_maddrs") or []
-                            return peer_id, maddrs
-                    logger.warning(f"{stage_key} missing peer info, retrying...")
+                candidates = await loop.run_in_executor(None, _get_candidates_sync)
+
+                if candidates:
+                    # ✅ 선택 정책:
+                    # 1) timestamp 최신순으로 상위 몇 개 추려서
+                    # 2) 그 중 랜덤 선택 (부하 분산 + 최신 고집 방지)
+                    candidates.sort(key=lambda x: x[2], reverse=True)
+                    top = candidates[: min(5, len(candidates))]
+                    peer_id_str, maddrs, _ts = random.choice(top)
+
+                    peer_id = PeerID.from_base58(peer_id_str)
+                    return peer_id, maddrs
+
+                logger.warning(f"{stage_key}: no candidates found (excluded={len(exclude_peer_ids)}), retrying...")
+
             except Exception as e:
                 logger.warning(f"Attempt {attempt + 1} to find peer for {stage_key} failed: {e}")
 
             if attempt < max_retries - 1:
                 await asyncio.sleep(retry_delay)
 
-        raise RuntimeError(f"Could not find peer via DHT key '{stage_key}' (excluded {len(exclude_peer_ids)} failed peers)")
+        raise RuntimeError(
+            f"Could not find peer via DHT key '{stage_key}' (excluded {len(exclude_peer_ids)} failed peers)"
+        )
 
-    async def _ensure_ready(self, stage_key: str):
+    async def _ensure_ready(self, stage_key: str, force_refresh: bool = False):
         if self.stage != 0:
             raise RuntimeError("RpcTransport client helpers should only be used on stage0")
         if self.p2p is None:
             self.p2p = await self._create_p2p()
             self.peer_id = self.p2p.peer_id
+
+        if force_refresh:
+            self.remote_info.pop(stage_key, None)
+
         info = self.remote_info.get(stage_key)
         if info is None:
-            peer_id, maddrs = await self._discover_peer(stage_key)
+            exclude = self.failed_peers.get(stage_key, set())
+            peer_id, maddrs = await self._discover_peer(stage_key, exclude_peer_ids=exclude)
             info = {"peer_id": peer_id, "maddrs": maddrs}
             self.remote_info[stage_key] = info
+
+            # connect 시도
             if maddrs:
                 try:
                     from multiaddr import Multiaddr
@@ -214,10 +259,8 @@ class RpcTransport:
                             ma = Multiaddr(base)
                             if ma.protocols()[0].name in ("ip4", "ip6", "tcp", "quic"):
                                 filtered.append(ma)
-                            else:
-                                logger.debug(f"Skipping non-tcp/ip multiaddr {m}")
-                        except Exception as e:
-                            logger.debug(f"Failed to parse multiaddr {m}: {e}")
+                        except Exception:
+                            pass
                     if filtered:
                         await self.p2p._client.connect(peer_id, filtered)
                         logger.info(f"Connected to {stage_key} via maddrs: {maddrs}")
@@ -225,11 +268,13 @@ class RpcTransport:
                         logger.warning(f"No usable tcp/ip multiaddrs to connect: {maddrs}")
                 except Exception as e:
                     logger.warning(f"Could not connect to {stage_key} via maddrs {maddrs}: {e}")
+
+        # optional: peers 확인
         try:
             await asyncio.wait_for(self.p2p.wait_for_at_least_n_peers(1), timeout=5)
-            logger.info(f"P2P connected peers: {await self.p2p.list_peers()}")
-        except Exception as e:
-            logger.warning(f"P2P did not see remote peer after connect attempt: {e}")
+        except Exception:
+            pass
+
 
     def _extract_token_id(self, response: runtime_pb2.ExpertResponse) -> Optional[int]:
         metadata = MSGPackSerializer.loads(response.metadata) if response.metadata else {}
@@ -364,11 +409,22 @@ class RpcTransport:
                 
                 # 실패한 peer_id 기록
                 if stage_key in self.remote_info:
-                    failed_peer_id = str(self.remote_info[stage_key].get("peer_id", ""))
-                    if stage_key not in self.failed_peers:
-                        self.failed_peers[stage_key] = set()
-                    self.failed_peers[stage_key].add(failed_peer_id)
-                    logger.info(f"Marked peer {failed_peer_id[:8]}... as failed for {stage_key}")
+                    pid_obj = self.remote_info[stage_key].get("peer_id", None)
+                    # PeerID -> base58 string으로 통일
+                    if pid_obj is not None:
+                        try:
+                            failed_peer_id = pid_obj.to_base58()
+                        except Exception:
+                            failed_peer_id = str(pid_obj)
+                    else:
+                        failed_peer_id = ""
+
+                    if failed_peer_id:
+                        if stage_key not in self.failed_peers:
+                            self.failed_peers[stage_key] = set()
+                        self.failed_peers[stage_key].add(failed_peer_id)
+                        logger.info(f"Marked peer {failed_peer_id[:8]}... as failed for {stage_key}")
+
                 
                 # 새 서버 찾기 (실패한 서버 제외)
                 try:
@@ -385,6 +441,10 @@ class RpcTransport:
                         "peer_id": new_peer_id,
                         "maddrs": new_maddrs
                     }
+
+                    # ✅ force_refresh로 새 peer로 강제 재연결 준비
+                    await self._ensure_ready(stage_key, force_refresh=True)
+
                     
                     # P2P 연결 재설정
                     if self.p2p and new_maddrs:
