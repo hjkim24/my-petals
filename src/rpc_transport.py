@@ -200,6 +200,7 @@ class RpcTransport:
             if isinstance(value, dict):
                 # subkey가 있는 경우 (여러 서버)
                 debug_entries = []
+                excluded_peers = []
                 for subk, v in value.items():
                     entry = v
                     # ValueWithExpiration 객체 처리 (hivemind의 일반적인 반환 형태)
@@ -222,6 +223,8 @@ class RpcTransport:
 
                     # 실패한 peer 제외
                     if peer_id_str in exclude_peer_ids:
+                        excluded_peers.append(peer_id_str)
+                        logger.debug(f"{stage_key}: Excluding failed peer {peer_id_str[:8]}... (subkey={subk})")
                         continue
 
                     # maddrs
@@ -238,10 +241,23 @@ class RpcTransport:
                         }
                     )
 
+                # 상세 로그 출력
+                logger.info(
+                    f"{stage_key}: DHT discovery - "
+                    f"total_entries={len(value)}, "
+                    f"candidates={len(candidates)}, "
+                    f"excluded={len(excluded_peers)} (excluded_peer_ids={list(exclude_peer_ids)}), "
+                    f"candidate_peers={[c[0][:8]+'...' for c in candidates]}"
+                )
                 if debug_entries:
-                    logger.info(f"{stage_key}: DHT entries={debug_entries}")
-                else:
-                    logger.warning(f"{stage_key}: DHT dict value has no usable entries: {value}")
+                    logger.debug(f"{stage_key}: DHT entries={debug_entries}")
+                if excluded_peers:
+                    logger.debug(f"{stage_key}: Excluded peers={[p[:8]+'...' for p in excluded_peers]}")
+                if not candidates and len(value) > 0:
+                    logger.warning(
+                        f"{stage_key}: DHT dict value has {len(value)} entries but no usable candidates "
+                        f"(excluded={len(excluded_peers)}, exclude_peer_ids={list(exclude_peer_ids)})"
+                    )
             else:
                 # 단일 entry 형태 (subkey 없음)
                 if isinstance(value, dict):
@@ -273,10 +289,20 @@ class RpcTransport:
                     top = candidates[: min(5, len(candidates))]
                     peer_id_str, maddrs, _ts = random.choice(top)
 
+                    logger.info(
+                        f"{stage_key}: Selected peer from {len(candidates)} candidates - "
+                        f"peer_id={peer_id_str[:8]}..., "
+                        f"timestamp={_ts}, "
+                        f"maddrs_count={len(maddrs)}"
+                    )
                     peer_id = PeerID.from_base58(peer_id_str)
                     return peer_id, maddrs
 
-                logger.warning(f"{stage_key}: no candidates found (excluded={len(exclude_peer_ids)}), retrying...")
+                logger.warning(
+                    f"{stage_key}: no candidates found (excluded={len(exclude_peer_ids)}, "
+                    f"excluded_peer_ids={[p[:8]+'...' for p in exclude_peer_ids] if exclude_peer_ids else 'none'}), "
+                    f"retrying... (attempt {attempt+1}/{max_retries})"
+                )
 
             except Exception as e:
                 logger.warning(f"Attempt {attempt + 1} to find peer for {stage_key} failed: {e}")
@@ -486,11 +512,21 @@ class RpcTransport:
                 # 새 서버 찾기 (실패한 서버 제외)
                 try:
                     exclude_peers = self.failed_peers.get(stage_key, set())
+                    logger.info(
+                        f"{stage_key}: Attempting recovery - "
+                        f"excluded_peers={[p[:8]+'...' for p in exclude_peers] if exclude_peers else 'none'}, "
+                        f"failed_peers_count={len(exclude_peers)}"
+                    )
                     new_peer_id, new_maddrs = await self._discover_peer(
                         stage_key, 
                         max_retries=5, 
                         retry_delay=0.5,
                         exclude_peer_ids=exclude_peers
+                    )
+                    logger.info(
+                        f"{stage_key}: Found replacement server - "
+                        f"peer_id={new_peer_id.to_base58()[:8]}..., "
+                        f"maddrs={new_maddrs}"
                     )
                     
                     # remote_info 업데이트
