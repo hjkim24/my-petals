@@ -163,22 +163,48 @@ class RpcTransport:
         loop = asyncio.get_running_loop()
 
         def _get_candidates_sync():
-            # ✅ 핵심: return_metadata=True 로 subkey별 entry를 얻는다
-            res = self.dht.get(stage_key, return_metadata=True)
-            if res is None or getattr(res, "value", None) is None:
-                return []
-
-            value = res.value
-
+            """Get candidate peers from DHT, handling different hivemind versions."""
             candidates = []
+            
+            # hivemind 버전에 따라 return_metadata 지원 여부가 다름
+            # 먼저 return_metadata 없이 시도
+            try:
+                res = self.dht.get(stage_key)
+            except TypeError:
+                # return_metadata가 필수인 경우를 대비해 다시 시도
+                try:
+                    res = self.dht.get(stage_key, return_metadata=True)
+                except TypeError:
+                    # return_metadata를 지원하지 않는 버전
+                    res = self.dht.get(stage_key)
+            
+            if res is None:
+                return []
+            
+            # res가 다양한 형태일 수 있음
+            value = None
+            if hasattr(res, 'value'):
+                value = res.value
+            elif isinstance(res, dict):
+                value = res
+            elif isinstance(res, (list, tuple)) and len(res) > 0:
+                # 일부 버전은 리스트/튜플로 반환
+                value = res[0] if isinstance(res[0], dict) else res
+            
+            if value is None:
+                return []
 
             # hivemind 버전에 따라 value가 dict(subkey->entry)일 수 있음
             if isinstance(value, dict):
+                # subkey가 있는 경우 (여러 서버)
                 for subk, v in value.items():
                     entry = v
                     # 어떤 버전은 (entry, expiration, ...) 튜플로 줄 때가 있음
                     if isinstance(v, tuple) and len(v) > 0:
                         entry = v[0]
+                    elif isinstance(v, dict) and "value" in v:
+                        # 중첩된 구조
+                        entry = v.get("value", v)
 
                     if not isinstance(entry, dict):
                         continue
@@ -196,11 +222,12 @@ class RpcTransport:
                     ts = entry.get("timestamp", 0)
 
                     candidates.append((peer_id_str, maddrs, ts))
-            elif isinstance(value, dict):
-                # 단일 entry 형태
-                peer_id_str = value.get("peer_id")
-                if peer_id_str and peer_id_str not in exclude_peer_ids:
-                    candidates.append((peer_id_str, value.get("p2p_maddrs") or [], value.get("timestamp", 0)))
+            else:
+                # 단일 entry 형태 (subkey 없음)
+                if isinstance(value, dict):
+                    peer_id_str = value.get("peer_id")
+                    if peer_id_str and peer_id_str not in exclude_peer_ids:
+                        candidates.append((peer_id_str, value.get("p2p_maddrs") or [], value.get("timestamp", 0)))
 
             return candidates
 
