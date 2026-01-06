@@ -266,7 +266,7 @@ class RpcTransport:
                 candidates = await loop.run_in_executor(None, _get_candidates_sync)
 
                 if candidates:
-                    # ✅ 선택 정책:
+                    # 선택 정책:
                     # 1) timestamp 최신순으로 상위 몇 개 추려서
                     # 2) 그 중 랜덤 선택 (부하 분산 + 최신 고집 방지)
                     candidates.sort(key=lambda x: x[2], reverse=True)
@@ -656,7 +656,11 @@ class RpcTransport:
                     is_replay=False,
                     session_id=session_id,
                 )
-                
+                # 통과한 스테이지 및 해당 스테이지의 maddrs 로그
+                info = self.remote_info.get(stage_key, {})
+                maddrs = info.get("maddrs") or []
+                logger.info(f"Prefill pass: stage_key={stage_key}, maddrs={maddrs}")
+
                 stage_times.append((stage_key, time.perf_counter() - stage_start)) # 4. Record time
                 if expect_hidden: # Not last stage
                     cur = result
@@ -718,7 +722,11 @@ class RpcTransport:
                     is_replay=False,
                     session_id=session_id,
                 )
-                
+                # 통과한 스테이지 및 해당 스테이지의 maddrs 로그
+                info = self.remote_info.get(stage_key, {})
+                maddrs = info.get("maddrs") or []
+                logger.info(f"Decode pass: stage_key={stage_key}, maddrs={maddrs}")
+
                 stage_times.append((stage_key, time.perf_counter() - stage_start))
                 if expect_hidden:
                     cur = result
