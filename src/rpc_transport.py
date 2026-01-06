@@ -202,14 +202,18 @@ class RpcTransport:
                 debug_entries = []
                 for subk, v in value.items():
                     entry = v
+                    # ValueWithExpiration 객체 처리 (hivemind의 일반적인 반환 형태)
+                    if hasattr(v, 'value'):
+                        entry = v.value
                     # 어떤 버전은 (entry, expiration, ...) 튜플로 줄 때가 있음
-                    if isinstance(v, tuple) and len(v) > 0:
+                    elif isinstance(v, tuple) and len(v) > 0:
                         entry = v[0]
+                    # dict에 "value" 키가 있는 경우
                     elif isinstance(v, dict) and "value" in v:
-                        # 중첩된 구조
                         entry = v.get("value", v)
 
                     if not isinstance(entry, dict):
+                        logger.debug(f"{stage_key}: Skipping non-dict entry for subkey {subk}, type={type(entry).__name__}, value={entry}")
                         continue
 
                     peer_id_str = entry.get("peer_id") or str(subk)
