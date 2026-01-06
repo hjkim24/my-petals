@@ -564,14 +564,22 @@ class RpcTransport:
                         len(self.client_cache[stage_key][session_id]) > 0):
                         past_count = len(self.client_cache[stage_key][session_id])
                         logger.info(f"Replaying {past_count} past inputs to {stage_key} for session {session_id[:8]}")
-                        await self._replay_past_inputs(stage_key, session_id, metadata)
+                        try:
+                            await self._replay_past_inputs(stage_key, session_id, metadata)
+                            logger.info(f"Replay completed successfully for {stage_key} (session {session_id[:8]})")
+                        except Exception as replay_e:
+                            logger.error(f"Replay failed for {stage_key} (session {session_id[:8]}): {replay_e}")
+                            # Replay 실패는 recovery 실패로 처리
+                            raise RuntimeError(f"Replay failed for {stage_key}: {replay_e}") from replay_e
                     
                     # 실패한 stage 제거 (복구 시도 완료)
                     self.failed_stages.discard(stage_key)
                     
+                    # 재시도 전에 서버가 준비될 시간을 줌
+                    await asyncio.sleep(0.2)
+                    
                     # 재시도
                     if attempt < max_recovery_attempts - 1:
-                        await asyncio.sleep(0.5)  # 잠시 대기 후 재시도
                         continue
                     else:
                         raise RuntimeError(f"Failed to recover {stage_key} after {max_recovery_attempts} attempts") from e
@@ -628,7 +636,18 @@ class RpcTransport:
             
             replay_metadata = MSGPackSerializer.dumps(replay_metadata_dict)
             serialized = serialize_torch_tensor(past_input)
-            size = len(serialized)
+            
+            # protobuf Tensor 크기 계산 (hivemind 버전 호환)
+            if hasattr(serialized, 'ByteSize'):
+                size = serialized.ByteSize()
+            elif isinstance(serialized, bytes):
+                size = len(serialized)
+            else:
+                # fallback: SerializeToString()으로 변환 후 크기 확인
+                try:
+                    size = len(serialized.SerializeToString())
+                except AttributeError:
+                    size = 0
             
             # 재전송 (응답은 무시, KV 캐시 복구만 목적)
             try:
@@ -640,9 +659,11 @@ class RpcTransport:
                     self.timeout,
                     expect_hidden=True
                 )
+                logger.debug(f"Replay step {idx+1}/{len(past_inputs)} completed for {stage_key} (session {session_id[:8]})")
             except Exception as e:
-                logger.warning(f"Replay step {idx}/{len(past_inputs)} failed for {stage_key}: {e}, continuing...")
-                # 일부 실패해도 계속 진행 (부분 복구)
+                logger.error(f"Replay step {idx+1}/{len(past_inputs)} failed for {stage_key} (session {session_id[:8]}): {e}")
+                # Replay 실패는 치명적이므로 예외를 다시 발생시켜서 recovery 실패로 처리
+                raise RuntimeError(f"Replay failed at step {idx+1}/{len(past_inputs)} for {stage_key}: {e}") from e
         
         logger.info(f"Replay completed for {stage_key} (session {session_id[:8]})")
 
