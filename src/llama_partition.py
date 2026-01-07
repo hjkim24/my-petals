@@ -140,7 +140,9 @@ class Stage0(nn.Module):
 class StageSegment(nn.Module):
     """LLaMA-only middle segment; keep Cache end-to-end."""
 
-    def __init__(self, full, start: int, end: int):
+    def __init__(self, full, start: int, end: int, 
+                 gpu_device: Optional[torch.device] = None,
+                 keep_layers_on_gpu: int = 0):
         super().__init__()
         model_type = getattr(full.config, "model_type", "").lower()
         if "llama" not in model_type and "mistral" not in model_type and "mixtral" not in model_type:
@@ -155,10 +157,60 @@ class StageSegment(nn.Module):
 
         self.layers = _convert_layers(nn.ModuleList(raw_layers), full.config)
         self.config = full.config
+        
+        # GPU device 설정
+        self.gpu_device = gpu_device if gpu_device is not None else torch.device("cuda:0")
+        self.cpu_device = torch.device("cpu")
+        self.keep_layers_on_gpu = keep_layers_on_gpu
+        
+        # 레이어들의 현재 device 추적
+        self._layer_devices = {}  # {layer_idx: device}
+        
+        # 초기화: 모든 레이어를 CPU에 저장 (이미 CPU에 있으면 그대로 유지)
+        for i, layer in enumerate(self.layers):
+            if layer.device.type != "cpu":
+                self.layers[i] = layer.to(self.cpu_device)
+            self._layer_devices[i] = self.cpu_device
+        
         if len(self.layers) == 0:
             logger.warning(f"StageSegment initialized with 0 layers (start={start}, end={end})")
         else:
-            logger.info(f"StageSegment initialized with {len(self.layers)} layers (start={start}, end={end})")
+            logger.info(f"StageSegment initialized with {len(self.layers)} layers (start={start}, end={end}), "
+                       f"lazy GPU loading enabled (keep {keep_layers_on_gpu} layers on GPU)")
+    
+    def _move_layer_to_gpu(self, layer_idx: int):
+        """레이어를 GPU로 이동"""
+        if layer_idx < 0 or layer_idx >= len(self.layers):
+            return
+        
+        layer = self.layers[layer_idx]
+        if self._layer_devices.get(layer_idx) != self.gpu_device:
+            try:
+                layer = layer.to(self.gpu_device, non_blocking=True)
+                self._layer_devices[layer_idx] = self.gpu_device
+            except RuntimeError as e:
+                # GPU 메모리 부족 시 CPU에서 실행하도록 fallback
+                logger.warning(f"Failed to move layer {layer_idx} to GPU: {e}, keeping on CPU")
+                self._layer_devices[layer_idx] = self.cpu_device
+    
+    def _move_layer_to_cpu(self, layer_idx: int):
+        """레이어를 CPU로 이동 (keep_layers_on_gpu 설정 고려)"""
+        if layer_idx < 0 or layer_idx >= len(self.layers):
+            return
+        
+        # 최근 N개 레이어는 GPU에 유지
+        if self.keep_layers_on_gpu > 0:
+            total_layers = len(self.layers)
+            if layer_idx >= total_layers - self.keep_layers_on_gpu:
+                return  # GPU에 유지
+        
+        layer = self.layers[layer_idx]
+        if self._layer_devices.get(layer_idx) != self.cpu_device:
+            try:
+                layer = layer.to(self.cpu_device, non_blocking=True)
+                self._layer_devices[layer_idx] = self.cpu_device
+            except Exception as e:
+                logger.warning(f"Failed to move layer {layer_idx} to CPU: {e}")
 
     def forward(
         self,
@@ -172,10 +224,35 @@ class StageSegment(nn.Module):
         tuple_cache = []
 
         for i, layer in enumerate(self.layers):
+            # 이전 레이어를 CPU로 이동 (필요한 경우)
+            if i > 0:
+                self._move_layer_to_cpu(i - 1)
+            
+            # 현재 레이어를 GPU로 이동
+            self._move_layer_to_gpu(i)
+            
+            # 레이어의 현재 device 확인
+            layer_device = self._layer_devices.get(i, self.cpu_device)
+            
+            # 입력을 레이어 device에 맞게 이동
+            if layer_device == self.gpu_device:
+                x = x.to(self.gpu_device, non_blocking=True)
+            
             layer_past = None if past_key_values is None else past_key_values[i]
+            
+            # past_key_values도 레이어와 동일한 device로 이동
+            if layer_past is not None and layer_device == self.gpu_device:
+                if isinstance(layer_past, (tuple, list)) and len(layer_past) == 2:
+                    key, value = layer_past
+                    layer_past = (
+                        key.to(self.gpu_device, non_blocking=True) if key is not None else None,
+                        value.to(self.gpu_device, non_blocking=True) if value is not None else None
+                    )
+            
             layer_pos = position_ids if position_ids is not None else default_position_ids(
                 layer_past, x.shape[1], x.device
             )
+            
             out = layer(
                 x,
                 attention_mask=None,
@@ -185,15 +262,28 @@ class StageSegment(nn.Module):
                 output_attentions=False,
             )
             x = out[0]
+            
             if use_cache:
                 present = out[-1] if len(out) > 1 else None
                 present = _from_cache(present)
                 if present is None:
                     logger.warning(f"StageSegment: layer {i} returned no KV cache")
-                # else:
-                    # cache_len = present[0].shape[-2] if isinstance(present, tuple) else "cache_obj"
-                    # logger.info(f"StageSegment layer {i} present cache_len={cache_len}")
+                # cache도 device 일치 확인 (필요한 경우)
+                if present is not None and layer_device == self.gpu_device:
+                    if isinstance(present, (tuple, list)) and len(present) == 2:
+                        key, value = present
+                        # 다음 레이어가 CPU면 CPU로 이동
+                        if i + 1 < len(self.layers) and self._layer_devices.get(i + 1, self.cpu_device) == self.cpu_device:
+                            present = (
+                                key.to(self.cpu_device, non_blocking=True) if key is not None else None,
+                                value.to(self.cpu_device, non_blocking=True) if value is not None else None
+                            )
                 tuple_cache.append(present)
+        
+        # 마지막 레이어 처리 후, 마지막 N개 레이어는 GPU에 유지
+        # 나머지는 CPU로 이동
+        for i in range(len(self.layers) - self.keep_layers_on_gpu):
+            self._move_layer_to_cpu(i)
 
         if not use_cache:
             return x, None
@@ -203,7 +293,9 @@ class StageSegment(nn.Module):
 class StageLast(nn.Module):
     """LLaMA-only last stage; keep Cache end-to-end."""
 
-    def __init__(self, full, start: int):
+    def __init__(self, full, start: int,
+                 gpu_device: Optional[torch.device] = None,
+                 keep_layers_on_gpu: int = 0):
         super().__init__()
         model_type = getattr(full.config, "model_type", "").lower()
         if "llama" not in model_type and "mistral" not in model_type and "mixtral" not in model_type:
@@ -226,7 +318,61 @@ class StageLast(nn.Module):
         self.layers = _convert_layers(nn.ModuleList(raw_layers), full.config)
         self.lm_head = full.lm_head
         self.config = full.config
-        logger.info(f"StageLast initialized with {len(self.layers)} layers (start={start})")
+        
+        # GPU device 설정
+        self.gpu_device = gpu_device if gpu_device is not None else torch.device("cuda:0")
+        self.cpu_device = torch.device("cpu")
+        self.keep_layers_on_gpu = keep_layers_on_gpu
+        
+        # 레이어들의 현재 device 추적
+        self._layer_devices = {}
+        
+        # 모든 레이어를 CPU에 저장 (이미 CPU에 있으면 그대로 유지)
+        for i, layer in enumerate(self.layers):
+            if layer.device.type != "cpu":
+                self.layers[i] = layer.to(self.cpu_device)
+            self._layer_devices[i] = self.cpu_device
+        
+        # norm과 lm_head는 항상 GPU에 유지 (작고 자주 사용)
+        if hasattr(self, 'norm') and self.norm is not None:
+            self.norm = self.norm.to(self.gpu_device)
+        if hasattr(self, 'lm_head') and self.lm_head is not None:
+            self.lm_head = self.lm_head.to(self.gpu_device)
+        
+        logger.info(f"StageLast initialized with {len(self.layers)} layers (start={start}), "
+                   f"lazy GPU loading enabled (keep {keep_layers_on_gpu} layers on GPU)")
+    
+    def _move_layer_to_gpu(self, layer_idx: int):
+        """레이어를 GPU로 이동"""
+        if layer_idx < 0 or layer_idx >= len(self.layers):
+            return
+        
+        if self._layer_devices.get(layer_idx) != self.gpu_device:
+            try:
+                self.layers[layer_idx] = self.layers[layer_idx].to(self.gpu_device, non_blocking=True)
+                self._layer_devices[layer_idx] = self.gpu_device
+            except RuntimeError as e:
+                # GPU 메모리 부족 시 CPU에서 실행하도록 fallback
+                logger.warning(f"Failed to move layer {layer_idx} to GPU: {e}, keeping on CPU")
+                self._layer_devices[layer_idx] = self.cpu_device
+    
+    def _move_layer_to_cpu(self, layer_idx: int):
+        """레이어를 CPU로 이동 (keep_layers_on_gpu 설정 고려)"""
+        if layer_idx < 0 or layer_idx >= len(self.layers):
+            return
+        
+        # 최근 N개 레이어는 GPU에 유지
+        if self.keep_layers_on_gpu > 0:
+            total_layers = len(self.layers)
+            if layer_idx >= total_layers - self.keep_layers_on_gpu:
+                return  # GPU에 유지
+        
+        if self._layer_devices.get(layer_idx) != self.cpu_device:
+            try:
+                self.layers[layer_idx] = self.layers[layer_idx].to(self.cpu_device, non_blocking=True)
+                self._layer_devices[layer_idx] = self.cpu_device
+            except Exception as e:
+                logger.warning(f"Failed to move layer {layer_idx} to CPU: {e}")
 
     def forward(
         self,
@@ -240,10 +386,35 @@ class StageLast(nn.Module):
         tuple_cache = []
 
         for i, layer in enumerate(self.layers):
+            # 이전 레이어를 CPU로 이동 (필요한 경우)
+            if i > 0:
+                self._move_layer_to_cpu(i - 1)
+            
+            # 현재 레이어를 GPU로 이동
+            self._move_layer_to_gpu(i)
+            
+            # 레이어의 현재 device 확인
+            layer_device = self._layer_devices.get(i, self.cpu_device)
+            
+            # 입력을 레이어 device에 맞게 이동
+            if layer_device == self.gpu_device:
+                x = x.to(self.gpu_device, non_blocking=True)
+            
             layer_past = None if past_key_values is None else past_key_values[i]
+            
+            # past_key_values도 레이어와 동일한 device로 이동
+            if layer_past is not None and layer_device == self.gpu_device:
+                if isinstance(layer_past, (tuple, list)) and len(layer_past) == 2:
+                    key, value = layer_past
+                    layer_past = (
+                        key.to(self.gpu_device, non_blocking=True) if key is not None else None,
+                        value.to(self.gpu_device, non_blocking=True) if value is not None else None
+                    )
+            
             layer_pos = position_ids if position_ids is not None else default_position_ids(
                 layer_past, x.shape[1], x.device
             )
+            
             out = layer(
                 x,
                 attention_mask=None,
@@ -253,21 +424,37 @@ class StageLast(nn.Module):
                 output_attentions=False,
             )
             x = out[0]
+            
             if use_cache:
                 present = out[-1] if len(out) > 1 else None
                 present = _from_cache(present)
                 if present is None:
                     logger.warning(f"StageLast: layer {i} returned no KV cache")
-                # else:
-                #     cache_len = present[0].shape[-2] if isinstance(present, tuple) else "cache_obj"
-                #     logger.info(f"StageLast layer {i} present cache_len={cache_len}")
+                # cache도 device 일치 확인 (필요한 경우)
+                if present is not None and layer_device == self.gpu_device:
+                    if isinstance(present, (tuple, list)) and len(present) == 2:
+                        key, value = present
+                        # 다음 레이어가 CPU면 CPU로 이동 (마지막 레이어는 norm/lm_head가 GPU이므로 GPU에 유지)
+                        if i + 1 < len(self.layers) and self._layer_devices.get(i + 1, self.cpu_device) == self.cpu_device:
+                            present = (
+                                key.to(self.cpu_device, non_blocking=True) if key is not None else None,
+                                value.to(self.cpu_device, non_blocking=True) if value is not None else None
+                            )
                 tuple_cache.append(present)
-
+        
+        # 마지막 레이어 처리 후, 마지막 N개 레이어는 GPU에 유지
+        # 나머지는 CPU로 이동
+        for i in range(len(self.layers) - self.keep_layers_on_gpu):
+            self._move_layer_to_cpu(i)
+        
+        # norm과 lm_head는 항상 GPU에 있음
+        x = x.to(self.gpu_device, non_blocking=True)
         x = self.norm(x)
         # Ensure x dtype matches lm_head weight dtype to avoid dtype mismatch
         if hasattr(self.lm_head, 'weight') and self.lm_head.weight is not None:
             x = x.to(dtype=self.lm_head.weight.dtype)
         logits = self.lm_head(x)
+        
         if not use_cache:
             return logits, None
         return logits, tuple(tuple_cache)
@@ -281,6 +468,7 @@ def load_stage_model(
     start: int = 0,
     end: Optional[int] = None,
     dtype=torch.float16,
+    use_cpu_offload: bool = False,
 ):
     """
     Load only the layers needed for a stage to reduce memory (LLaMA-only).
@@ -288,6 +476,7 @@ def load_stage_model(
       - 'stage0': keep embeddings + layers[:end], drop head/norm
       - 'segment': keep layers[start:end], drop embeddings/head/norm
       - 'last': keep layers[start:], norm, lm_head
+    use_cpu_offload: If True, load model to CPU instead of device (for lazy GPU loading)
     """
     full = AutoModelForCausalLM.from_pretrained(
         model_name,
@@ -337,5 +526,11 @@ def load_stage_model(
     if num_layers == 0:
         raise ValueError(f"Pruned model has 0 layers for role={role} (start={start}, end={end}). Check --splits.")
 
-    full = full.to(device)
+    # CPU 오프로딩 모드면 CPU에 로드, 아니면 기존대로 device에 로드
+    if use_cpu_offload:
+        full = full.to(torch.device("cpu"))
+        logger.info(f"load_stage_model: Model loaded to CPU (lazy GPU loading enabled)")
+    else:
+        full = full.to(device)
+    
     return full
