@@ -414,18 +414,44 @@ def run_stage_server(args, device, splits):
                 logger.warning(f"Stage{args.stage} P2P listen maddrs unknown; using fallback {p2p_maddrs}")
 
             peer_info = {
-                "peer_id": str(p2p.peer_id),
-                "ip": local_ip,
-                "rpc_port": args.rpc_port,
-                "dht_port": args.dht_port,
+                "peer_id": str(p2p.peer_id),          # 서버 고유 ID (subkey로도 사용)
                 "timestamp": get_dht_time(),
+                "stage": args.stage,
             }
-            # P2P Multiaddr 존재하면 peer_info에 추가
             if p2p_maddrs:
                 peer_info["p2p_maddrs"] = p2p_maddrs
 
-            # DHT Network에 rpc 통신에 필요한 정보 저장
-            dht.store(f"mini_petals:stage{args.stage}", peer_info, expiration_time=get_dht_time() + 3600)
+            # ✅ (핵심) 같은 stage_key 아래에 여러 서버가 공존하도록 subkey 사용
+            STAGE_KEY = f"mini_petals:stage{args.stage}"
+            SUBKEY = str(p2p.peer_id)
+
+            # ✅ (핵심) 죽은 서버가 오래 남지 않게 TTL 짧게 + heartbeat 갱신
+            TTL = 45  # seconds (권장: 30~60)
+
+            def _store_once():
+                peer_info["timestamp"] = get_dht_time()
+                dht.store(
+                    key=STAGE_KEY,
+                    subkey=SUBKEY,
+                    value=peer_info,
+                    expiration_time=get_dht_time() + TTL,
+                )
+
+            # 최초 1회 등록
+            _store_once()
+            logger.info(f"Stage{args.stage} registered in DHT: key={STAGE_KEY}, subkey={SUBKEY[:8]}..., ttl={TTL}s")
+
+            # 주기적 heartbeat (TTL/3 마다 갱신)
+            async def heartbeat():
+                while True:
+                    try:
+                        _store_once()
+                    except Exception as e:
+                        logger.warning(f"Stage{args.stage} heartbeat failed: {e}")
+                    await asyncio.sleep(TTL / 3)
+
+            hb_task = asyncio.create_task(heartbeat())
+
 
             # P2P Daemon에 StageConnectionHandler의 rpc_* 메서드 등록
             await handler.add_p2p_handlers(p2p)
@@ -439,6 +465,8 @@ def run_stage_server(args, device, splits):
         except KeyboardInterrupt:
             logger.info(f"Stage{args.stage} shutting down...")
         finally:
+            if 'hb_task' in locals():
+                hb_task.cancel()
             if p2p:
                 try:
                     await p2p.shutdown()
