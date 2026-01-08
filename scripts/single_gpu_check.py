@@ -91,39 +91,46 @@ def main():
                 layers[i] = layers[i].to(device)
                 layer_devices[i] = device
         
-        # 각 레이어의 forward를 래핑하여 레이어 호출 전에 GPU로 이동 (클로저 문제 해결)
+        # 각 레이어의 forward를 래핑하여 호출 전에 GPU로 이동 (동기적으로)
+        num_layers = len(layers)
+        
+        # 각 레이어마다 고유한 래퍼 함수 생성 (클로저 문제 해결)
+        import types
+        
+        def create_wrapped_forward(idx, orig_fn):
+            """각 레이어마다 독립적인 래퍼 함수 생성"""
+            def wrapped_forward(*args, **kwargs):
+                # 현재 레이어를 GPU로 이동 (동기적으로 - 모든 서브모듈도 함께 이동)
+                if layer_devices.get(idx) != device:
+                    layers[idx] = layers[idx].to(device)
+                    layer_devices[idx] = device
+                    # CUDA 동기화로 이동 완료 보장 (모든 서브모듈도 함께 이동)
+                    if device.type == "cuda":
+                        torch.cuda.synchronize(device)
+                
+                # 이전 레이어를 CPU로 이동 (keep_layers_on_gpu 고려)
+                if idx > 0:
+                    prev_idx = idx - 1
+                    if args.keep_layers_on_gpu == 0 or prev_idx < num_layers - args.keep_layers_on_gpu:
+                        if layer_devices.get(prev_idx) == device:
+                            layers[prev_idx] = layers[prev_idx].to(cpu_device)
+                            layer_devices[prev_idx] = cpu_device
+                
+                # 입력 텐서를 GPU로 이동 (레이어가 GPU에 있으면)
+                if layer_devices.get(idx) == device:
+                    if args and len(args) > 0 and isinstance(args[0], torch.Tensor):
+                        args = (args[0].to(device),) + args[1:]
+                    if 'hidden_states' in kwargs and isinstance(kwargs['hidden_states'], torch.Tensor):
+                        kwargs['hidden_states'] = kwargs['hidden_states'].to(device)
+                
+                # 원본 forward 호출
+                return orig_fn(*args, **kwargs)
+            return wrapped_forward
+        
         for i, layer in enumerate(layers):
-            # 각 레이어의 원본 forward를 별도로 저장
             original_forward = layer.forward
-            
-            def make_layer_forward(layer_idx, orig_forward):
-                def wrapped_layer_forward(*args, **kwargs):
-                    # 현재 레이어를 GPU로 이동
-                    if layer_devices.get(layer_idx) != device:
-                        layers[layer_idx] = layers[layer_idx].to(device, non_blocking=True)
-                        layer_devices[layer_idx] = device
-                    
-                    # 이전 레이어를 CPU로 이동 (keep_layers_on_gpu 고려)
-                    if layer_idx > 0:
-                        prev_idx = layer_idx - 1
-                        if args.keep_layers_on_gpu == 0 or prev_idx < num_layers - args.keep_layers_on_gpu:
-                            if layer_devices.get(prev_idx) == device:
-                                layers[prev_idx] = layers[prev_idx].to(cpu_device, non_blocking=True)
-                                layer_devices[prev_idx] = cpu_device
-                    
-                    # 입력을 GPU로 이동 (레이어가 GPU에 있으면)
-                    if layer_devices.get(layer_idx) == device:
-                        if args and len(args) > 0 and isinstance(args[0], torch.Tensor):
-                            args = (args[0].to(device, non_blocking=True),) + args[1:]
-                        # kwargs의 텐서도 이동
-                        if 'hidden_states' in kwargs and isinstance(kwargs['hidden_states'], torch.Tensor):
-                            kwargs['hidden_states'] = kwargs['hidden_states'].to(device, non_blocking=True)
-                    
-                    # 원본 forward 호출
-                    return orig_forward(*args, **kwargs)
-                return wrapped_layer_forward
-            
-            layer.forward = make_layer_forward(i, original_forward)
+            wrapped_fn = create_wrapped_forward(i, original_forward)
+            layer.forward = types.MethodType(wrapped_fn, layer)
         
         # Embeddings와 norm, lm_head는 항상 GPU에 유지 (작고 자주 사용)
         if hasattr(model, "model") and hasattr(model.model, "embed_tokens"):
