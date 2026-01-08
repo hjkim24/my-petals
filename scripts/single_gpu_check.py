@@ -97,7 +97,7 @@ def main():
         # 각 레이어마다 고유한 래퍼 함수 생성 (클로저 문제 해결)
         import types
         
-        def create_wrapped_forward(idx, orig_fn):
+        def create_wrapped_forward(idx, orig_fn, cli_args):
             """각 레이어마다 독립적인 래퍼 함수 생성"""
             def wrapped_forward(self, *args, **kwargs):
                 # 현재 레이어를 GPU로 이동 (동기적으로 - 모든 서브모듈도 함께 이동)
@@ -111,7 +111,7 @@ def main():
                 # 이전 레이어를 CPU로 이동 (keep_layers_on_gpu 고려)
                 if idx > 0:
                     prev_idx = idx - 1
-                    if args.keep_layers_on_gpu == 0 or prev_idx < num_layers - args.keep_layers_on_gpu:
+                    if cli_args.keep_layers_on_gpu == 0 or prev_idx < num_layers - cli_args.keep_layers_on_gpu:
                         if layer_devices.get(prev_idx) == device:
                             layers[prev_idx] = layers[prev_idx].to(cpu_device)
                             layer_devices[prev_idx] = cpu_device
@@ -135,7 +135,7 @@ def main():
         
         for i, layer in enumerate(layers):
             original_forward = layer.__class__.forward
-            wrapped_fn = create_wrapped_forward(i, original_forward)
+            wrapped_fn = create_wrapped_forward(i, original_forward, args)
             layer.forward = types.MethodType(wrapped_fn, layer)
         
         # Embeddings와 norm, lm_head는 항상 GPU에 유지 (작고 자주 사용)
