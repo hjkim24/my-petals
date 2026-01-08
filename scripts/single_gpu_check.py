@@ -137,6 +137,11 @@ def main():
             model.model.embed_tokens = model.model.embed_tokens.to(device)
         elif hasattr(model, "transformer") and hasattr(model.transformer, "wte"):
             model.transformer.wte = model.transformer.wte.to(device)
+
+        if hasattr(model, "model") and hasattr(model.model, "rotary_emb"):
+            model.model.rotary_emb = model.model.rotary_emb.to(device)
+        elif hasattr(model, "transformer") and hasattr(model.transformer, "rotary_emb"):
+            model.transformer.rotary_emb = model.transformer.rotary_emb.to(device)
         
         if hasattr(model, "model") and hasattr(model.model, "norm"):
             model.model.norm = model.model.norm.to(device)
