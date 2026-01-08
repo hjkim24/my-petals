@@ -99,7 +99,7 @@ def main():
         
         def create_wrapped_forward(idx, orig_fn):
             """각 레이어마다 독립적인 래퍼 함수 생성"""
-            def wrapped_forward(*args, **kwargs):
+            def wrapped_forward(self, *args, **kwargs):
                 # 현재 레이어를 GPU로 이동 (동기적으로 - 모든 서브모듈도 함께 이동)
                 if layer_devices.get(idx) != device:
                     layers[idx] = layers[idx].to(device)
@@ -120,15 +120,21 @@ def main():
                 if layer_devices.get(idx) == device:
                     if args and len(args) > 0 and isinstance(args[0], torch.Tensor):
                         args = (args[0].to(device),) + args[1:]
-                    if 'hidden_states' in kwargs and isinstance(kwargs['hidden_states'], torch.Tensor):
-                        kwargs['hidden_states'] = kwargs['hidden_states'].to(device)
+                    if "hidden_states" in kwargs and isinstance(kwargs["hidden_states"], torch.Tensor):
+                        kwargs["hidden_states"] = kwargs["hidden_states"].to(device)
+                    if "attention_mask" in kwargs and isinstance(kwargs["attention_mask"], torch.Tensor):
+                        kwargs["attention_mask"] = kwargs["attention_mask"].to(device)
+                    if "position_ids" in kwargs and isinstance(kwargs["position_ids"], torch.Tensor):
+                        kwargs["position_ids"] = kwargs["position_ids"].to(device)
+                    if "cache_position" in kwargs and isinstance(kwargs["cache_position"], torch.Tensor):
+                        kwargs["cache_position"] = kwargs["cache_position"].to(device)
                 
                 # 원본 forward 호출
-                return orig_fn(*args, **kwargs)
+                return orig_fn(self, *args, **kwargs)
             return wrapped_forward
         
         for i, layer in enumerate(layers):
-            original_forward = layer.forward
+            original_forward = layer.__class__.forward
             wrapped_fn = create_wrapped_forward(i, original_forward)
             layer.forward = types.MethodType(wrapped_fn, layer)
         
