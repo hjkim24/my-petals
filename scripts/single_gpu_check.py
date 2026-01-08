@@ -1,7 +1,15 @@
 # single_gpu_check.py
 import argparse
+import sys
+from pathlib import Path
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
+
+# 프로젝트 루트를 path에 추가
+project_root = Path(__file__).parent.parent
+sys.path.insert(0, str(project_root))
+
+from src.llama_partition import load_stage_model, Stage0, StageLast
 
 
 def main():
@@ -20,6 +28,10 @@ def main():
                        help="Nucleus sampling p")
     parser.add_argument("--top_k", type=int, default=50,
                        help="Top-k sampling")
+    parser.add_argument("--use_cpu_offload", action="store_true",
+                       help="Enable CPU offloading: keep model parameters on CPU and move to GPU only when needed")
+    parser.add_argument("--keep_layers_on_gpu", type=int, default=0,
+                       help="Number of recent layers to keep on GPU when using CPU offloading (default: 0)")
     
     args = parser.parse_args()
     
@@ -38,20 +50,94 @@ def main():
     top_p = args.top_p
     top_k = args.top_k
     
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     tok = AutoTokenizer.from_pretrained(model_name)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
     
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        torch_dtype=dtype,
-        low_cpu_mem_usage=True,
-        device_map=None,   # 단일 GPU
-    )
-    model.to(device)
-    model.eval()
+    # CPU 오프로딩 사용 여부에 따라 모델 로딩 방식 결정
+    if args.use_cpu_offload:
+        # 전체 모델을 StageLast로 구성 (모든 레이어 포함)
+        # embeddings는 별도로 처리
+        stage_last_full = load_stage_model(
+            model_name, device, role="last",
+            start=0, dtype=dtype, use_cpu_offload=True
+        )
+        stage_last = StageLast(
+            stage_last_full, 0,
+            gpu_device=device,
+            keep_layers_on_gpu=args.keep_layers_on_gpu
+        )
+        
+        # embeddings 가져오기
+        temp_model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            torch_dtype=dtype,
+            low_cpu_mem_usage=True,
+        )
+        if hasattr(temp_model, "model") and hasattr(temp_model.model, "embed_tokens"):
+            embed_tokens = temp_model.model.embed_tokens
+        elif hasattr(temp_model, "transformer") and hasattr(temp_model.transformer, "wte"):
+            embed_tokens = temp_model.transformer.wte
+        else:
+            raise ValueError("Unsupported model architecture: cannot find embed_tokens")
+        
+        # embeddings를 CPU로 이동 (오프로딩 모드)
+        embed_tokens = embed_tokens.to(torch.device("cpu"))
+        del temp_model
+        import gc
+        gc.collect()
+        
+        # 모델을 래퍼로 구성
+        from src.utils import default_position_ids
+        
+        class OffloadedModel(torch.nn.Module):
+            def __init__(self, embed_tokens, stage_last):
+                super().__init__()
+                self.embed_tokens = embed_tokens
+                self.stage_last = stage_last
+                self.config = stage_last.config
+            
+            def eval(self):
+                self.stage_last.eval()
+                return self
+            
+            def forward(self, input_ids, past_key_values=None, use_cache=True, **kwargs):
+                # Embeddings (CPU에서 GPU로 이동)
+                hidden_states = self.embed_tokens(input_ids).to(device, non_blocking=True)
+                
+                # position_ids 생성
+                position_ids = default_position_ids(past_key_values, hidden_states.shape[1], hidden_states.device)
+                
+                # StageLast: 모든 레이어 + norm + lm_head
+                logits, stage_last_cache = self.stage_last(
+                    hidden_states,
+                    position_ids=position_ids,
+                    attention_mask=None,
+                    past_key_values=past_key_values,
+                    use_cache=use_cache
+                )
+                
+                from transformers.modeling_outputs import CausalLMOutputWithPast
+                return CausalLMOutputWithPast(
+                    logits=logits,
+                    past_key_values=stage_last_cache if use_cache else None
+                )
+        
+        model = OffloadedModel(embed_tokens, stage_last)
+        model.eval()
+        print(f"CPU offloading enabled: Model loaded with lazy GPU loading (keep {args.keep_layers_on_gpu} layers on GPU)")
+    else:
+        # 기존 방식: 전체 모델을 GPU에 로드
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            torch_dtype=dtype,
+            low_cpu_mem_usage=True,
+            device_map=None,   # 단일 GPU
+        )
+        model.to(device)
+        model.eval()
     
     # 1. Prefill: 프롬프트 처리
     print("=" * 80)
