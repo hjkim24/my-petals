@@ -168,7 +168,14 @@ class StageSegment(nn.Module):
         
         # 초기화: 모든 레이어를 CPU에 저장 (이미 CPU에 있으면 그대로 유지)
         for i, layer in enumerate(self.layers):
-            if layer.device.type != "cpu":
+            # PyTorch 모듈의 device 확인: 첫 번째 파라미터의 device 사용
+            try:
+                layer_device = next(layer.parameters()).device
+            except StopIteration:
+                # 파라미터가 없는 경우 (거의 없지만) 기본값으로 CPU 가정
+                layer_device = self.cpu_device
+            
+            if layer_device.type != "cpu":
                 self.layers[i] = layer.to(self.cpu_device)
             self._layer_devices[i] = self.cpu_device
         
@@ -329,7 +336,14 @@ class StageLast(nn.Module):
         
         # 모든 레이어를 CPU에 저장 (이미 CPU에 있으면 그대로 유지)
         for i, layer in enumerate(self.layers):
-            if layer.device.type != "cpu":
+            # PyTorch 모듈의 device 확인: 첫 번째 파라미터의 device 사용
+            try:
+                layer_device = next(layer.parameters()).device
+            except StopIteration:
+                # 파라미터가 없는 경우 (거의 없지만) 기본값으로 CPU 가정
+                layer_device = self.cpu_device
+            
+            if layer_device.type != "cpu":
                 self.layers[i] = layer.to(self.cpu_device)
             self._layer_devices[i] = self.cpu_device
         
