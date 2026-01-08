@@ -91,28 +91,39 @@ def main():
                 layers[i] = layers[i].to(device)
                 layer_devices[i] = device
         
-        # Forward hook으로 레이어별 GPU 이동
-        def make_forward_hook(layer_idx):
-            def hook(module, input, output):
-                # 현재 레이어를 GPU로 이동
-                if layer_devices.get(layer_idx) != device:
-                    layers[layer_idx] = layers[layer_idx].to(device)
-                    layer_devices[layer_idx] = device
-                
-                # 이전 레이어를 CPU로 이동 (keep_layers_on_gpu 고려)
-                if layer_idx > 0:
-                    prev_idx = layer_idx - 1
-                    if args.keep_layers_on_gpu == 0 or prev_idx < num_layers - args.keep_layers_on_gpu:
-                        if layer_devices.get(prev_idx) == device:
-                            layers[prev_idx] = layers[prev_idx].to(cpu_device)
-                            layer_devices[prev_idx] = cpu_device
-                
-                return output
-            return hook
-        
-        # 각 레이어에 hook 등록
+        # 각 레이어의 forward를 래핑하여 레이어 호출 전에 GPU로 이동 (클로저 문제 해결)
         for i, layer in enumerate(layers):
-            layer.register_forward_hook(make_forward_hook(i))
+            # 각 레이어의 원본 forward를 별도로 저장
+            original_forward = layer.forward
+            
+            def make_layer_forward(layer_idx, orig_forward):
+                def wrapped_layer_forward(*args, **kwargs):
+                    # 현재 레이어를 GPU로 이동
+                    if layer_devices.get(layer_idx) != device:
+                        layers[layer_idx] = layers[layer_idx].to(device, non_blocking=True)
+                        layer_devices[layer_idx] = device
+                    
+                    # 이전 레이어를 CPU로 이동 (keep_layers_on_gpu 고려)
+                    if layer_idx > 0:
+                        prev_idx = layer_idx - 1
+                        if args.keep_layers_on_gpu == 0 or prev_idx < num_layers - args.keep_layers_on_gpu:
+                            if layer_devices.get(prev_idx) == device:
+                                layers[prev_idx] = layers[prev_idx].to(cpu_device, non_blocking=True)
+                                layer_devices[prev_idx] = cpu_device
+                    
+                    # 입력을 GPU로 이동 (레이어가 GPU에 있으면)
+                    if layer_devices.get(layer_idx) == device:
+                        if args and len(args) > 0 and isinstance(args[0], torch.Tensor):
+                            args = (args[0].to(device, non_blocking=True),) + args[1:]
+                        # kwargs의 텐서도 이동
+                        if 'hidden_states' in kwargs and isinstance(kwargs['hidden_states'], torch.Tensor):
+                            kwargs['hidden_states'] = kwargs['hidden_states'].to(device, non_blocking=True)
+                    
+                    # 원본 forward 호출
+                    return orig_forward(*args, **kwargs)
+                return wrapped_layer_forward
+            
+            layer.forward = make_layer_forward(i, original_forward)
         
         # Embeddings와 norm, lm_head는 항상 GPU에 유지 (작고 자주 사용)
         if hasattr(model, "model") and hasattr(model.model, "embed_tokens"):
