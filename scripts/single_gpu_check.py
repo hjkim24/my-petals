@@ -2,6 +2,7 @@
 import argparse
 import sys
 from pathlib import Path
+import time
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
@@ -171,12 +172,16 @@ def main():
     inputs = tok(prompt, return_tensors="pt").to(device)
     input_ids = inputs.input_ids
     
+    # Prefill 시간 측정 시작
+    t_prefill_start = time.perf_counter()
     with torch.inference_mode():
         outputs = model(**inputs, use_cache=True)
         logits = outputs.logits  # [1, seq_len, vocab]
         past_key_values = outputs.past_key_values
         last_logits = logits[:, -1, :]      # 마지막 토큰 위치
         topk_vals, topk_ids = last_logits.topk(5, dim=-1)
+    t_prefill_end = time.perf_counter()
+    prefill_time = t_prefill_end - t_prefill_start
     
     print(f"Device: {device}, dtype: {logits.dtype}")
     print(f"Prompt: '{prompt}'")
@@ -192,6 +197,7 @@ def main():
         next_id = int(torch.argmax(last_logits, dim=-1).item())
         next_token_text = tok.decode([next_id], skip_special_tokens=True)
     print(f"Greedy next token: {next_id} ('{next_token_text}')")
+    print(f"TTFT (Time to First Token): {prefill_time:.3f}s")
     
     # 2. Decode: 토큰 생성 반복
     print("\n" + "=" * 80)
@@ -201,6 +207,8 @@ def main():
     generated = [next_id]
     eos_token_id = tok.eos_token_id if tok.eos_token_id is not None else tok.pad_token_id
     
+    # Decode 시간 측정 시작
+    t_decode_start = time.perf_counter()
     for step in range(max_new_tokens):
         # 다음 토큰을 입력으로 사용
         next_input = torch.tensor([[next_id]], device=device, dtype=torch.long)
@@ -261,6 +269,14 @@ def main():
             print(f"EOS token generated at step {step+1}")
             break
     
+    # Decode 시간 측정 종료
+    t_decode_end = time.perf_counter()
+    decode_time = t_decode_end - t_decode_start
+    total_time = t_decode_end - t_prefill_start
+    
+    # 생성된 토큰 수 (prefill에서 생성된 첫 토큰 포함)
+    num_generated_tokens = len(generated)  # prefill에서 1개 + decode에서 생성된 토큰들
+    
     # 3. 최종 결과
     print("\n" + "=" * 80)
     print("FINAL RESULTS")
@@ -271,6 +287,25 @@ def main():
     print(f"Generated tokens: {len(generated)}")
     print(f"Unique tokens: {len(set(generated))}")
     print(f"Repetition ratio: {(1.0 - len(set(generated)) / len(generated)) * 100:.2f}%")
+    
+    # 성능 지표 출력
+    print("\n" + "=" * 80)
+    print("PERFORMANCE METRICS")
+    print("=" * 80)
+    print(f"TTFT (Time to First Token): {prefill_time:.3f}s")
+    print(f"Decode time: {decode_time:.3f}s")
+    print(f"Total time: {total_time:.3f}s")
+    if decode_time > 0:
+        decode_tokens = num_generated_tokens - 1  # prefill에서 생성된 첫 토큰 제외
+        decoding_speed = decode_tokens / decode_time if decode_tokens > 0 else 0.0
+        print(f"Decoding speed: {decoding_speed:.2f} tokens/s")
+    else:
+        print(f"Decoding speed: N/A (no decode tokens)")
+    if total_time > 0:
+        throughput = num_generated_tokens / total_time
+        print(f"Throughput: {throughput:.2f} tokens/s")
+    else:
+        print(f"Throughput: N/A")
 
 
 if __name__ == "__main__":
