@@ -9,7 +9,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-from src.llama_partition import load_stage_model, Stage0, StageLast
+# 분산 추론용 import 제거 - 단일 GPU에서는 불필요
 
 
 def main():
@@ -56,88 +56,84 @@ def main():
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
     
-    # CPU 오프로딩 사용 여부에 따라 모델 로딩 방식 결정
+    # 모델 로드 (CPU 오프로딩 지원)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        torch_dtype=dtype,
+        low_cpu_mem_usage=True,
+    )
+    
     if args.use_cpu_offload:
-        # 전체 모델을 StageLast로 구성 (모든 레이어 포함)
-        # embeddings는 별도로 처리
-        stage_last_full = load_stage_model(
-            model_name, device, role="last",
-            start=0, dtype=dtype, use_cpu_offload=True
-        )
-        stage_last = StageLast(
-            stage_last_full, 0,
-            gpu_device=device,
-            keep_layers_on_gpu=args.keep_layers_on_gpu
-        )
+        # CPU 오프로딩 모드: 모델을 CPU에 로드하고 forward 시 필요한 레이어만 GPU로 이동
+        model = model.to(torch.device("cpu"))
         
-        # embeddings 가져오기
-        temp_model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            torch_dtype=dtype,
-            low_cpu_mem_usage=True,
-        )
-        if hasattr(temp_model, "model") and hasattr(temp_model.model, "embed_tokens"):
-            embed_tokens = temp_model.model.embed_tokens
-        elif hasattr(temp_model, "transformer") and hasattr(temp_model.transformer, "wte"):
-            embed_tokens = temp_model.transformer.wte
+        # 레이어 접근 (LLaMA 구조)
+        if hasattr(model, "model") and hasattr(model.model, "layers"):
+            layers = model.model.layers
+        elif hasattr(model, "transformer") and hasattr(model.transformer, "h"):
+            layers = model.transformer.h
         else:
-            raise ValueError("Unsupported model architecture: cannot find embed_tokens")
+            raise ValueError("Unsupported model architecture: cannot find layers")
         
-        # embeddings를 CPU로 이동 (오프로딩 모드)
-        embed_tokens = embed_tokens.to(torch.device("cpu"))
-        del temp_model
-        import gc
-        gc.collect()
+        # 레이어별 device 추적
+        layer_devices = {}
+        cpu_device = torch.device("cpu")
         
-        # 모델을 래퍼로 구성
-        from src.utils import default_position_ids
+        # 모든 레이어를 CPU에 유지
+        for i, layer in enumerate(layers):
+            layer = layer.to(cpu_device)
+            layer_devices[i] = cpu_device
         
-        class OffloadedModel(torch.nn.Module):
-            def __init__(self, embed_tokens, stage_last):
-                super().__init__()
-                self.embed_tokens = embed_tokens
-                self.stage_last = stage_last
-                self.config = stage_last.config
-            
-            def eval(self):
-                self.stage_last.eval()
-                return self
-            
-            def forward(self, input_ids, past_key_values=None, use_cache=True, **kwargs):
-                # Embeddings (CPU에서 GPU로 이동)
-                hidden_states = self.embed_tokens(input_ids).to(device, non_blocking=True)
+        # 최근 N개 레이어는 GPU에 유지
+        if args.keep_layers_on_gpu > 0:
+            num_layers = len(layers)
+            for i in range(max(0, num_layers - args.keep_layers_on_gpu), num_layers):
+                layers[i] = layers[i].to(device)
+                layer_devices[i] = device
+        
+        # Forward hook으로 레이어별 GPU 이동
+        def make_forward_hook(layer_idx):
+            def hook(module, input, output):
+                # 현재 레이어를 GPU로 이동
+                if layer_devices.get(layer_idx) != device:
+                    layers[layer_idx] = layers[layer_idx].to(device)
+                    layer_devices[layer_idx] = device
                 
-                # position_ids 생성
-                position_ids = default_position_ids(past_key_values, hidden_states.shape[1], hidden_states.device)
+                # 이전 레이어를 CPU로 이동 (keep_layers_on_gpu 고려)
+                if layer_idx > 0:
+                    prev_idx = layer_idx - 1
+                    if args.keep_layers_on_gpu == 0 or prev_idx < num_layers - args.keep_layers_on_gpu:
+                        if layer_devices.get(prev_idx) == device:
+                            layers[prev_idx] = layers[prev_idx].to(cpu_device)
+                            layer_devices[prev_idx] = cpu_device
                 
-                # StageLast: 모든 레이어 + norm + lm_head
-                logits, stage_last_cache = self.stage_last(
-                    hidden_states,
-                    position_ids=position_ids,
-                    attention_mask=None,
-                    past_key_values=past_key_values,
-                    use_cache=use_cache
-                )
-                
-                from transformers.modeling_outputs import CausalLMOutputWithPast
-                return CausalLMOutputWithPast(
-                    logits=logits,
-                    past_key_values=stage_last_cache if use_cache else None
-                )
+                return output
+            return hook
         
-        model = OffloadedModel(embed_tokens, stage_last)
-        model.eval()
+        # 각 레이어에 hook 등록
+        for i, layer in enumerate(layers):
+            layer.register_forward_hook(make_forward_hook(i))
+        
+        # Embeddings와 norm, lm_head는 항상 GPU에 유지 (작고 자주 사용)
+        if hasattr(model, "model") and hasattr(model.model, "embed_tokens"):
+            model.model.embed_tokens = model.model.embed_tokens.to(device)
+        elif hasattr(model, "transformer") and hasattr(model.transformer, "wte"):
+            model.transformer.wte = model.transformer.wte.to(device)
+        
+        if hasattr(model, "model") and hasattr(model.model, "norm"):
+            model.model.norm = model.model.norm.to(device)
+        elif hasattr(model, "transformer") and hasattr(model.transformer, "ln_f"):
+            model.transformer.ln_f = model.transformer.ln_f.to(device)
+        
+        if hasattr(model, "lm_head"):
+            model.lm_head = model.lm_head.to(device)
+        
         print(f"CPU offloading enabled: Model loaded with lazy GPU loading (keep {args.keep_layers_on_gpu} layers on GPU)")
     else:
-        # 기존 방식: 전체 모델을 GPU에 로드
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            torch_dtype=dtype,
-            low_cpu_mem_usage=True,
-            device_map=None,   # 단일 GPU
-        )
-        model.to(device)
-        model.eval()
+        # 일반 모드: 전체 모델을 GPU에 로드
+        model = model.to(device)
+    
+    model.eval()
     
     # 1. Prefill: 프롬프트 처리
     print("=" * 80)
