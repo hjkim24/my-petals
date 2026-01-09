@@ -66,7 +66,9 @@ def main():
     
     p = next(model.parameters())
     print("First param dtype:", p.dtype, "device:", p.device)
-    print("lm_head dtype:", model.lm_head.weight.dtype, "device:", model.lm_head.weight.device)
+
+    out_emb = model.get_output_embeddings()
+    print("output emb dtype:", out_emb.weight.dtype, "device:", out_emb.weight.device)
 
 
     if args.use_cpu_offload:
