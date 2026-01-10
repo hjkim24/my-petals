@@ -3,6 +3,7 @@ transformers>=4.43.1,<4.44.0
 multiaddr>=0.1.1
 accelerate>=1.12.0
 hf_transfer>=0.1.9
+numpy>=1.20.0  # Required for Load Balancing
 
 # Optional dependencies (with fallbacks in code)
 async-timeout>=4.0.0  # Optional: used for Python <3.11 (Python 3.11+ uses asyncio.timeout)

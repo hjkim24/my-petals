@@ -287,7 +287,23 @@ def run_rank0(args, device, splits):
 
 @torch.inference_mode()
 def run_stage_server(args, device, splits):
-    """Run a server stage (1, 2, or 3)."""
+    """Run a server stage (1, 2, or 3) with optional Load Balancing."""
+    # Load Balancing 활성화 여부 확인
+    use_load_balancing = getattr(args, 'use_load_balancing', False)
+    num_blocks = getattr(args, 'num_blocks', None)  # Load Balancing 시 담당할 블록 개수
+    total_blocks = getattr(args, 'total_blocks', None)  # 전체 블록 개수
+    
+    if use_load_balancing:
+        return run_stage_server_with_load_balancing(
+            args, device, splits, num_blocks, total_blocks
+        )
+    
+    # 기존 고정 splits 방식
+    return run_stage_server_fixed(args, device, splits)
+
+
+def run_stage_server_fixed(args, device, splits):
+    """Run a server stage with fixed splits (original implementation)."""
     # CPU 오프로딩 옵션
     use_cpu_offload = getattr(args, 'use_cpu_offload', False)
     keep_layers_on_gpu = getattr(args, 'keep_layers_on_gpu', 0)
@@ -333,7 +349,162 @@ def run_stage_server(args, device, splits):
         final_stage = True
     else:
         raise ValueError("stage must be 1, 2, or 3 for server")
+    
+    return _setup_and_run_server(args, device, stage_model, final_stage)
 
+
+def run_stage_server_with_load_balancing(args, device, splits, num_blocks, total_blocks):
+    """Run a server stage with Load Balancing (논문식 Full Load Balancing)."""
+    try:
+        from .load_balancing import (
+            choose_best_blocks, should_choose_other_blocks, ServerState
+        )
+        from .dht_utils import (
+            get_remote_module_infos, register_server_on_dht,
+            register_blocks_on_dht, update_server_throughput_on_dht
+        )
+        from .throughput_measurement import get_server_throughput
+    except ImportError as e:
+        logger.error(f"Failed to import Load Balancing modules: {e}")
+        logger.error("Falling back to fixed splits mode")
+        return run_stage_server_fixed(args, device, splits)
+    
+    import random
+    import asyncio
+    
+    # DHT 초기화
+    initial_peers_list = _format_initial_peers(args.dht_initial_peers)
+    local_ip = _get_local_ip()
+    announce_ip = args.public_ip if args.public_ip else local_ip
+    public_dht_port = args.public_dht_port if args.public_dht_port is not None else args.dht_port
+    public_rpc_port = args.public_rpc_port if args.public_rpc_port is not None else args.rpc_port
+    
+    if args.public_ip:
+        host_maddrs = [f"/ip4/0.0.0.0/tcp/{args.dht_port}"]
+        announce_maddrs = [f"/ip4/{args.public_ip}/tcp/{public_dht_port}"]
+    else:
+        host_maddrs = [f"/ip4/{local_ip}/tcp/{args.dht_port}"]
+        announce_maddrs = None
+    
+    dht = DHT(
+        start=True,
+        initial_peers=initial_peers_list if initial_peers_list else None,
+        host_maddrs=host_maddrs,
+        announce_maddrs=announce_maddrs,
+    )
+    
+    # 기본값 설정
+    if num_blocks is None:
+        num_blocks = 4  # 기본값: 4개 블록
+    if total_blocks is None:
+        # 모델에서 전체 레이어 수 추론 (간단한 휴리스틱)
+        try:
+            from transformers import AutoConfig
+            config = AutoConfig.from_pretrained(args.model)
+            total_blocks = config.num_hidden_layers if hasattr(config, 'num_hidden_layers') else 32
+        except:
+            total_blocks = 32
+    
+    # Load Balancing 메인 루프
+    balance_quality = getattr(args, 'balance_quality', 0.75)
+    mean_balance_check_period = getattr(args, 'mean_balance_check_period', 120.0)
+    
+    while True:
+        try:
+            # 1. 현재 시스템 상태 조회
+            module_infos = get_remote_module_infos(dht, args.model, total_blocks)
+            
+            # 2. 최적 블록 선택 (규칙 1 또는 규칙 2)
+            if len(module_infos) == 0:
+                # 첫 서버이거나 다른 서버 정보 없음 - 랜덤 선택
+                block_indices = list(range(min(num_blocks, total_blocks)))
+            else:
+                # 논문식 최적 블록 선택
+                block_indices = choose_best_blocks(num_blocks, module_infos, total_blocks)
+            
+            start_block = min(block_indices)
+            end_block = max(block_indices) + 1
+            
+            logger.info(f"Selected blocks: {block_indices} (start={start_block}, end={end_block})")
+            
+            # 3. 모델 로드
+            use_cpu_offload = getattr(args, 'use_cpu_offload', False)
+            keep_layers_on_gpu = getattr(args, 'keep_layers_on_gpu', 0)
+            
+            if end_block >= total_blocks:
+                # 마지막 블록 포함 - final stage
+                full = load_stage_model(
+                    args.model, device, role="last",
+                    start=start_block, dtype=args.dtype,
+                    use_cpu_offload=use_cpu_offload
+                )
+                stage_model = StageLast(
+                    full, start_block,
+                    gpu_device=device,
+                    keep_layers_on_gpu=keep_layers_on_gpu
+                )
+                final_stage = True
+            else:
+                # 중간 세그먼트
+                full = load_stage_model(
+                    args.model, device, role="segment",
+                    start=start_block, end=end_block, dtype=args.dtype,
+                    use_cpu_offload=use_cpu_offload
+                )
+                stage_model = StageSegment(
+                    full, start_block, end_block,
+                    gpu_device=device,
+                    keep_layers_on_gpu=keep_layers_on_gpu
+                )
+                final_stage = False
+            
+            # 4. 처리량 측정
+            try:
+                hidden_size = getattr(stage_model.config, 'hidden_size', 4096)
+                throughput = get_server_throughput(
+                    stage_model, device, num_blocks=len(block_indices),
+                    hidden_size=hidden_size, dtype=args.dtype,
+                    network_bandwidth_mbps=getattr(args, 'network_bandwidth_mbps', None),
+                )
+            except Exception as e:
+                logger.warning(f"Failed to measure throughput, using default: {e}")
+                throughput = 10.0  # 기본값
+            
+            # 5. DHT에 등록
+            peer_id = dht.peer_id
+            register_server_on_dht(
+                dht, peer_id, start_block, end_block, throughput,
+                model_name=args.model, server_address=announce_ip,
+                state=ServerState.ONLINE
+            )
+            register_blocks_on_dht(dht, peer_id, block_indices, args.model)
+            
+            # 6. 서버 실행 (재조정 로직 포함)
+            should_rebalance = _setup_and_run_server_with_rebalancing(
+                args, device, stage_model, final_stage, dht, peer_id,
+                block_indices, throughput, balance_quality, mean_balance_check_period,
+                args.model, total_blocks
+            )
+            
+            # 재조정이 필요하면 루프 계속, 아니면 종료
+            if not should_rebalance:
+                logger.info("Server shutting down normally")
+                break
+            
+            # 재조정 루프에서 나왔다면 다시 블록 선택
+            logger.info("Re-evaluating block assignment...")
+            time.sleep(1)  # 잠시 대기
+            
+        except KeyboardInterrupt:
+            logger.info("Shutting down Load Balancing server...")
+            break
+        except Exception as e:
+            logger.error(f"Error in Load Balancing loop: {e}", exc_info=True)
+            time.sleep(5)  # 에러 후 재시도 전 대기
+
+
+def _setup_and_run_server(args, device, stage_model, final_stage):
+    """기존 서버 설정 및 실행 로직 (고정 splits용)."""
     dht_peers = args.dht_initial_peers.split(",") if args.dht_initial_peers else []
     initial_peers_list = _format_initial_peers(args.dht_initial_peers)
     local_ip = _get_local_ip()
@@ -504,6 +675,324 @@ def run_stage_server(args, device, splits):
     asyncio.run(setup_and_run())
 
 
+def _setup_and_run_server_with_rebalancing(
+    args, device, stage_model, final_stage, dht, peer_id,
+    block_indices, throughput, balance_quality, mean_balance_check_period,
+    model_name, total_blocks
+) -> bool:
+    """
+    Load Balancing을 지원하는 서버 실행 (주기적 재조정 포함)
+    
+    Returns:
+        True이면 재조정 필요 (블록 변경 필요), False이면 정상 종료
+    """
+    try:
+        from .load_balancing import should_choose_other_blocks
+        from .dht_utils import get_remote_module_infos, update_server_throughput_on_dht
+    except ImportError as e:
+        logger.error(f"Failed to import Load Balancing modules: {e}")
+        return False
+    
+    import random
+    
+    handler = StageConnectionHandler(
+        dht=dht,
+        stage_model=stage_model,
+        device=device,
+        request_timeout=args.request_timeout,
+        final_stage=final_stage,
+    )
+    
+    should_rebalance = False
+    stop_event = asyncio.Event()
+    
+    async def setup_and_run_with_rebalancing():
+        nonlocal should_rebalance
+        p2p = None
+        hb_task = None
+        rebalance_task = None
+        
+        try:
+            local_ip = _get_local_ip()
+            announce_ip = args.public_ip if args.public_ip else local_ip
+            public_rpc_port = args.public_rpc_port if args.public_rpc_port is not None else args.rpc_port
+            
+            # P2P 초기화
+            if args.public_ip:
+                p2p_host_maddrs = [f"/ip4/0.0.0.0/tcp/{args.rpc_port}"]
+            else:
+                p2p_host_maddrs = [f"/ip4/{local_ip}/tcp/{args.rpc_port}"]
+            
+            p2p = await P2P.create(host_maddrs=p2p_host_maddrs)
+            logger.info(f"P2P initialized for Load Balancing server, PeerID: {p2p.peer_id}")
+            
+            # Heartbeat 로직
+            STAGE_KEY = f"mini_petals:stage{args.stage}"
+            SUBKEY = str(p2p.peer_id)
+            TTL = 45
+            
+            def _store_once():
+                peer_info = {
+                    "peer_id": str(p2p.peer_id),
+                    "timestamp": get_dht_time(),
+                    "stage": args.stage,
+                    "blocks": block_indices,
+                    "throughput": throughput,
+                }
+                dht.store(
+                    key=STAGE_KEY,
+                    subkey=SUBKEY,
+                    value=peer_info,
+                    expiration_time=get_dht_time() + TTL,
+                )
+            
+            _store_once()
+            
+            async def heartbeat():
+                while not stop_event.is_set():
+                    try:
+                        _store_once()
+                        await asyncio.sleep(TTL / 3)
+                    except asyncio.CancelledError:
+                        break
+                    except Exception as e:
+                        logger.warning(f"Heartbeat failed: {e}")
+                        await asyncio.sleep(TTL / 3)
+            
+            hb_task = asyncio.create_task(heartbeat())
+            
+            # 주기적 재조정 체크 (논문 Appendix D 규칙 2)
+            async def rebalance_check():
+                nonlocal should_rebalance
+                while not stop_event.is_set():
+                    try:
+                        # 랜덤 대기 시간 (평균 mean_balance_check_period)
+                        timeout = random.random() * 2 * mean_balance_check_period
+                        await asyncio.sleep(timeout)
+                        
+                        if stop_event.is_set():
+                            break
+                        
+                        # 처리량 업데이트
+                        try:
+                            from .throughput_measurement import get_server_throughput
+                            hidden_size = getattr(stage_model.config, 'hidden_size', 4096)
+                            new_throughput = get_server_throughput(
+                                stage_model, device, num_blocks=len(block_indices),
+                                hidden_size=hidden_size, dtype=args.dtype,
+                            )
+                            update_server_throughput_on_dht(dht, peer_id, new_throughput, model_name)
+                        except Exception as e:
+                            logger.debug(f"Failed to update throughput: {e}")
+                        
+                        # 재조정 필요 여부 확인
+                        module_infos = get_remote_module_infos(dht, model_name, total_blocks)
+                        if should_choose_other_blocks(peer_id, module_infos, balance_quality, total_blocks):
+                            logger.info("Load balancing detected imbalance, will rebalance blocks")
+                            should_rebalance = True
+                            stop_event.set()
+                            break
+                            
+                    except asyncio.CancelledError:
+                        break
+                    except Exception as e:
+                        logger.warning(f"Rebalance check failed: {e}")
+                        await asyncio.sleep(10)
+            
+            rebalance_task = asyncio.create_task(rebalance_check())
+            
+            # Handler 등록
+            await handler.add_p2p_handlers(p2p)
+            logger.info(f"Load Balancing server ready, blocks={block_indices}, throughput={throughput:.2f} rps")
+            
+            # 무한 대기 (재조정 또는 종료 신호까지)
+            await stop_event.wait()
+            
+        except KeyboardInterrupt:
+            logger.info("Shutting down Load Balancing server...")
+        except Exception as e:
+            logger.error(f"Error in Load Balancing server: {e}", exc_info=True)
+        finally:
+            stop_event.set()
+            if hb_task:
+                hb_task.cancel()
+            if rebalance_task:
+                rebalance_task.cancel()
+            if p2p:
+                try:
+                    await p2p.shutdown()
+                except Exception as e:
+                    logger.warning(f"Error shutting down P2P: {e}")
+    
+    try:
+        asyncio.run(setup_and_run_with_rebalancing())
+    except KeyboardInterrupt:
+        logger.info("Load Balancing server interrupted")
+        return False
+    
+    return should_rebalance
+
+
+def _setup_and_run_server_with_rebalancing(
+    args, device, stage_model, final_stage, dht, peer_id,
+    block_indices, throughput, balance_quality, mean_balance_check_period,
+    model_name, total_blocks
+) -> bool:
+    """
+    Load Balancing을 지원하는 서버 실행 (주기적 재조정 포함)
+    
+    Returns:
+        True이면 재조정 필요 (블록 변경 필요), False이면 정상 종료
+    """
+    try:
+        from .load_balancing import should_choose_other_blocks
+        from .dht_utils import get_remote_module_infos, update_server_throughput_on_dht
+    except ImportError as e:
+        logger.error(f"Failed to import Load Balancing modules: {e}")
+        return False
+    
+    import random
+    import asyncio
+    
+    handler = StageConnectionHandler(
+        dht=dht,
+        stage_model=stage_model,
+        device=device,
+        request_timeout=args.request_timeout,
+        final_stage=final_stage,
+    )
+    
+    should_rebalance = False
+    stop_event = None  # asyncio.Event로 생성
+    
+    async def setup_and_run_with_rebalancing():
+        nonlocal should_rebalance, stop_event
+        stop_event = asyncio.Event()  # async 함수 내에서 생성
+        p2p = None
+        hb_task = None
+        rebalance_task = None
+        
+        try:
+            local_ip = _get_local_ip()
+            announce_ip = args.public_ip if args.public_ip else local_ip
+            public_rpc_port = args.public_rpc_port if args.public_rpc_port is not None else args.rpc_port
+            
+            # P2P 초기화 (기존 로직 재사용)
+            if args.public_ip:
+                p2p_host_maddrs = [f"/ip4/0.0.0.0/tcp/{args.rpc_port}"]
+            else:
+                p2p_host_maddrs = [f"/ip4/{local_ip}/tcp/{args.rpc_port}"]
+            
+            p2p = await P2P.create(host_maddrs=p2p_host_maddrs)
+            logger.info(f"P2P initialized for Load Balancing server, PeerID: {p2p.peer_id}")
+            
+            # 기존 heartbeat 로직
+            STAGE_KEY = f"mini_petals:stage{args.stage}"
+            SUBKEY = str(p2p.peer_id)
+            TTL = 45
+            
+            def _store_once():
+                peer_info = {
+                    "peer_id": str(p2p.peer_id),
+                    "timestamp": get_dht_time(),
+                    "stage": args.stage,
+                    "blocks": block_indices,
+                    "throughput": throughput,
+                }
+                dht.store(
+                    key=STAGE_KEY,
+                    subkey=SUBKEY,
+                    value=peer_info,
+                    expiration_time=get_dht_time() + TTL,
+                )
+            
+            _store_once()
+            
+            async def heartbeat():
+                while not stop_event.is_set():
+                    try:
+                        _store_once()
+                        await asyncio.sleep(TTL / 3)
+                    except asyncio.CancelledError:
+                        break
+                    except Exception as e:
+                        logger.warning(f"Heartbeat failed: {e}")
+                        await asyncio.sleep(TTL / 3)
+            
+            hb_task = asyncio.create_task(heartbeat())
+            
+            # 주기적 재조정 체크 (논문 Appendix D 규칙 2)
+            async def rebalance_check():
+                nonlocal should_rebalance
+                while not stop_event.is_set():
+                    try:
+                        # 랜덤 대기 시간 (평균 mean_balance_check_period)
+                        timeout = random.random() * 2 * mean_balance_check_period
+                        await asyncio.sleep(timeout)
+                        
+                        if stop_event.is_set():
+                            break
+                        
+                        # 처리량 업데이트
+                        try:
+                            from .throughput_measurement import get_server_throughput
+                            hidden_size = getattr(stage_model.config, 'hidden_size', 4096)
+                            new_throughput = get_server_throughput(
+                                stage_model, device, num_blocks=len(block_indices),
+                                hidden_size=hidden_size, dtype=args.dtype,
+                            )
+                            update_server_throughput_on_dht(dht, peer_id, new_throughput, model_name)
+                        except Exception as e:
+                            logger.debug(f"Failed to update throughput: {e}")
+                        
+                        # 재조정 필요 여부 확인
+                        module_infos = get_remote_module_infos(dht, model_name, total_blocks)
+                        if should_choose_other_blocks(peer_id, module_infos, balance_quality, total_blocks):
+                            logger.info("Load balancing detected imbalance, will rebalance blocks")
+                            should_rebalance = True
+                            stop_event.set()
+                            break
+                            
+                    except asyncio.CancelledError:
+                        break
+                    except Exception as e:
+                        logger.warning(f"Rebalance check failed: {e}")
+                        await asyncio.sleep(10)
+            
+            rebalance_task = asyncio.create_task(rebalance_check())
+            
+            # Handler 등록
+            await handler.add_p2p_handlers(p2p)
+            logger.info(f"Load Balancing server ready, blocks={block_indices}, throughput={throughput:.2f} rps")
+            
+            # 무한 대기 (재조정 또는 종료 신호까지)
+            await asyncio.Event().wait()
+            
+        except KeyboardInterrupt:
+            logger.info("Shutting down Load Balancing server...")
+        except Exception as e:
+            logger.error(f"Error in Load Balancing server: {e}", exc_info=True)
+        finally:
+            stop_event.set()
+            if hb_task:
+                hb_task.cancel()
+            if rebalance_task:
+                rebalance_task.cancel()
+            if p2p:
+                try:
+                    await p2p.shutdown()
+                except Exception as e:
+                    logger.warning(f"Error shutting down P2P: {e}")
+    
+    try:
+        asyncio.run(setup_and_run_with_rebalancing())
+    except KeyboardInterrupt:
+        logger.info("Load Balancing server interrupted")
+        return False
+    
+    return should_rebalance
+
+
 def main():
     parser = argparse.ArgumentParser(description="Mini Petals: Distributed Inference")
     parser.add_argument("--model", type=str, required=True)
@@ -535,6 +1024,19 @@ def main():
                        help='Enable CPU offloading: keep model parameters on CPU and move to GPU only when needed')
     parser.add_argument('--keep_layers_on_gpu', type=int, default=0,
                        help='Number of recent layers to keep on GPU when using CPU offloading (default: 0)')
+    # Load Balancing 옵션
+    parser.add_argument('--use_load_balancing', action='store_true',
+                       help='Enable Full Load Balancing (논문식)')
+    parser.add_argument('--num_blocks', type=int, default=None,
+                       help='Number of blocks to serve (for Load Balancing, default: auto)')
+    parser.add_argument('--total_blocks', type=int, default=None,
+                       help='Total number of blocks in the model (for Load Balancing, default: auto)')
+    parser.add_argument('--balance_quality', type=float, default=0.75,
+                       help='Load balancing quality threshold (0.75 = 25%% improvement needed, default: 0.75)')
+    parser.add_argument('--mean_balance_check_period', type=float, default=120.0,
+                       help='Mean period for balance check in seconds (default: 120)')
+    parser.add_argument('--network_bandwidth_mbps', type=float, default=None,
+                       help='Network bandwidth in Mbps for throughput estimation (default: auto estimate)')
     
     args = parser.parse_args()
 
