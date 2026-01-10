@@ -25,7 +25,7 @@ def measure_compute_throughput(
     컴퓨팅 처리량 측정 (forward pass)
     
     Args:
-        model: PyTorch 모델
+        model: PyTorch 모델 (StageSegment, StageLast 등)
         device: 디바이스
         hidden_size: Hidden state 크기
         num_blocks: 담당하는 블록 개수
@@ -42,40 +42,103 @@ def measure_compute_throughput(
     batch_size = 1
     seq_len = 1  # autoregressive generation 시 seq_len=1
     
+    # 모델 타입 확인 (StageSegment/StageLast는 position_ids, attention_mask 필요)
+    model_class_name = model.__class__.__name__
+    requires_position_ids = model_class_name in ["StageSegment", "StageLast"]
+    
     try:
         # Forward pass 처리량 측정
         with torch.inference_mode():
             # 워밍업
-            for _ in range(warmup_steps):
-                dummy_input = torch.randn(
+            warmup_success = False
+            for warmup_step in range(warmup_steps):
+                hidden_states = torch.randn(
                     batch_size, seq_len, hidden_size,
                     device=device, dtype=dtype
                 )
-                try:
-                    _ = model(dummy_input)
-                except Exception as e:
-                    logger.warning(f"Forward pass failed during warmup: {e}")
-                    return {"forward_rps": 0.0, "inference_rps": 0.0}
+                
+                if requires_position_ids:
+                    # StageSegment/StageLast는 position_ids와 attention_mask 필요
+                    position_ids = torch.zeros(batch_size, seq_len, dtype=torch.long, device=device)
+                    attention_mask = torch.ones(batch_size, seq_len, dtype=dtype, device=device)
+                    try:
+                        output = model(
+                            hidden_states,
+                            position_ids=position_ids,
+                            attention_mask=attention_mask,
+                            past_key_values=None,
+                            use_cache=False
+                        )
+                        # 출력이 tuple인 경우 처리 (hidden_states, past_key_values)
+                        if isinstance(output, tuple):
+                            _ = output[0]
+                        else:
+                            _ = output
+                        warmup_success = True
+                    except Exception as e:
+                        logger.debug(f"Forward pass failed during warmup step {warmup_step+1}/{warmup_steps}: {e}")
+                        # 마지막 워밍업에서도 실패하면 경고
+                        if warmup_step == warmup_steps - 1:
+                            logger.warning(f"All warmup steps failed, proceeding anyway")
+                else:
+                    # 일반 모델 (Stage0 등)
+                    try:
+                        _ = model(hidden_states)
+                        warmup_success = True
+                    except Exception as e:
+                        logger.debug(f"Forward pass failed during warmup: {e}")
+            
+            if not warmup_success and requires_position_ids:
+                logger.warning("Warmup failed but continuing with benchmark")
             
             # 벤치마크
             torch.cuda.synchronize() if device.type == "cuda" else None
             start_time = time.time()
             
-            for _ in range(benchmark_steps):
-                dummy_input = torch.randn(
+            successful_steps = 0
+            for step in range(benchmark_steps):
+                hidden_states = torch.randn(
                     batch_size, seq_len, hidden_size,
                     device=device, dtype=dtype
                 )
-                try:
-                    _ = model(dummy_input)
-                except Exception as e:
-                    logger.warning(f"Forward pass failed during benchmark: {e}")
-                    return {"forward_rps": 0.0, "inference_rps": 0.0}
+                
+                if requires_position_ids:
+                    position_ids = torch.zeros(batch_size, seq_len, dtype=torch.long, device=device)
+                    attention_mask = torch.ones(batch_size, seq_len, dtype=dtype, device=device)
+                    try:
+                        output = model(
+                            hidden_states,
+                            position_ids=position_ids,
+                            attention_mask=attention_mask,
+                            past_key_values=None,
+                            use_cache=False
+                        )
+                        # 출력이 tuple인 경우 처리 (hidden_states, past_key_values)
+                        if isinstance(output, tuple):
+                            _ = output[0]
+                        else:
+                            _ = output
+                        successful_steps += 1
+                    except Exception as e:
+                        logger.warning(f"Forward pass failed at step {step+1}/{benchmark_steps}: {e}")
+                        # 계속 진행하되 실패한 스텝은 카운트하지 않음
+                        continue
+                else:
+                    try:
+                        _ = model(hidden_states)
+                        successful_steps += 1
+                    except Exception as e:
+                        logger.warning(f"Forward pass failed at step {step+1}/{benchmark_steps}: {e}")
+                        continue
             
             torch.cuda.synchronize() if device.type == "cuda" else None
             elapsed = time.time() - start_time
             
-            forward_rps = benchmark_steps / elapsed if elapsed > 0 else 0.0
+            if successful_steps == 0:
+                logger.warning("All benchmark steps failed, returning 0.0 rps")
+                forward_rps = 0.0
+            else:
+                forward_rps = successful_steps / elapsed if elapsed > 0 else 0.0
         
         # Inference RPS는 forward RPS와 동일 (autoregressive의 경우)
         inference_rps = forward_rps
@@ -176,9 +239,22 @@ def get_server_throughput(
         network_throughput *= (1.0 - relay_penalty)
     
     # 최종 처리량 = min(컴퓨팅, 네트워크)
-    final_throughput = min(compute_throughput, network_throughput)
+    # 처리량 측정 실패 시 (0.0) 네트워크 처리량 사용
+    if compute_throughput <= 0:
+        logger.warning(
+            f"Compute throughput measurement failed (got {compute_throughput:.2f} rps), "
+            f"using network throughput estimate: {network_throughput:.2f} rps"
+        )
+        final_throughput = network_throughput
+    else:
+        final_throughput = min(compute_throughput, network_throughput)
     
-    logger.debug(
+    # 최종 fallback: 둘 다 0이면 기본값 사용
+    if final_throughput <= 0:
+        logger.warning("Both compute and network throughput are 0, using default: 10.0 rps")
+        final_throughput = 10.0
+    
+    logger.info(
         f"Server throughput: compute={compute_throughput:.2f} rps, "
         f"network={network_throughput:.2f} rps, "
         f"final={final_throughput:.2f} rps"
