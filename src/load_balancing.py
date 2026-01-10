@@ -281,19 +281,42 @@ def should_choose_other_blocks(
         total_blocks = max_block + 1 if max_block > 0 else 32  # 기본값
     
     spans = compute_spans(module_infos, min_state=ServerState.JOINING)
+    
+    # 디버깅: spans에 있는 peer ID들 로깅
+    if len(spans) > 0:
+        span_peer_ids = [str(pid)[:16] for pid in spans.keys()]
+        logger.debug(f"Found {len(spans)} spans with peer_ids: {span_peer_ids}")
+    else:
+        logger.debug(f"No spans found in module_infos (total: {len(module_infos)})")
+    
+    logger.debug(f"Looking for local peer_id: {local_peer_id}")
+    
     throughputs = compute_throughputs(spans, total_blocks=total_blocks)
-    initial_throughput = float(np.min(throughputs))
+    initial_throughput = float(np.min(throughputs)) if len(throughputs) > 0 else 0.0
     eps = 1e-3
     
-    # 현재 서버의 스팬 찾기
-    if local_peer_id not in spans:
-        logger.warning(f"Local peer {local_peer_id} not found in spans")
+    # 현재 서버의 스팬 찾기 (peer_id 비교 시 문자열 변환하여 비교)
+    local_peer_id_str = str(local_peer_id)
+    matching_peer_id = None
+    for span_peer_id in spans.keys():
+        if str(span_peer_id) == local_peer_id_str:
+            matching_peer_id = span_peer_id
+            break
+    
+    if matching_peer_id is None:
+        logger.warning(f"Local peer {local_peer_id_str[:16]}... not found in spans (have {len(spans)} spans)")
+        if len(spans) > 0:
+            logger.warning(f"Available peer_ids in spans: {[str(pid)[:16] for pid in spans.keys()]}")
         return False
     
-    local_span = spans[local_peer_id]
+    local_span = spans[matching_peer_id]
+    logger.debug(f"Found local span: start={local_span.start}, end={local_span.end}, throughput={local_span.throughput}")
     
     # 자신의 블록을 제거한 상태에서 처리량 계산
-    throughputs[local_span.start : local_span.end] -= local_span.throughput * (1 + eps)
+    local_start = max(0, min(local_span.start, len(throughputs) - 1))
+    local_end = min(local_span.end, len(throughputs))
+    if local_end > local_start:
+        throughputs[local_start : local_end] -= local_span.throughput * (1 + eps)
     
     # 파이프라인 분리 체크 (disjoint check)
     if initial_throughput > eps and np.min(throughputs) <= 0:
