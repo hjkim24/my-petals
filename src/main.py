@@ -96,7 +96,13 @@ def run_rank0(args, device, splits):
     # 1. Initialize
     full = load_stage_model(
         args.model, device, role="stage0", end=splits[0], 
-        dtype=args.torch_dtype, quantization_config=args.quantization_config
+        dtype=args.torch_dtype, 
+        quantization_config=args.quantization_config,
+        load_in_4bit=args.load_in_4bit,
+        load_in_8bit=args.load_in_8bit,
+        bnb_4bit_compute_dtype=args.bnb_4bit_compute_dtype,
+        bnb_4bit_use_double_quant=args.bnb_4bit_use_double_quant,
+        bnb_4bit_quant_type=args.bnb_4bit_quant_type,
     )
     s0 = Stage0(full, splits[0]).to(device) # load to GPU
 
@@ -295,7 +301,13 @@ def run_stage_server(args, device, splits):
         start, end = splits[0], splits[1]
         full = load_stage_model(
             args.model, device, role="segment", start=start, end=end, 
-            dtype=args.torch_dtype, quantization_config=args.quantization_config
+            dtype=args.torch_dtype, 
+            quantization_config=args.quantization_config,
+            load_in_4bit=args.load_in_4bit,
+            load_in_8bit=args.load_in_8bit,
+            bnb_4bit_compute_dtype=args.bnb_4bit_compute_dtype,
+            bnb_4bit_use_double_quant=args.bnb_4bit_use_double_quant,
+            bnb_4bit_quant_type=args.bnb_4bit_quant_type,
         )
         stage_model = StageSegment(full, start, end).to(device)
         final_stage = False
@@ -303,7 +315,13 @@ def run_stage_server(args, device, splits):
         start, end = splits[1], splits[2]
         full = load_stage_model(
             args.model, device, role="segment", start=start, end=end, 
-            dtype=args.torch_dtype, quantization_config=args.quantization_config
+            dtype=args.torch_dtype, 
+            quantization_config=args.quantization_config,
+            load_in_4bit=args.load_in_4bit,
+            load_in_8bit=args.load_in_8bit,
+            bnb_4bit_compute_dtype=args.bnb_4bit_compute_dtype,
+            bnb_4bit_use_double_quant=args.bnb_4bit_use_double_quant,
+            bnb_4bit_quant_type=args.bnb_4bit_quant_type,
         )
         stage_model = StageSegment(full, start, end).to(device)
         final_stage = False
@@ -311,7 +329,13 @@ def run_stage_server(args, device, splits):
         start = splits[2]
         full = load_stage_model(
             args.model, device, role="last", start=start, 
-            dtype=args.torch_dtype, quantization_config=args.quantization_config
+            dtype=args.torch_dtype, 
+            quantization_config=args.quantization_config,
+            load_in_4bit=args.load_in_4bit,
+            load_in_8bit=args.load_in_8bit,
+            bnb_4bit_compute_dtype=args.bnb_4bit_compute_dtype,
+            bnb_4bit_use_double_quant=args.bnb_4bit_use_double_quant,
+            bnb_4bit_quant_type=args.bnb_4bit_quant_type,
         )
         stage_model = StageLast(full, start).to(device)
         final_stage = True
@@ -529,9 +553,15 @@ def main():
 
     # Handle dtype and quantization config
     args.quantization_config = None
+    args.load_in_4bit = False
+    args.load_in_8bit = False
+    args.bnb_4bit_compute_dtype = None
+    args.bnb_4bit_use_double_quant = False
+    args.bnb_4bit_quant_type = None
+    
     if args.dtype in ["int4", "int8"]:
         try:
-            from transformers import BitsAndBytesConfig
+            import bitsandbytes as bnb
         except ImportError:
             raise ImportError(
                 "bitsandbytes is required for int4/int8 quantization. "
@@ -543,17 +573,36 @@ def main():
         compute_dtype = torch.float16
         
         if args.dtype == "int4":
-            args.quantization_config = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_compute_dtype=compute_dtype,
-                bnb_4bit_use_double_quant=True,
-                bnb_4bit_quant_type="nf4"
-            )
+            args.load_in_4bit = True
+            args.bnb_4bit_compute_dtype = compute_dtype
+            args.bnb_4bit_use_double_quant = True
+            args.bnb_4bit_quant_type = "nf4"
+            
+            # Also create BitsAndBytesConfig for newer transformers versions
+            try:
+                from transformers import BitsAndBytesConfig
+                args.quantization_config = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_compute_dtype=compute_dtype,
+                    bnb_4bit_use_double_quant=True,
+                    bnb_4bit_quant_type="nf4"
+                )
+            except (ImportError, AttributeError):
+                # Older transformers versions may not support BitsAndBytesConfig
+                args.quantization_config = None
             logger.info(f"Using int4 quantization with compute_dtype={compute_dtype}")
         else:  # int8
-            args.quantization_config = BitsAndBytesConfig(
-                load_in_8bit=True,
-            )
+            args.load_in_8bit = True
+            
+            # Also create BitsAndBytesConfig for newer transformers versions
+            try:
+                from transformers import BitsAndBytesConfig
+                args.quantization_config = BitsAndBytesConfig(
+                    load_in_8bit=True,
+                )
+            except (ImportError, AttributeError):
+                # Older transformers versions may not support BitsAndBytesConfig
+                args.quantization_config = None
             logger.info(f"Using int8 quantization")
         
         # Set torch_dtype to None for quantization (will use compute_dtype from config)

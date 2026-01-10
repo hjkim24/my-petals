@@ -282,6 +282,11 @@ def load_stage_model(
     end: Optional[int] = None,
     dtype=torch.float16,
     quantization_config=None,
+    load_in_4bit=False,
+    load_in_8bit=False,
+    bnb_4bit_compute_dtype=None,
+    bnb_4bit_use_double_quant=False,
+    bnb_4bit_quant_type=None,
 ):
     """
     Load only the layers needed for a stage to reduce memory (LLaMA-only).
@@ -289,15 +294,43 @@ def load_stage_model(
       - 'stage0': keep embeddings + layers[:end], drop head/norm
       - 'segment': keep layers[start:end], drop embeddings/head/norm
       - 'last': keep layers[start:], norm, lm_head
-    quantization_config: Optional BitsAndBytesConfig for int4/int8 quantization
+    quantization_config: Optional BitsAndBytesConfig for int4/int8 quantization (newer transformers)
+    load_in_4bit/load_in_8bit: Direct parameters for quantization (compatible with transformers 4.43+)
     """
-    if quantization_config is not None:
-        # Quantization mode: use quantization_config, skip torch_dtype
-        full = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            quantization_config=quantization_config,
-            low_cpu_mem_usage=True,
-        )
+    # Determine quantization mode
+    use_quantization = load_in_4bit or load_in_8bit
+    
+    if use_quantization:
+        # Build kwargs for quantization using direct parameters (compatible with transformers 4.43+)
+        # Direct parameters are more reliable than BitsAndBytesConfig for transformers 4.43.1
+        quant_kwargs = {"low_cpu_mem_usage": True}
+        
+        if load_in_4bit:
+            quant_kwargs["load_in_4bit"] = True
+            if bnb_4bit_compute_dtype is not None:
+                quant_kwargs["bnb_4bit_compute_dtype"] = bnb_4bit_compute_dtype
+            if bnb_4bit_use_double_quant:
+                quant_kwargs["bnb_4bit_use_double_quant"] = True
+            if bnb_4bit_quant_type is not None:
+                quant_kwargs["bnb_4bit_quant_type"] = bnb_4bit_quant_type
+        elif load_in_8bit:
+            quant_kwargs["load_in_8bit"] = True
+        
+        # For quantization, device_map="auto" is typically needed
+        # But transformers 4.43 may have issues, so we try both ways
+        try:
+            full = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                device_map="auto",
+                **quant_kwargs,
+            )
+        except (TypeError, AttributeError) as e:
+            # Fallback: try without device_map (will handle device manually later)
+            logger.warning(f"Failed to load quantized model with device_map='auto': {e}, trying without device_map")
+            full = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                **quant_kwargs,
+            )
     else:
         # Normal mode: use torch_dtype
         full = AutoModelForCausalLM.from_pretrained(
@@ -344,22 +377,28 @@ def load_stage_model(
         num_layers = len(full.transformer.h)
     else:
         num_layers = -1
-    logger.info(f"load_stage_model: role={role}, layers={num_layers}, start={start}, end={end}, quantization={'enabled' if quantization_config is not None else 'disabled'}")
+    quantization_status = "enabled" if (quantization_config is not None or load_in_4bit or load_in_8bit) else "disabled"
+    logger.info(f"load_stage_model: role={role}, layers={num_layers}, start={start}, end={end}, quantization={quantization_status}")
     if num_layers == 0:
         raise ValueError(f"Pruned model has 0 layers for role={role} (start={start}, end={end}). Check --splits.")
 
     # Move model to device
-    # For quantized models, .to(device) should work but may need special handling
-    if quantization_config is not None:
-        # Quantized models are typically already on a device, but we ensure it's on the target device
-        # Note: Some quantized models may not support .to(device) directly, so we check if needed
-        try:
-            full = full.to(device)
-        except Exception as e:
-            logger.warning(f"Failed to move quantized model to {device}: {e}. Model may already be on correct device.")
-            # Try to verify device placement
-            if hasattr(full, 'device') and str(full.device) != str(device):
-                logger.warning(f"Quantized model device mismatch: expected {device}, but model is on {full.device}")
+    # For quantized models with device_map="auto", they're already on device, but we may need to handle manually
+    use_quantization = quantization_config is not None or load_in_4bit or load_in_8bit
+    if use_quantization:
+        # Quantized models with device_map="auto" are already on device
+        # Only move if device_map was not used or if we need to change device
+        if not hasattr(full, 'hf_device_map') or full.hf_device_map is None:
+            # device_map was not used, try to move manually
+            try:
+                full = full.to(device)
+            except Exception as e:
+                logger.warning(f"Failed to move quantized model to {device}: {e}. Model may already be on correct device.")
+                # Try to verify device placement
+                if hasattr(full, 'device') and str(full.device) != str(device):
+                    logger.warning(f"Quantized model device mismatch: expected {device}, but model is on {full.device}")
+        else:
+            logger.info(f"Quantized model loaded with device_map, device placement: {full.hf_device_map}")
     else:
         full = full.to(device)
     
