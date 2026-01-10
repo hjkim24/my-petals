@@ -288,48 +288,29 @@ def run_rank0(args, device, splits):
 @torch.inference_mode()
 def run_stage_server(args, device, splits):
     """Run a server stage (1, 2, or 3)."""
-    # CPU 오프로딩 옵션
-    use_cpu_offload = getattr(args, 'use_cpu_offload', False)
-    keep_layers_on_gpu = getattr(args, 'keep_layers_on_gpu', 0)
-    
     if args.stage == 1:
         start, end = splits[0], splits[1]
         full = load_stage_model(
             args.model, device, role="segment", 
-            start=start, end=end, dtype=args.dtype,
-            use_cpu_offload=use_cpu_offload
+            start=start, end=end, dtype=args.dtype
         )
-        stage_model = StageSegment(
-            full, start, end,
-            gpu_device=device,
-            keep_layers_on_gpu=keep_layers_on_gpu
-        )
+        stage_model = StageSegment(full, start, end)
         final_stage = False
     elif args.stage == 2:
         start, end = splits[1], splits[2]
         full = load_stage_model(
             args.model, device, role="segment",
-            start=start, end=end, dtype=args.dtype,
-            use_cpu_offload=use_cpu_offload
+            start=start, end=end, dtype=args.dtype
         )
-        stage_model = StageSegment(
-            full, start, end,
-            gpu_device=device,
-            keep_layers_on_gpu=keep_layers_on_gpu
-        )
+        stage_model = StageSegment(full, start, end)
         final_stage = False
     elif args.stage == 3:
         start = splits[2]
         full = load_stage_model(
             args.model, device, role="last",
-            start=start, dtype=args.dtype,
-            use_cpu_offload=use_cpu_offload
+            start=start, dtype=args.dtype
         )
-        stage_model = StageLast(
-            full, start,
-            gpu_device=device,
-            keep_layers_on_gpu=keep_layers_on_gpu
-        )
+        stage_model = StageLast(full, start)
         final_stage = True
     else:
         raise ValueError("stage must be 1, 2, or 3 for server")
@@ -503,10 +484,6 @@ def main():
     parser.add_argument('--temperature', type=float, default=1.0, help='Sampling temperature (client->stage3)')
     parser.add_argument('--top_p', type=float, default=0.92, help='Nucleus sampling p')
     parser.add_argument('--top_k', type=int, default=50, help='Top-k sampling (0=disabled)')
-    parser.add_argument('--use_cpu_offload', action='store_true',
-                       help='Enable CPU offloading: keep model parameters on CPU and move to GPU only when needed')
-    parser.add_argument('--keep_layers_on_gpu', type=int, default=0,
-                       help='Number of recent layers to keep on GPU when using CPU offloading (default: 0)')
     
     args = parser.parse_args()
 
