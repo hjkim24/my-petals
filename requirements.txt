@@ -6,5 +6,5 @@ hf_transfer>=0.1.9
 
 # Optional dependencies (with fallbacks in code)
 async-timeout>=4.0.0  # Optional: used for Python <3.11 (Python 3.11+ uses asyncio.timeout)
-bitsandbytes>=0.43.1,<0.44.0  # Optional: used for int4/int8 quantization support (compatible with transformers 4.43.1)
+bitsandbytes == 0.41.1  # Optional: used for int4/int8 quantization support (compatible with transformers 4.43.1)
 

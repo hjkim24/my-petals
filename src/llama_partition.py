@@ -1,5 +1,6 @@
 import logging
 from typing import Optional, Tuple
+from enum import Enum
 
 import torch
 import torch.nn as nn
@@ -9,6 +10,81 @@ from transformers.models.llama.modeling_llama import LlamaDecoderLayer
 from .utils import default_position_ids
 
 logger = logging.getLogger(__name__)
+
+
+class QuantType(Enum):
+    NONE = 0
+    INT8 = 1  # 8-bit as in the LLM.int8() paper
+    NF4 = 2  # 4-bit as in the QLoRA paper
+
+
+def quantize_module(model: nn.Module, *, quant_type: QuantType) -> nn.Module:
+    """
+    Quantize a model module by replacing Linear layers with quantized versions.
+    This is based on the original Petals implementation.
+    
+    Args:
+        model: The model module to quantize
+        quant_type: Type of quantization (INT8 or NF4)
+    
+    Returns:
+        The quantized model (modified in-place)
+    """
+    # Import bitsandbytes only when necessary
+    try:
+        import bitsandbytes as bnb
+    except ImportError:
+        raise ImportError(
+            "bitsandbytes is required for quantization. "
+            "Install it with: pip install bitsandbytes"
+        )
+
+    for n, module in model.named_children():
+        if len(list(module.children())) > 0:
+            quantize_module(module, quant_type=quant_type)
+
+        if isinstance(module, torch.nn.Linear) and n not in ["lm_head", "score"]:
+            # Ensure the module is on CPU before quantization
+            # Note: We load the model on CPU initially, so this should already be on CPU
+            if module.weight.device.type != "cpu":
+                # If somehow on GPU, move to CPU first
+                logger.warning(
+                    f"Linear layer '{n}' is on {module.weight.device}, moving to CPU for quantization"
+                )
+                # Move the actual module in the model
+                model._modules[n] = module.cpu()
+                module = model._modules[n]
+            
+            if quant_type == QuantType.INT8:
+                model._modules[n] = bnb.nn.Linear8bitLt(
+                    module.in_features,
+                    module.out_features,
+                    module.bias is not None,
+                    has_fp16_weights=False,
+                    threshold=6.0,  # Default from the LLM.int8() paper
+                )
+                model._modules[n].weight = bnb.nn.Int8Params(
+                    module.weight.data, requires_grad=False, has_fp16_weights=False
+                ).to(module.weight.dtype)
+            elif quant_type == QuantType.NF4:
+                compress_statistics = True
+                model._modules[n] = bnb.nn.LinearNF4(
+                    module.in_features,
+                    module.out_features,
+                    module.bias is not None,
+                    compress_statistics=compress_statistics,
+                )
+                model._modules[n].weight = bnb.nn.Params4bit(
+                    module.weight.data,
+                    requires_grad=False,
+                    quant_type="nf4",
+                    blocksize=64,
+                    compress_statistics=compress_statistics,
+                ).to(module.weight.dtype)
+            else:
+                raise ValueError(f"Unsupported quant_type='{quant_type}'")
+            model._modules[n].bias = module.bias
+    return model
 
 # Prefer petals optimized block (uses rotary_emb cache) when available
 try:
@@ -281,12 +357,7 @@ def load_stage_model(
     start: int = 0,
     end: Optional[int] = None,
     dtype=torch.float16,
-    quantization_config=None,
-    load_in_4bit=False,
-    load_in_8bit=False,
-    bnb_4bit_compute_dtype=None,
-    bnb_4bit_use_double_quant=False,
-    bnb_4bit_quant_type=None,
+    quant_type: QuantType = QuantType.NONE,
 ):
     """
     Load only the layers needed for a stage to reduce memory (LLaMA-only).
@@ -294,59 +365,27 @@ def load_stage_model(
       - 'stage0': keep embeddings + layers[:end], drop head/norm
       - 'segment': keep layers[start:end], drop embeddings/head/norm
       - 'last': keep layers[start:], norm, lm_head
-    quantization_config: Optional BitsAndBytesConfig for int4/int8 quantization (newer transformers)
-    load_in_4bit/load_in_8bit: Direct parameters for quantization (compatible with transformers 4.43+)
+    quant_type: Quantization type (QuantType.NONE, QuantType.INT8, or QuantType.NF4)
+                If quantization is enabled, model will be loaded on CPU, quantized, then moved to device
     """
-    # Determine quantization mode
-    use_quantization = load_in_4bit or load_in_8bit
-    
-    if use_quantization:
-        # Build kwargs for quantization using direct parameters (compatible with transformers 4.43+)
-        # Direct parameters are more reliable than BitsAndBytesConfig for transformers 4.43.1
-        quant_kwargs = {"low_cpu_mem_usage": True}
-        
-        if load_in_4bit:
-            quant_kwargs["load_in_4bit"] = True
-            if bnb_4bit_compute_dtype is not None:
-                quant_kwargs["bnb_4bit_compute_dtype"] = bnb_4bit_compute_dtype
-            if bnb_4bit_use_double_quant:
-                quant_kwargs["bnb_4bit_use_double_quant"] = True
-            if bnb_4bit_quant_type is not None:
-                quant_kwargs["bnb_4bit_quant_type"] = bnb_4bit_quant_type
-        elif load_in_8bit:
-            quant_kwargs["load_in_8bit"] = True
-        
-        # For quantization, device_map="auto" is typically needed
-        # But transformers 4.43.1 may have compatibility issues with bitsandbytes
-        # Try with device_map first, then fallback without it
-        try:
-            full = AutoModelForCausalLM.from_pretrained(
-                model_name,
-                device_map="auto",
-                **quant_kwargs,
-            )
-        except (TypeError, AttributeError) as e:
-            # Fallback: try without device_map (will handle device manually later)
-            logger.warning(f"Failed to load quantized model with device_map='auto': {e}, trying without device_map")
-            try:
-                full = AutoModelForCausalLM.from_pretrained(
-                    model_name,
-                    **quant_kwargs,
-                )
-            except (TypeError, AttributeError) as e2:
-                # If both fail, it's likely a version compatibility issue
-                raise RuntimeError(
-                    f"Failed to load quantized model. This may be due to transformers 4.43.1 and bitsandbytes version mismatch. "
-                    f"Error: {e2}. "
-                    f"Please ensure bitsandbytes>=0.43.2 is installed: pip install --upgrade bitsandbytes"
-                ) from e2
-    else:
-        # Normal mode: use torch_dtype
+    # Always load model on CPU first (required for quantization, and safe for normal loading)
+    # Try device_map="cpu" first, fallback to manual CPU loading if not supported
+    try:
         full = AutoModelForCausalLM.from_pretrained(
             model_name,
             torch_dtype=dtype,
-            low_cpu_mem_usage=True
+            low_cpu_mem_usage=True,
+            device_map="cpu"  # Explicitly load on CPU for quantization compatibility
         )
+    except TypeError:
+        # Fallback for older transformers versions that don't support device_map="cpu"
+        logger.warning("device_map='cpu' not supported, loading model and moving to CPU manually")
+        full = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            torch_dtype=dtype,
+            low_cpu_mem_usage=True,
+        )
+        full = full.cpu()
     try:
         full.config.use_cache = True
     except Exception:
@@ -386,29 +425,37 @@ def load_stage_model(
         num_layers = len(full.transformer.h)
     else:
         num_layers = -1
-    quantization_status = "enabled" if (quantization_config is not None or load_in_4bit or load_in_8bit) else "disabled"
-    logger.info(f"load_stage_model: role={role}, layers={num_layers}, start={start}, end={end}, quantization={quantization_status}")
+    logger.info(f"load_stage_model: role={role}, layers={num_layers}, start={start}, end={end}, quant_type={quant_type.name}")
     if num_layers == 0:
         raise ValueError(f"Pruned model has 0 layers for role={role} (start={start}, end={end}). Check --splits.")
 
-    # Move model to device
-    # For quantized models with device_map="auto", they're already on device, but we may need to handle manually
-    use_quantization = quantization_config is not None or load_in_4bit or load_in_8bit
-    if use_quantization:
-        # Quantized models with device_map="auto" are already on device
-        # Only move if device_map was not used or if we need to change device
-        if not hasattr(full, 'hf_device_map') or full.hf_device_map is None:
-            # device_map was not used, try to move manually
-            try:
-                full = full.to(device)
-            except Exception as e:
-                logger.warning(f"Failed to move quantized model to {device}: {e}. Model may already be on correct device.")
-                # Try to verify device placement
-                if hasattr(full, 'device') and str(full.device) != str(device):
-                    logger.warning(f"Quantized model device mismatch: expected {device}, but model is on {full.device}")
-        else:
-            logger.info(f"Quantized model loaded with device_map, device placement: {full.hf_device_map}")
+    # Apply quantization if requested (must be done on CPU before moving to device)
+    if quant_type != QuantType.NONE:
+        logger.info(f"Quantizing model with {quant_type.name}...")
+        # Ensure model is on CPU for quantization
+        if next(full.parameters()).device.type != "cpu":
+            logger.warning("Moving model to CPU for quantization...")
+            full = full.cpu()
+        
+        # Apply quantization
+        full = quantize_module(full, quant_type=quant_type)
+        logger.info(f"Quantization with {quant_type.name} completed")
+
+    # Move model to target device
+    # For quantized models, bitsandbytes handles device placement automatically during forward pass
+    # but we still need to move non-quantized parts (embeddings, norm, lm_head) to device
+    if quant_type != QuantType.NONE:
+        # For quantized models, move to device carefully
+        # Quantized Linear layers will handle device placement during forward pass
+        # But we need to move embeddings and other non-quantized components
+        try:
+            # Move the entire model structure, bitsandbytes will handle quantized layers
+            full = full.to(device)
+        except Exception as e:
+            logger.warning(f"Failed to move quantized model to {device}: {e}. "
+                         "Quantized layers may handle device placement automatically during forward pass.")
     else:
+        # Normal model: just move to device
         full = full.to(device)
     
     return full

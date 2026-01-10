@@ -5,8 +5,10 @@ from uuid import uuid4
 import time
 
 import torch
+import torch.nn as nn
 from transformers import AutoTokenizer
 import logging
+from enum import Enum
 from hivemind import DHT, get_dht_time
 from hivemind.p2p import P2P
 from hivemind.utils.logging import get_logger
@@ -14,7 +16,7 @@ from hivemind.utils.logging import get_logger
 # Import 경로 처리: 패키지로 실행되거나 직접 실행될 때 모두 지원
 try:
     # 패키지로 실행될 때 (python -m src.main)
-    from .llama_partition import load_stage_model, Stage0, StageSegment, StageLast
+    from .llama_partition import load_stage_model, Stage0, StageSegment, StageLast, QuantType
     from .rpc_transport import RpcTransport
     from .rpc_handler import StageConnectionHandler
 except ImportError:
@@ -23,14 +25,13 @@ except ImportError:
     from pathlib import Path
     project_root = Path(__file__).parent.parent
     sys.path.insert(0, str(project_root))
-    from src.llama_partition import load_stage_model, Stage0, StageSegment, StageLast
+    from src.llama_partition import load_stage_model, Stage0, StageSegment, StageLast, QuantType
     from src.rpc_transport import RpcTransport
     from src.rpc_handler import StageConnectionHandler
 
 logger = get_logger(__name__)
 # Ensure logs are emitted when running from terminal
 logging.basicConfig(level=logging.INFO)
-
 
 def build_masks(seq_len: int, device, dtype=None):
     # batch=1, no padding
@@ -97,12 +98,7 @@ def run_rank0(args, device, splits):
     full = load_stage_model(
         args.model, device, role="stage0", end=splits[0], 
         dtype=args.torch_dtype, 
-        quantization_config=args.quantization_config,
-        load_in_4bit=args.load_in_4bit,
-        load_in_8bit=args.load_in_8bit,
-        bnb_4bit_compute_dtype=args.bnb_4bit_compute_dtype,
-        bnb_4bit_use_double_quant=args.bnb_4bit_use_double_quant,
-        bnb_4bit_quant_type=args.bnb_4bit_quant_type,
+        quant_type=args.quant_type,
     )
     s0 = Stage0(full, splits[0]).to(device) # load to GPU
 
@@ -302,12 +298,7 @@ def run_stage_server(args, device, splits):
         full = load_stage_model(
             args.model, device, role="segment", start=start, end=end, 
             dtype=args.torch_dtype, 
-            quantization_config=args.quantization_config,
-            load_in_4bit=args.load_in_4bit,
-            load_in_8bit=args.load_in_8bit,
-            bnb_4bit_compute_dtype=args.bnb_4bit_compute_dtype,
-            bnb_4bit_use_double_quant=args.bnb_4bit_use_double_quant,
-            bnb_4bit_quant_type=args.bnb_4bit_quant_type,
+            quant_type=args.quant_type,
         )
         stage_model = StageSegment(full, start, end).to(device)
         final_stage = False
@@ -316,12 +307,7 @@ def run_stage_server(args, device, splits):
         full = load_stage_model(
             args.model, device, role="segment", start=start, end=end, 
             dtype=args.torch_dtype, 
-            quantization_config=args.quantization_config,
-            load_in_4bit=args.load_in_4bit,
-            load_in_8bit=args.load_in_8bit,
-            bnb_4bit_compute_dtype=args.bnb_4bit_compute_dtype,
-            bnb_4bit_use_double_quant=args.bnb_4bit_use_double_quant,
-            bnb_4bit_quant_type=args.bnb_4bit_quant_type,
+            quant_type=args.quant_type,
         )
         stage_model = StageSegment(full, start, end).to(device)
         final_stage = False
@@ -330,12 +316,7 @@ def run_stage_server(args, device, splits):
         full = load_stage_model(
             args.model, device, role="last", start=start, 
             dtype=args.torch_dtype, 
-            quantization_config=args.quantization_config,
-            load_in_4bit=args.load_in_4bit,
-            load_in_8bit=args.load_in_8bit,
-            bnb_4bit_compute_dtype=args.bnb_4bit_compute_dtype,
-            bnb_4bit_use_double_quant=args.bnb_4bit_use_double_quant,
-            bnb_4bit_quant_type=args.bnb_4bit_quant_type,
+            quant_type=args.quant_type,
         )
         stage_model = StageLast(full, start).to(device)
         final_stage = True
@@ -551,14 +532,7 @@ def main():
         device = torch.device("cpu")
     logger.info(f"Using device: {device}")
 
-    # Handle dtype and quantization config
-    args.quantization_config = None
-    args.load_in_4bit = False
-    args.load_in_8bit = False
-    args.bnb_4bit_compute_dtype = None
-    args.bnb_4bit_use_double_quant = False
-    args.bnb_4bit_quant_type = None
-    
+    # Handle dtype and quantization
     if args.dtype in ["int4", "int8"]:
         try:
             import bitsandbytes as bnb
@@ -568,26 +542,17 @@ def main():
                 "Install it with: pip install bitsandbytes"
             )
         
-        # For quantization, compute_dtype defaults to fp16 (can be changed if needed)
-        # Using fp16 as default for best compatibility
-        compute_dtype = torch.float16
-        
+        # Convert dtype string to QuantType
         if args.dtype == "int4":
-            args.load_in_4bit = True
-            args.bnb_4bit_compute_dtype = compute_dtype
-            args.bnb_4bit_use_double_quant = True
-            args.bnb_4bit_quant_type = "nf4"
-            # Don't create BitsAndBytesConfig - use direct parameters for transformers 4.43.1 compatibility
-            args.quantization_config = None
-            logger.info(f"Using int4 quantization with compute_dtype={compute_dtype} (direct parameters)")
+            args.quant_type = QuantType.NF4
+            logger.info(f"Using NF4 quantization (4-bit)")
         else:  # int8
-            args.load_in_8bit = True
-            # Don't create BitsAndBytesConfig - use direct parameters for transformers 4.43.1 compatibility
-            args.quantization_config = None
-            logger.info(f"Using int8 quantization (direct parameters)")
+            args.quant_type = QuantType.INT8
+            logger.info(f"Using INT8 quantization (8-bit)")
         
-        # Set torch_dtype to None for quantization (will use compute_dtype from config)
-        args.torch_dtype = None
+        # For quantization, we still need a compute dtype for non-quantized parts
+        # Default to fp16 for compatibility
+        args.torch_dtype = torch.float16
     else:
         dtype_map = {
             "fp16": torch.float16,
@@ -595,7 +560,8 @@ def main():
             "fp32": torch.float32,
         }
         args.torch_dtype = dtype_map[args.dtype]
-        logger.info(f"Using torch_dtype={args.torch_dtype}")
+        args.quant_type = QuantType.NONE
+        logger.info(f"Using torch_dtype={args.torch_dtype}, no quantization")
     
     splits = parse_splits(args.splits)
     if args.stage == 0:
