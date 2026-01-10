@@ -577,33 +577,14 @@ def main():
             args.bnb_4bit_compute_dtype = compute_dtype
             args.bnb_4bit_use_double_quant = True
             args.bnb_4bit_quant_type = "nf4"
-            
-            # Also create BitsAndBytesConfig for newer transformers versions
-            try:
-                from transformers import BitsAndBytesConfig
-                args.quantization_config = BitsAndBytesConfig(
-                    load_in_4bit=True,
-                    bnb_4bit_compute_dtype=compute_dtype,
-                    bnb_4bit_use_double_quant=True,
-                    bnb_4bit_quant_type="nf4"
-                )
-            except (ImportError, AttributeError):
-                # Older transformers versions may not support BitsAndBytesConfig
-                args.quantization_config = None
-            logger.info(f"Using int4 quantization with compute_dtype={compute_dtype}")
+            # Don't create BitsAndBytesConfig - use direct parameters for transformers 4.43.1 compatibility
+            args.quantization_config = None
+            logger.info(f"Using int4 quantization with compute_dtype={compute_dtype} (direct parameters)")
         else:  # int8
             args.load_in_8bit = True
-            
-            # Also create BitsAndBytesConfig for newer transformers versions
-            try:
-                from transformers import BitsAndBytesConfig
-                args.quantization_config = BitsAndBytesConfig(
-                    load_in_8bit=True,
-                )
-            except (ImportError, AttributeError):
-                # Older transformers versions may not support BitsAndBytesConfig
-                args.quantization_config = None
-            logger.info(f"Using int8 quantization")
+            # Don't create BitsAndBytesConfig - use direct parameters for transformers 4.43.1 compatibility
+            args.quantization_config = None
+            logger.info(f"Using int8 quantization (direct parameters)")
         
         # Set torch_dtype to None for quantization (will use compute_dtype from config)
         args.torch_dtype = None

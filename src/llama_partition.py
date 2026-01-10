@@ -317,7 +317,8 @@ def load_stage_model(
             quant_kwargs["load_in_8bit"] = True
         
         # For quantization, device_map="auto" is typically needed
-        # But transformers 4.43 may have issues, so we try both ways
+        # But transformers 4.43.1 may have compatibility issues with bitsandbytes
+        # Try with device_map first, then fallback without it
         try:
             full = AutoModelForCausalLM.from_pretrained(
                 model_name,
@@ -327,10 +328,18 @@ def load_stage_model(
         except (TypeError, AttributeError) as e:
             # Fallback: try without device_map (will handle device manually later)
             logger.warning(f"Failed to load quantized model with device_map='auto': {e}, trying without device_map")
-            full = AutoModelForCausalLM.from_pretrained(
-                model_name,
-                **quant_kwargs,
-            )
+            try:
+                full = AutoModelForCausalLM.from_pretrained(
+                    model_name,
+                    **quant_kwargs,
+                )
+            except (TypeError, AttributeError) as e2:
+                # If both fail, it's likely a version compatibility issue
+                raise RuntimeError(
+                    f"Failed to load quantized model. This may be due to transformers 4.43.1 and bitsandbytes version mismatch. "
+                    f"Error: {e2}. "
+                    f"Please ensure bitsandbytes>=0.43.2 is installed: pip install --upgrade bitsandbytes"
+                ) from e2
     else:
         # Normal mode: use torch_dtype
         full = AutoModelForCausalLM.from_pretrained(
