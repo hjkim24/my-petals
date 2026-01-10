@@ -393,6 +393,33 @@ def run_stage_server_with_load_balancing(args, device, splits, num_blocks, total
         announce_maddrs=announce_maddrs,
     )
     
+    # DHT 초기화 후 multiaddr 정보 로깅 (Stage2 연결용)
+    visible = dht.get_visible_maddrs()
+    dht_peer_id = str(dht.peer_id)
+    
+    if args.public_ip:
+        visible_str = [str(m) for m in visible] if visible else []
+        has_public_ip = any(args.public_ip in str(m) for m in visible_str)
+        
+        if not has_public_ip:
+            # 공인 IP와 외부 포트를 사용한 multiaddr을 명시적으로 생성
+            public_maddr = f"/ip4/{args.public_ip}/tcp/{public_dht_port}/p2p/{dht_peer_id}"
+            logger.warning(
+                f"DHT visible multiaddrs do not contain public IP {args.public_ip}. "
+                f"Use this multiaddr for --dht_initial_peers: {public_maddr}"
+            )
+            logger.info(f"DHT visible multiaddrs (may contain private IP): {visible}")
+        else:
+            logger.info(f"DHT visible multiaddrs (use for --dht_initial_peers): {visible}")
+    elif visible:
+        logger.info(f"DHT visible multiaddrs (use for --dht_initial_peers): {visible}")
+    else:
+        # 공인 IP가 없고 visible maddrs도 없으면 fallback
+        fallback_maddr = f"/ip4/{announce_ip}/tcp/{public_dht_port}/p2p/{dht_peer_id}"
+        logger.info(
+            f"DHT visible multiaddrs not available; try fallback: {fallback_maddr}"
+        )
+    
     # 기본값 설정
     if num_blocks is None:
         num_blocks = 4  # 기본값: 4개 블록
