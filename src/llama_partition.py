@@ -281,6 +281,7 @@ def load_stage_model(
     start: int = 0,
     end: Optional[int] = None,
     dtype=torch.float16,
+    quantization_config=None,
 ):
     """
     Load only the layers needed for a stage to reduce memory (LLaMA-only).
@@ -288,12 +289,22 @@ def load_stage_model(
       - 'stage0': keep embeddings + layers[:end], drop head/norm
       - 'segment': keep layers[start:end], drop embeddings/head/norm
       - 'last': keep layers[start:], norm, lm_head
+    quantization_config: Optional BitsAndBytesConfig for int4/int8 quantization
     """
-    full = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        torch_dtype=dtype,
-        low_cpu_mem_usage=True
-    )
+    if quantization_config is not None:
+        # Quantization mode: use quantization_config, skip torch_dtype
+        full = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            quantization_config=quantization_config,
+            low_cpu_mem_usage=True,
+        )
+    else:
+        # Normal mode: use torch_dtype
+        full = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            torch_dtype=dtype,
+            low_cpu_mem_usage=True
+        )
     try:
         full.config.use_cache = True
     except Exception:
@@ -333,9 +344,23 @@ def load_stage_model(
         num_layers = len(full.transformer.h)
     else:
         num_layers = -1
-    logger.info(f"load_stage_model: role={role}, layers={num_layers}, start={start}, end={end}")
+    logger.info(f"load_stage_model: role={role}, layers={num_layers}, start={start}, end={end}, quantization={'enabled' if quantization_config is not None else 'disabled'}")
     if num_layers == 0:
         raise ValueError(f"Pruned model has 0 layers for role={role} (start={start}, end={end}). Check --splits.")
 
-    full = full.to(device)
+    # Move model to device
+    # For quantized models, .to(device) should work but may need special handling
+    if quantization_config is not None:
+        # Quantized models are typically already on a device, but we ensure it's on the target device
+        # Note: Some quantized models may not support .to(device) directly, so we check if needed
+        try:
+            full = full.to(device)
+        except Exception as e:
+            logger.warning(f"Failed to move quantized model to {device}: {e}. Model may already be on correct device.")
+            # Try to verify device placement
+            if hasattr(full, 'device') and str(full.device) != str(device):
+                logger.warning(f"Quantized model device mismatch: expected {device}, but model is on {full.device}")
+    else:
+        full = full.to(device)
+    
     return full

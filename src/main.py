@@ -94,7 +94,10 @@ def run_rank0(args, device, splits):
         return str(type(past))
 
     # 1. Initialize
-    full = load_stage_model(args.model, device, role="stage0", end=splits[0], dtype=args.dtype)
+    full = load_stage_model(
+        args.model, device, role="stage0", end=splits[0], 
+        dtype=args.torch_dtype, quantization_config=args.quantization_config
+    )
     s0 = Stage0(full, splits[0]).to(device) # load to GPU
 
     # connect to DHT Network with initial(stage1) DHT peer address
@@ -290,17 +293,26 @@ def run_stage_server(args, device, splits):
     """Run a server stage (1, 2, or 3)."""
     if args.stage == 1:
         start, end = splits[0], splits[1]
-        full = load_stage_model(args.model, device, role="segment", start=start, end=end, dtype=args.dtype)
+        full = load_stage_model(
+            args.model, device, role="segment", start=start, end=end, 
+            dtype=args.torch_dtype, quantization_config=args.quantization_config
+        )
         stage_model = StageSegment(full, start, end).to(device)
         final_stage = False
     elif args.stage == 2:
         start, end = splits[1], splits[2]
-        full = load_stage_model(args.model, device, role="segment", start=start, end=end, dtype=args.dtype)
+        full = load_stage_model(
+            args.model, device, role="segment", start=start, end=end, 
+            dtype=args.torch_dtype, quantization_config=args.quantization_config
+        )
         stage_model = StageSegment(full, start, end).to(device)
         final_stage = False
     elif args.stage == 3:
         start = splits[2]
-        full = load_stage_model(args.model, device, role="last", start=start, dtype=args.dtype)
+        full = load_stage_model(
+            args.model, device, role="last", start=start, 
+            dtype=args.torch_dtype, quantization_config=args.quantization_config
+        )
         stage_model = StageLast(full, start).to(device)
         final_stage = True
     else:
@@ -481,8 +493,8 @@ def main():
     parser.add_argument("--model", type=str, required=True)
     parser.add_argument("--splits", type=str, required=True,
                        help="Comma-separated cut points for 4-stage pipeline, e.g., 10,20,30")
-    parser.add_argument("--dtype", type=str, default="fp16", choices=["fp16", "bf16", "fp32"],
-                       help="Model dtype: fp16 (default), bf16, fp32")
+    parser.add_argument("--dtype", type=str, default="fp16", choices=["fp16", "bf16", "fp32", "int4", "int8"],
+                       help="Model dtype: fp16 (default), bf16, fp32, int4, int8")
     parser.add_argument("--max_new_tokens", type=int, default=64)
     parser.add_argument("--prompt", type=str, default="Hello, how are you?",
                        help="Input prompt for text generation")
@@ -515,12 +527,45 @@ def main():
         device = torch.device("cpu")
     logger.info(f"Using device: {device}")
 
-    dtype_map = {
-        "fp16": torch.float16,
-        "bf16": torch.bfloat16,
-        "fp32": torch.float32,
-    }
-    args.dtype = dtype_map[args.dtype]
+    # Handle dtype and quantization config
+    args.quantization_config = None
+    if args.dtype in ["int4", "int8"]:
+        try:
+            from transformers import BitsAndBytesConfig
+        except ImportError:
+            raise ImportError(
+                "bitsandbytes is required for int4/int8 quantization. "
+                "Install it with: pip install bitsandbytes"
+            )
+        
+        # For quantization, compute_dtype defaults to fp16 (can be changed if needed)
+        # Using fp16 as default for best compatibility
+        compute_dtype = torch.float16
+        
+        if args.dtype == "int4":
+            args.quantization_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=compute_dtype,
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_quant_type="nf4"
+            )
+            logger.info(f"Using int4 quantization with compute_dtype={compute_dtype}")
+        else:  # int8
+            args.quantization_config = BitsAndBytesConfig(
+                load_in_8bit=True,
+            )
+            logger.info(f"Using int8 quantization")
+        
+        # Set torch_dtype to None for quantization (will use compute_dtype from config)
+        args.torch_dtype = None
+    else:
+        dtype_map = {
+            "fp16": torch.float16,
+            "bf16": torch.bfloat16,
+            "fp32": torch.float32,
+        }
+        args.torch_dtype = dtype_map[args.dtype]
+        logger.info(f"Using torch_dtype={args.torch_dtype}")
     
     splits = parse_splits(args.splits)
     if args.stage == 0:
