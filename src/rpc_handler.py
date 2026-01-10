@@ -176,31 +176,53 @@ class StageConnectionHandler(ConnectionHandler):
         if is_prefill:
             past_key_values = None
             past_len = 0
+            # Replay 모드에서 prefill이면 기존 KV cache 초기화
+            if is_replay and session_id in self._kv_cache:
+                logger.info(f"[{session_id[:8]}] REPLAY: Clearing existing KV cache for prefill")
+                self._kv_cache[session_id] = None
             # logger.info(f"[{session_id[:8]}] PREFILL: seq_len={seq_len}, cur_len={cur_len}, past_len=0 (no cache)")
         else:
             past_key_values = self._kv_cache.get(session_id)
             if past_key_values is None:
-                raise ValueError(f"Missing past_key_values for session_id={session_id}")
-            past_len = StageConnectionHandler._past_len(past_key_values, cur_len, hidden_states.shape[1])
-            # 디버깅: past_len이 올바른지 확인 (INFO 레벨로 변경하여 항상 출력)
-            expected_past_len = cur_len - hidden_states.shape[1]
-            if past_len != expected_past_len:
-                pkv_type = type(past_key_values).__name__
-                try:
-                    from transformers.cache_utils import Cache  # type: ignore
-                except Exception:
-                    Cache = None
-                cache_len = None
-                if Cache is not None and isinstance(past_key_values, Cache):
+                # Replay 모드에서 KV cache가 없으면 prefill로 처리 (새 서버에 첫 요청)
+                if is_replay:
+                    logger.warning(
+                        f"[{session_id[:8]}] REPLAY: Missing KV cache for decode step, "
+                        f"treating as prefill (seq_len={seq_len}, cur_len={cur_len}). "
+                        f"This may indicate the first replay request to a new server."
+                    )
+                    past_key_values = None
+                    past_len = 0
+                    # is_prefill은 변경하지 않고, past_key_values만 None으로 처리
+                else:
+                    raise ValueError(
+                        f"Missing past_key_values for session_id={session_id}. "
+                        f"This may indicate a server restart or cache loss. "
+                        f"If this is a replay scenario, ensure is_replay=True in metadata."
+                    )
+            else:
+                past_len = StageConnectionHandler._past_len(past_key_values, cur_len, hidden_states.shape[1])
+            
+            # 디버깅: past_len이 올바른지 확인 (replay 모드가 아닐 때만 검증)
+            if not is_replay and past_key_values is not None:
+                expected_past_len = cur_len - hidden_states.shape[1]
+                if past_len != expected_past_len:
+                    pkv_type = type(past_key_values).__name__
                     try:
-                        cache_len = past_key_values.get_seq_length()
+                        from transformers.cache_utils import Cache  # type: ignore
                     except Exception:
-                        cache_len = "error"
-                logger.warning(
-                    f"[{session_id[:8]}] DECODE: Past len mismatch! past_len={past_len}, cur_len={cur_len}, "
-                    f"hidden_shape={hidden_states.shape[1]}, expected={expected_past_len}, "
-                    f"pkv_type={pkv_type}, cache_len={cache_len}"
-                )
+                        Cache = None
+                    cache_len = None
+                    if Cache is not None and isinstance(past_key_values, Cache):
+                        try:
+                            cache_len = past_key_values.get_seq_length()
+                        except Exception:
+                            cache_len = "error"
+                    logger.warning(
+                        f"[{session_id[:8]}] DECODE: Past len mismatch! past_len={past_len}, cur_len={cur_len}, "
+                        f"hidden_shape={hidden_states.shape[1]}, expected={expected_past_len}, "
+                        f"pkv_type={pkv_type}, cache_len={cache_len}"
+                    )
             # else:
             #     logger.info(
             #         f"[{session_id[:8]}] DECODE: seq_len={seq_len}, cur_len={cur_len}, past_len={past_len}, "
