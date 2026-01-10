@@ -411,16 +411,41 @@ def run_stage_server_with_load_balancing(args, device, splits, num_blocks, total
     
     while True:
         try:
-            # 1. 현재 시스템 상태 조회
-            module_infos = get_remote_module_infos(dht, args.model, total_blocks)
+            # 1. 현재 시스템 상태 조회 (DHT 전파 시간 고려하여 재시도)
+            module_infos = []
+            max_retries = 3
+            retry_delay = 2.0  # 초
+            
+            for retry in range(max_retries):
+                module_infos = get_remote_module_infos(dht, args.model, total_blocks)
+                logger.info(f"Retrieved {len(module_infos)} module infos from DHT (attempt {retry+1}/{max_retries})")
+                
+                if len(module_infos) > 0 or retry == max_retries - 1:
+                    break
+                
+                # 다른 서버 정보를 찾지 못했지만 첫 번째 시도가 아닌 경우 잠시 대기
+                if retry < max_retries - 1:
+                    logger.info(f"No existing servers found, waiting {retry_delay}s for DHT propagation...")
+                    time.sleep(retry_delay)
+                    retry_delay *= 1.5  # 지수 백오프
+            
+            # 조회된 서버 정보 로깅
+            if len(module_infos) > 0:
+                unique_servers = set()
+                for info in module_infos:
+                    if info.server_info:
+                        unique_servers.add(str(info.server_info.peer_id)[:16])
+                logger.info(f"Found {len(unique_servers)} unique server(s) in DHT: {list(unique_servers)}")
             
             # 2. 최적 블록 선택 (규칙 1 또는 규칙 2)
             if len(module_infos) == 0:
-                # 첫 서버이거나 다른 서버 정보 없음 - 랜덤 선택
+                # 첫 서버이거나 다른 서버 정보 없음 - 처음부터 시작
                 block_indices = list(range(min(num_blocks, total_blocks)))
+                logger.info(f"No existing servers found, selecting first {num_blocks} blocks: {block_indices}")
             else:
                 # 논문식 최적 블록 선택
                 block_indices = choose_best_blocks(num_blocks, module_infos, total_blocks)
+                logger.info(f"Load balancing selected blocks: {block_indices}")
             
             start_block = min(block_indices)
             end_block = max(block_indices) + 1

@@ -193,7 +193,26 @@ def get_remote_module_infos(
             logger.debug(f"Failed to get module info for block {block_idx}: {e}")
             continue
     
-    logger.debug(f"Retrieved {len(module_infos)} module infos from DHT")
+    logger.info(f"Retrieved {len(module_infos)} module infos from DHT (total_blocks={total_blocks})")
+    
+    # 조회된 블록 정보 요약 로깅
+    if len(module_infos) > 0:
+        block_servers = {}
+        for info in module_infos:
+            try:
+                block_idx = int(info.uid.split("_")[-1])
+                if info.server_info:
+                    server_id = str(info.server_info.peer_id)[:16]
+                    if block_idx not in block_servers:
+                        block_servers[block_idx] = []
+                    block_servers[block_idx].append(server_id)
+            except (ValueError, IndexError):
+                pass
+        
+        if block_servers:
+            logger.info(f"Block coverage: {min(block_servers.keys())} to {max(block_servers.keys())} "
+                       f"({len(block_servers)} blocks found)")
+    
     return module_infos
 
 
