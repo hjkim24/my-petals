@@ -5,13 +5,18 @@ Uses P2P protobuf handlers for client-side RPC calls.
 [Full LB 핵심 변경]
 - routing="stage"  : 기존 mini_petals:stage1/2/3 체인
 - routing="module" : petals:module:<model>:block_* 기반으로 route를 DHT에서 계산해서 호출
+
+[Fix 포함]
+- hivemind DHT.get()의 latest 인자/return 형태 버전 차이 안전 처리 (TypeError 방지)
+- Full LB에서 remote_info에 pin만 해둔 peer도 반드시 connect 시도 (peer table empty 방지)
+- _run_async가 코루틴 내부 예외를 event-loop 에러로 오인해서 재실행하지 않도록 안전화
 """
 import asyncio
 import concurrent.futures
-import socket
 import random
+import socket
 import time
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple, Any, TYPE_CHECKING
 
 import torch
 from hivemind import DHT, PeerID, serialize_torch_tensor, MSGPackSerializer
@@ -30,6 +35,9 @@ from hivemind.utils.logging import get_logger
 from hivemind.utils.streaming import split_for_streaming
 
 from .dht_utils import get_module_key
+
+if TYPE_CHECKING:
+    from multiaddr import Multiaddr
 
 logger = get_logger(__name__)
 
@@ -50,7 +58,7 @@ class RpcTransport:
         top_k: int = 50,
         stage_keys: Optional[List[str]] = None,
         # ✅ Full LB
-        routing: str = "stage",          # "stage" | "module"
+        routing: str = "stage",  # "stage" | "module"
         model_name: str = "default",
         total_blocks: Optional[int] = None,
         start_block: int = 0,
@@ -86,7 +94,7 @@ class RpcTransport:
         self.sampling = {"temperature": float(temperature), "top_p": float(top_p), "top_k": int(top_k)}
 
         self._last_token: Optional[int] = None
-        self.remote_info: Dict[str, Dict] = {}  # key(stage_key or module_key) -> {"peer_id": PeerID, "maddrs": [...]}
+        self.remote_info: Dict[str, Dict[str, Any]] = {}  # key(stage_key/module_key) -> {"peer_id": PeerID, "maddrs":[...]}
         self.last_prefill_stage_times: List[Tuple[str, float]] = []
         self.last_prefill_total: Optional[float] = None
         self.last_decode_stage_times: List[Tuple[str, float]] = []
@@ -121,6 +129,10 @@ class RpcTransport:
 
         logger.info(f"RpcTransport initialized: stage={stage}, peer_id={self.peer_id}, routing={self.routing}")
 
+    # ----------------------------
+    # Small helpers (compat/safety)
+    # ----------------------------
+
     def _format_initial_peers(self, dht_initial_peers: List[str]) -> List[str]:
         initial_peers_list = []
         for peer in dht_initial_peers:
@@ -150,25 +162,67 @@ class RpcTransport:
 
     # ✅ FIX: event loop 관련 RuntimeError만 처리하고, 코루틴 내부 예외는 재실행하지 않음
     def _run_async(self, coro):
+        """
+        Run an async coroutine from sync context safely.
+        - If we're already inside an event loop: run in a separate thread with asyncio.run()
+        - If no event loop / closed loop: asyncio.run()
+        - Otherwise: loop.run_until_complete()
+        """
         try:
             loop = asyncio.get_event_loop()
         except RuntimeError:
-            # no current event loop
             return asyncio.run(coro)
 
         if loop.is_closed():
             return asyncio.run(coro)
 
         if loop.is_running():
-            # run coroutine in a separate thread with its own event loop
             with concurrent.futures.ThreadPoolExecutor() as executor:
                 future = executor.submit(asyncio.run, coro)
                 return future.result()
-        else:
-            return loop.run_until_complete(coro)
+        return loop.run_until_complete(coro)
 
     async def _create_p2p(self) -> P2P:
         return await P2P.create()
+
+    def _dht_get_compat(self, key: str, *, latest: bool = False, return_metadata: bool = False):
+        """
+        hivemind 버전에 따라 DHT.get 시그니처가 다를 수 있어 TypeError 방어.
+        - latest/return_metadata 지원하면 사용
+        - 지원 안하면 인자 없이 get(key)로 fallback
+        """
+        if return_metadata:
+            try:
+                return self.dht.get(key, return_metadata=True)  # type: ignore[arg-type]
+            except TypeError:
+                return self.dht.get(key)
+        if latest:
+            try:
+                return self.dht.get(key, latest=True)  # type: ignore[arg-type]
+            except TypeError:
+                return self.dht.get(key)
+        return self.dht.get(key)
+
+    def _extract_dht_value(self, res: Any) -> Any:
+        """
+        hivemind DHT.get 반환 형태를 통일해서 value를 뽑아준다.
+        가능한 케이스:
+        - res.value 존재 (DHTValue)
+        - res 자체가 dict
+        - res가 (value, meta) 형태의 튜플/리스트
+        """
+        if res is None:
+            return None
+        if hasattr(res, "value"):
+            return res.value
+        if isinstance(res, dict):
+            return res
+        if isinstance(res, (list, tuple)) and len(res) > 0:
+            first = res[0]
+            if hasattr(first, "value"):
+                return first.value
+            return first
+        return None
 
     def _filter_maddrs_for_connect(self, maddrs: List[str]) -> List["Multiaddr"]:
         """
@@ -180,14 +234,12 @@ class RpcTransport:
         except Exception:
             return []
 
-        filtered = []
+        filtered: List["Multiaddr"] = []
         for m in maddrs or []:
             try:
                 base = m.split("/p2p/")[0]  # keep /ip4/.../tcp/...
                 ma = Multiaddr(base)
-                # Multiaddr protocols are like ip4 -> tcp
                 protos = [p.name for p in ma.protocols()]
-                # accept typical transports
                 if any(p in ("ip4", "ip6") for p in protos) and any(p in ("tcp", "quic") for p in protos):
                     filtered.append(ma)
             except Exception:
@@ -196,28 +248,31 @@ class RpcTransport:
 
     async def _connect_peer_if_possible(self, stage_key: str, peer_id: PeerID, maddrs: List[str]) -> None:
         """
-        ✅ Full LB 핵심: remote_info가 이미 있어도(connect 안 한 상태) RPC가 나가면
+        ✅ Full LB 핵심:
+        remote_info가 이미 있어도(connect 안 한 상태) RPC가 나가면
         'failed to find any peer in table'가 뜬다.
         그래서 info가 있든 없든 maddrs가 있으면 항상 connect를 시도한다.
         """
-        if self.p2p is None:
-            return
-        if not maddrs:
+        if self.p2p is None or not maddrs:
             return
         try:
             filtered = self._filter_maddrs_for_connect(maddrs)
             if filtered:
-                await self.p2p._client.connect(peer_id, filtered)
+                await self.p2p._client.connect(peer_id, filtered)  # NOTE: internal client
                 logger.info(f"Connected to {stage_key} via maddrs: {maddrs}")
         except Exception as e:
             logger.warning(f"Could not connect to {stage_key} via maddrs {maddrs}: {e}")
+
+    # ----------------------------
+    # Peer discovery / readiness
+    # ----------------------------
 
     async def _discover_peer(
         self,
         stage_key: str,
         max_retries: int = 10,
         retry_delay: float = 1.0,
-        exclude_peer_ids: Optional[Set[str]] = None
+        exclude_peer_ids: Optional[Set[str]] = None,
     ) -> Tuple[PeerID, List[str]]:
         """
         Find server peer_id via DHT for a given key (stage key or module key).
@@ -229,91 +284,69 @@ class RpcTransport:
         loop = asyncio.get_running_loop()
 
         def _get_candidates_sync():
-            candidates = []
-
+            candidates: List[Tuple[str, List[str], float]] = []
             try:
-                res = self.dht.get(stage_key)
-            except TypeError:
-                try:
-                    res = self.dht.get(stage_key, return_metadata=True)
-                except TypeError:
-                    res = self.dht.get(stage_key)
-
-            if res is None:
-                logger.warning(f"{stage_key}: DHT.get returned None (no value for this key)")
+                res = self._dht_get_compat(stage_key, return_metadata=False)
+            except Exception as e:
+                logger.warning(f"{stage_key}: DHT.get failed: {e}")
                 return []
 
-            value = None
-            if hasattr(res, 'value'):
-                value = res.value
-            elif isinstance(res, dict):
-                value = res
-            elif isinstance(res, (list, tuple)) and len(res) > 0:
-                value = res[0] if isinstance(res[0], dict) else res
-
+            value = self._extract_dht_value(res)
             if value is None:
-                logger.warning(f"{stage_key}: DHT.get returned object without usable value (type={type(res).__name__})")
+                logger.warning(f"{stage_key}: DHT.get returned None/empty")
                 return []
 
-            if isinstance(value, dict):
-                excluded_peers = []
-                for subk, v in value.items():
-                    entry = v
-                    if hasattr(v, 'value'):
-                        entry = v.value
-                    elif isinstance(v, tuple) and len(v) > 0:
-                        entry = v[0]
-                    elif isinstance(v, dict) and "value" in v:
-                        entry = v.get("value", v)
+            if not isinstance(value, dict):
+                logger.warning(f"{stage_key}: Unexpected DHT value type {type(value).__name__}")
+                return []
 
-                    if not isinstance(entry, dict):
-                        continue
+            excluded = 0
+            for subk, v in value.items():
+                entry = v.value if hasattr(v, "value") else v
+                if isinstance(entry, (list, tuple)) and len(entry) > 0:
+                    entry = entry[0]
+                if isinstance(entry, dict) and "value" in entry and isinstance(entry["value"], dict):
+                    entry = entry["value"]
 
-                    peer_id_str = entry.get("peer_id") or str(subk)
-                    if not peer_id_str:
-                        continue
+                if not isinstance(entry, dict):
+                    continue
 
-                    if peer_id_str in exclude_peer_ids:
-                        excluded_peers.append(peer_id_str)
-                        continue
+                peer_id_str = entry.get("peer_id") or str(subk)
+                if not peer_id_str:
+                    continue
+                if peer_id_str in exclude_peer_ids:
+                    excluded += 1
+                    continue
 
-                    maddrs = entry.get("p2p_maddrs") or []
-                    ts = entry.get("timestamp", 0)
-                    candidates.append((peer_id_str, maddrs, ts))
+                maddrs = entry.get("p2p_maddrs") or []
+                ts = float(entry.get("timestamp", 0) or 0)
+                candidates.append((peer_id_str, maddrs, ts))
 
-                logger.info(
-                    f"{stage_key}: DHT discovery - total_entries={len(value)}, "
-                    f"candidates={len(candidates)}, excluded={len(excluded_peers)}"
-                )
-                return candidates
-
-            logger.warning(f"{stage_key}: Unexpected DHT value type {type(value).__name__}")
-            return []
+            logger.info(
+                f"{stage_key}: DHT discovery - total_entries={len(value)}, candidates={len(candidates)}, excluded={excluded}"
+            )
+            return candidates
 
         for attempt in range(max_retries):
+            candidates = []
             try:
                 candidates = await loop.run_in_executor(None, _get_candidates_sync)
-
-                if candidates:
-                    candidates.sort(key=lambda x: x[2], reverse=True)
-                    top = candidates[: min(5, len(candidates))]
-                    peer_id_str, maddrs, ts = random.choice(top)
-
-                    logger.info(
-                        f"{stage_key}: Selected peer - peer_id={peer_id_str[:8]}..., "
-                        f"timestamp={ts}, maddrs_count={len(maddrs)}"
-                    )
-                    peer_id = PeerID.from_base58(peer_id_str)
-                    return peer_id, maddrs
-
-                logger.warning(
-                    f"{stage_key}: no candidates found (excluded={len(exclude_peer_ids)}), retrying... "
-                    f"(attempt {attempt+1}/{max_retries})"
-                )
-
             except Exception as e:
                 logger.warning(f"Attempt {attempt + 1} to find peer for {stage_key} failed: {e}")
 
+            if candidates:
+                candidates.sort(key=lambda x: x[2], reverse=True)
+                top = candidates[: min(5, len(candidates))]
+                peer_id_str, maddrs, ts = random.choice(top)
+                logger.info(
+                    f"{stage_key}: Selected peer - peer_id={peer_id_str[:8]}..., timestamp={ts}, maddrs_count={len(maddrs)}"
+                )
+                return PeerID.from_base58(peer_id_str), maddrs
+
+            logger.warning(
+                f"{stage_key}: no candidates found (excluded={len(exclude_peer_ids)}), retrying... "
+                f"(attempt {attempt + 1}/{max_retries})"
+            )
             if attempt < max_retries - 1:
                 await asyncio.sleep(retry_delay)
 
@@ -332,15 +365,14 @@ class RpcTransport:
 
         info = self.remote_info.get(stage_key)
 
-        # ✅ 1) info가 없으면 DHT에서 찾는다
+        # 1) info가 없으면 DHT에서 찾는다
         if info is None:
             exclude = self.failed_peers.get(stage_key, set())
             peer_id, maddrs = await self._discover_peer(stage_key, exclude_peer_ids=exclude)
             info = {"peer_id": peer_id, "maddrs": maddrs}
             self.remote_info[stage_key] = info
 
-        # ✅ 2) Full LB(module routing)에서 핵심:
-        # info가 이미 있어도(=route 계산으로 pin 되어 있어도) connect를 반드시 시도해야 한다.
+        # 2) Full LB(module routing)에서 핵심: info가 있어도 connect를 반드시 시도
         try:
             peer_id = info["peer_id"]
             maddrs = info.get("maddrs") or []
@@ -348,11 +380,15 @@ class RpcTransport:
         except Exception as e:
             logger.warning(f"_ensure_ready connect step failed for {stage_key}: {e}")
 
-        # (optional) wait a bit; not strictly required to have >=1 peers, but harmless
+        # optional small wait
         try:
             await asyncio.wait_for(self.p2p.wait_for_at_least_n_peers(1), timeout=2)
         except Exception:
             pass
+
+    # ----------------------------
+    # Routing (stage / module)
+    # ----------------------------
 
     async def _compute_module_route(self, session_id: str) -> List[Tuple[str, bool]]:
         """
@@ -364,39 +400,47 @@ class RpcTransport:
 
         cur = int(self.start_block)
         route: List[Tuple[str, bool]] = []
-
         hops = 0
+
         while cur < self.total_blocks:
             mk = get_module_key(cur, self.model_name)
-            try:
-                res = self.dht.get(mk, latest=True)
-            except TypeError:
-                # hivemind 버전에 따라 latest 인자가 없을 수 있음
-                res = self.dht.get(mk)
-            if res is None or res.value is None or not isinstance(res.value, dict):
+
+            res = self._dht_get_compat(mk, latest=True)
+            value = self._extract_dht_value(res)
+
+            if value is None or not isinstance(value, dict):
                 raise RuntimeError(f"[module routing] No candidates for {mk} (block={cur})")
 
             # candidates: (end_block, throughput, peer_id_str, maddrs, final_stage)
-            candidates = []
-            for subk, raw in res.value.items():
+            candidates: List[Tuple[int, float, str, List[str], bool]] = []
+            for subk, raw in value.items():
                 entry = raw.value if hasattr(raw, "value") else raw
+                if isinstance(entry, (list, tuple)) and len(entry) > 0:
+                    entry = entry[0]
+                if isinstance(entry, dict) and "value" in entry and isinstance(entry["value"], dict):
+                    entry = entry["value"]
+
                 if not isinstance(entry, dict):
                     continue
+
                 pid = entry.get("peer_id") or str(subk)
                 if not pid:
                     continue
+
                 st = entry.get("start_block")
                 ed = entry.get("end_block")
                 if st is None or ed is None:
                     continue
-                st = int(st)
-                ed = int(ed)
-                if not (st <= cur < ed):
+
+                st_i = int(st)
+                ed_i = int(ed)
+                if not (st_i <= cur < ed_i):
                     continue
+
                 thr = float(entry.get("throughput") or 0.0)
                 maddrs = entry.get("p2p_maddrs") or []
                 fin = bool(entry.get("final_stage", False))
-                candidates.append((ed, thr, pid, maddrs, fin))
+                candidates.append((ed_i, thr, pid, maddrs, fin))
 
             if not candidates:
                 raise RuntimeError(f"[module routing] No server covers block={cur} (key={mk})")
@@ -410,31 +454,42 @@ class RpcTransport:
 
             is_last = end_block >= self.total_blocks
             route.append((key, not is_last))
+
             cur = end_block
             hops += 1
             if hops > self.total_blocks + 5:
                 raise RuntimeError("[module routing] Route seems stuck; check start/end in DHT entries.")
 
-        # 마지막 hop은 final_stage 서버가 되도록 확인 (StageLast span)
+        # 마지막 hop은 final_stage 서버인지 확인
         last_key, _ = route[-1]
         last_peer_obj = self.remote_info[last_key]["peer_id"]
         last_peer = last_peer_obj.to_base58()
 
-        last_res = self.dht.get(last_key, latest=True)
+        last_res = self._dht_get_compat(last_key, latest=True)
+        last_value = self._extract_dht_value(last_res)
+
         ok = False
-        if last_res is not None and isinstance(getattr(last_res, "value", None), dict):
-            for subk, raw in last_res.value.items():
+        if isinstance(last_value, dict):
+            for subk, raw in last_value.items():
                 entry = raw.value if hasattr(raw, "value") else raw
+                if isinstance(entry, (list, tuple)) and len(entry) > 0:
+                    entry = entry[0]
+                if isinstance(entry, dict) and "value" in entry and isinstance(entry["value"], dict):
+                    entry = entry["value"]
+
                 if not isinstance(entry, dict):
                     continue
                 pid = entry.get("peer_id") or str(subk)
                 if pid == last_peer and bool(entry.get("final_stage", False)):
                     ok = True
                     break
-        if not ok:
-            raise RuntimeError("[module routing] Last hop server is not marked as final_stage; need StageLast span at the end.")
 
-        logger.info(f"[module routing] Built route for session {session_id[:8]}: {[k for k,_ in route]}")
+        if not ok:
+            raise RuntimeError(
+                "[module routing] Last hop server is not marked as final_stage; need StageLast span at the end."
+            )
+
+        logger.info(f"[module routing] Built route for session {session_id[:8]}: {[k for k, _ in route]}")
         return route
 
     async def _get_route(self, session_id: str) -> List[Tuple[str, bool]]:
@@ -444,6 +499,10 @@ class RpcTransport:
         if session_id not in self.session_routes:
             self.session_routes[session_id] = await self._compute_module_route(session_id)
         return self.session_routes[session_id]
+
+    # ----------------------------
+    # RPC calls
+    # ----------------------------
 
     def _extract_token_id(self, response: runtime_pb2.ExpertResponse) -> Optional[int]:
         metadata = MSGPackSerializer.loads(response.metadata) if response.metadata else {}
@@ -464,7 +523,7 @@ class RpcTransport:
         peer_id = self.remote_info[stage_key]["peer_id"]
         request = runtime_pb2.ExpertRequest(uid=stage_key, tensors=serialized_tensors, metadata=metadata)
         response = await asyncio.wait_for(
-            self.p2p.call_protobuf_handler(
+            self.p2p.call_protobuf_handler(  # type: ignore[union-attr]
                 peer_id,
                 "StageConnectionHandler.rpc_forward",
                 request,
@@ -488,13 +547,14 @@ class RpcTransport:
     ):
         await self._ensure_ready(stage_key)
         peer_id = self.remote_info[stage_key]["peer_id"]
+
         parts = (
             runtime_pb2.ExpertRequest(uid=stage_key, tensors=[part], metadata=metadata)
             for tensor in serialized_tensors
             for part in split_for_streaming(tensor, DEFAULT_MAX_MSG_SIZE)
         )
 
-        outputs = self.p2p.iterate_protobuf_handler(
+        outputs = self.p2p.iterate_protobuf_handler(  # type: ignore[union-attr]
             peer_id,
             "StageConnectionHandler.rpc_forward_stream",
             iter_as_aiter(parts),
@@ -516,13 +576,13 @@ class RpcTransport:
             if not tensors:
                 raise ValueError(f"{stage_key} stream returned no tensors")
             return deserialize_torch_tensor(tensors[0])
-        else:
-            if token_id is None:
-                if tensors:
-                    token_id = int(deserialize_torch_tensor(tensors[0]).item())
-                else:
-                    raise ValueError(f"{stage_key} stream returned no token")
-            return token_id
+
+        if token_id is None:
+            if tensors:
+                token_id = int(deserialize_torch_tensor(tensors[0]).item())
+            else:
+                raise ValueError(f"{stage_key} stream returned no token")
+        return token_id
 
     async def _call_stage_with_recovery(
         self,
@@ -540,7 +600,7 @@ class RpcTransport:
             try:
                 if serialized_tensors:
                     first_tensor = serialized_tensors[0]
-                    if hasattr(first_tensor, 'ByteSize'):
+                    if hasattr(first_tensor, "ByteSize"):
                         size = first_tensor.ByteSize()
                     elif isinstance(first_tensor, bytes):
                         size = len(first_tensor)
@@ -560,19 +620,18 @@ class RpcTransport:
                     logger.error(f"Replay failed for {stage_key}: {e}")
                     raise
 
-                logger.warning(f"Stage {stage_key} failed (attempt {attempt+1}/{max_recovery_attempts}): {e}")
+                logger.warning(f"Stage {stage_key} failed (attempt {attempt + 1}/{max_recovery_attempts}): {e}")
                 self.failed_stages.add(stage_key)
 
+                # mark failed peer
                 if stage_key in self.remote_info:
                     pid_obj = self.remote_info[stage_key].get("peer_id", None)
+                    failed_peer_id = ""
                     if pid_obj is not None:
                         try:
                             failed_peer_id = pid_obj.to_base58()
                         except Exception:
                             failed_peer_id = str(pid_obj)
-                    else:
-                        failed_peer_id = ""
-
                     if failed_peer_id:
                         self.failed_peers.setdefault(stage_key, set()).add(failed_peer_id)
                         logger.info(f"Marked peer {failed_peer_id[:8]}... as failed for {stage_key}")
@@ -580,19 +639,18 @@ class RpcTransport:
                 try:
                     exclude_peers = self.failed_peers.get(stage_key, set())
                     new_peer_id, new_maddrs = await self._discover_peer(
-                        stage_key,
-                        max_retries=5,
-                        retry_delay=0.5,
-                        exclude_peer_ids=exclude_peers
+                        stage_key, max_retries=5, retry_delay=0.5, exclude_peer_ids=exclude_peers
                     )
 
                     self.remote_info[stage_key] = {"peer_id": new_peer_id, "maddrs": new_maddrs}
-                    # force_refresh=True면 DHT로 다시 가버릴 수 있으니, 여기서는 connect만 다시 시도해도 충분
                     await self._connect_peer_if_possible(stage_key, new_peer_id, new_maddrs)
 
-                    if (stage_key in self.client_cache and
-                        session_id in self.client_cache[stage_key] and
-                        len(self.client_cache[stage_key][session_id]) > 0):
+                    if (
+                        stage_key in self.client_cache
+                        and session_id is not None
+                        and session_id in self.client_cache[stage_key]
+                        and len(self.client_cache[stage_key][session_id]) > 0
+                    ):
                         await self._replay_past_inputs(stage_key, session_id, metadata)
 
                     self.failed_stages.discard(stage_key)
@@ -610,18 +668,20 @@ class RpcTransport:
                     raise RuntimeError(f"Failed to recover {stage_key}: {recovery_e}") from recovery_e
 
     async def _replay_past_inputs(self, stage_key: str, session_id: str, base_metadata: bytes):
-        if (stage_key not in self.client_cache or
-            session_id not in self.client_cache[stage_key] or
-            len(self.client_cache[stage_key][session_id]) == 0):
+        if (
+            stage_key not in self.client_cache
+            or session_id not in self.client_cache[stage_key]
+            or len(self.client_cache[stage_key][session_id]) == 0
+        ):
             return
 
         past_inputs = self.client_cache[stage_key][session_id]
-        base_metadata_dict = MSGPackSerializer.loads(base_metadata)
+        base_metadata_dict = MSGPackSerializer.loads(base_metadata) if base_metadata else {}
 
         cumulative_len = 0
         for idx, past_input in enumerate(past_inputs):
-            replay_metadata_dict = base_metadata_dict.copy()
-            seq_len = past_input.shape[1]
+            replay_metadata_dict = dict(base_metadata_dict)
+            seq_len = int(past_input.shape[1])
 
             if idx == 0:
                 replay_metadata_dict["is_prefill"] = True
@@ -638,7 +698,7 @@ class RpcTransport:
             replay_metadata = MSGPackSerializer.dumps(replay_metadata_dict)
             serialized = serialize_torch_tensor(past_input)
 
-            if hasattr(serialized, 'ByteSize'):
+            if hasattr(serialized, "ByteSize"):
                 size = serialized.ByteSize()
             elif isinstance(serialized, bytes):
                 size = len(serialized)
@@ -651,6 +711,10 @@ class RpcTransport:
             forward_fn = self._call_stage_stream if size > MAX_UNARY_PAYLOAD_SIZE // 2 else self._call_stage_unary
             await forward_fn(stage_key, [serialized], replay_metadata, self.timeout, expect_hidden=True)
 
+    # ----------------------------
+    # Public API: prefill / decode
+    # ----------------------------
+
     def send_prefill(self, L: int, hidden: torch.Tensor, session_id: str, max_length: int):
         if self.stage != 0:
             raise RuntimeError("send_prefill should only be called by stage0")
@@ -661,10 +725,10 @@ class RpcTransport:
             metadata = MSGPackSerializer.dumps(
                 {
                     "session_id": session_id,
-                    "seq_len": L,
-                    "cur_len": L,
+                    "seq_len": int(L),
+                    "cur_len": int(L),
                     "is_prefill": True,
-                    "max_length": max_length,
+                    "max_length": int(max_length),
                     **self.sampling,
                 }
             )
@@ -673,14 +737,17 @@ class RpcTransport:
             stage_times: List[Tuple[str, float]] = []
             route = await self._get_route(session_id)
 
-            for idx, (stage_key, expect_hidden) in enumerate(route):
+            for stage_key, expect_hidden in route:
                 self.client_cache.setdefault(stage_key, {}).setdefault(session_id, []).append(cur.clone().cpu())
 
                 stage_start = time.perf_counter()
                 serialized = serialize_torch_tensor(cur)
 
                 result = await self._call_stage_with_recovery(
-                    stage_key, [serialized], metadata, self.timeout,
+                    stage_key,
+                    [serialized],
+                    metadata,
+                    self.timeout,
                     expect_hidden=expect_hidden,
                     is_replay=False,
                     session_id=session_id,
@@ -710,7 +777,7 @@ class RpcTransport:
         hidden: torch.Tensor,
         session_id: str,
         max_length: int,
-        generated_tokens: Optional[List[int]] = None
+        generated_tokens: Optional[List[int]] = None,
     ):
         if self.stage != 0:
             raise RuntimeError("send_decode_step should only be called by stage0")
@@ -722,9 +789,9 @@ class RpcTransport:
                 {
                     "session_id": session_id,
                     "seq_len": 1,
-                    "cur_len": cur_len,
+                    "cur_len": int(cur_len),
                     "is_prefill": False,
-                    "max_length": max_length,
+                    "max_length": int(max_length),
                     "generated_tokens": (generated_tokens[-50:] if generated_tokens else []),
                     **self.sampling,
                 }
@@ -734,14 +801,17 @@ class RpcTransport:
             stage_times: List[Tuple[str, float]] = []
             route = await self._get_route(session_id)
 
-            for idx, (stage_key, expect_hidden) in enumerate(route):
+            for stage_key, expect_hidden in route:
                 self.client_cache.setdefault(stage_key, {}).setdefault(session_id, []).append(cur.clone().cpu())
 
                 stage_start = time.perf_counter()
                 serialized = serialize_torch_tensor(cur)
 
                 result = await self._call_stage_with_recovery(
-                    stage_key, [serialized], metadata, self.timeout,
+                    stage_key,
+                    [serialized],
+                    metadata,
+                    self.timeout,
                     expect_hidden=expect_hidden,
                     is_replay=False,
                     session_id=session_id,
@@ -778,7 +848,7 @@ class RpcTransport:
             raise RuntimeError("No token received. Call send_prefill or send_decode_step first.")
         token_id = self._last_token
         self._last_token = None
-        return token_id
+        return int(token_id)
 
     def shutdown(self):
         if self.p2p is not None:
