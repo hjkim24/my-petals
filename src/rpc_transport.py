@@ -368,7 +368,11 @@ class RpcTransport:
         hops = 0
         while cur < self.total_blocks:
             mk = get_module_key(cur, self.model_name)
-            res = self.dht.get(mk, latest=True)
+            try:
+                res = self.dht.get(mk, latest=True)
+            except TypeError:
+                # hivemind 버전에 따라 latest 인자가 없을 수 있음
+                res = self.dht.get(mk)
             if res is None or res.value is None or not isinstance(res.value, dict):
                 raise RuntimeError(f"[module routing] No candidates for {mk} (block={cur})")
 
