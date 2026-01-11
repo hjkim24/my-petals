@@ -1,0 +1,18 @@
+--- a/src/main.py
++++ b/src/main.py
+@@ -656,6 +656,15 @@
+                         f"Use this multiaddr: {public_p2p_maddr}"
+                     )
+                     p2p_maddrs.append(public_p2p_maddr)
++
++                # ✅ DHT에는 '공인 IP + 공인 포트' multiaddr만 남기기
++                #    (10.x / 127.0.0.1 / 0.0.0.0 등 내부 주소가 먼저 선택되어 peer_id가 실패로 제외되는 문제 방지)
++                public_p2p_maddr = f"/ip4/{args.public_ip}/tcp/{public_rpc_port}/p2p/{p2p.peer_id}"
++                p2p_maddrs = [m for m in p2p_maddrs if f"/ip4/{args.public_ip}/tcp/{public_rpc_port}/" in m]
++                if public_p2p_maddr not in p2p_maddrs:
++                    p2p_maddrs.append(public_p2p_maddr)
++                # dedupe (순서 보존)
++                p2p_maddrs = list(dict.fromkeys(p2p_maddrs))
+             
+             if p2p_maddrs:
+                 logger.info(f"Stage{args.stage} P2P listen maddrs: {p2p_maddrs}")

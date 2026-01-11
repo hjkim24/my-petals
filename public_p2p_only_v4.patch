@@ -1,0 +1,60 @@
+diff --git a/src/main.py b/src/main.py
+index 5bea685..ed50f22 100644
+--- a/src/main.py
++++ b/src/main.py
+@@ -490,15 +490,24 @@ def _setup_and_run_server(args, device, stage_model, final_stage):
+             p2p_maddrs = [str(m) for m in visible_maddrs] if visible_maddrs else []
+ 
+             if args.public_ip:
+-                has_public_ip = any(args.public_ip in m for m in p2p_maddrs)
+-                if not has_public_ip:
+-                    public_p2p_maddr = f"/ip4/{args.public_ip}/tcp/{public_rpc_port}/p2p/{p2p.peer_id}"
++                public_p2p_maddr = f"/ip4/{args.public_ip}/tcp/{public_rpc_port}/p2p/{p2p.peer_id}"
++
++                # If the daemon didn't report a public multiaddr, still add it for convenience.
++                if not any(args.public_ip in m for m in p2p_maddrs):
+                     logger.warning(
+                         f"Stage{args.stage} P2P visible maddrs do not contain public IP {args.public_ip}. "
+                         f"Use this multiaddr: {public_p2p_maddr}"
+                     )
+                     p2p_maddrs.append(public_p2p_maddr)
+ 
++                # ✅ DHT에는 'public IP + public port' multiaddr만 남기기
++                # (10.x / 127.0.0.1 / 0.0.0.0 등 내부 주소가 먼저 선택되어 연결 실패 → peer 제외되는 문제 방지)
++                p2p_maddrs = [m for m in p2p_maddrs if f"/ip4/{args.public_ip}/" in m]
++                if public_p2p_maddr not in p2p_maddrs:
++                    p2p_maddrs.append(public_p2p_maddr)
++                # dedupe (preserve order)
++                p2p_maddrs = list(dict.fromkeys(p2p_maddrs))
++
+             if p2p_maddrs:
+                 logger.info(f"Stage{args.stage} P2P listen maddrs: {p2p_maddrs}")
+             else:
+@@ -616,15 +625,24 @@ def _setup_and_run_server_with_rebalancing(
+             p2p_maddrs = [str(m) for m in visible_maddrs] if visible_maddrs else []
+ 
+             if args.public_ip:
+-                has_public_ip = any(args.public_ip in m for m in p2p_maddrs)
+-                if not has_public_ip:
+-                    public_p2p_maddr = f"/ip4/{args.public_ip}/tcp/{public_rpc_port}/p2p/{p2p.peer_id}"
++                public_p2p_maddr = f"/ip4/{args.public_ip}/tcp/{public_rpc_port}/p2p/{p2p.peer_id}"
++
++                # If the daemon didn't report a public multiaddr, still add it for convenience.
++                if not any(args.public_ip in m for m in p2p_maddrs):
+                     logger.warning(
+                         f"Stage{args.stage} P2P visible maddrs do not contain public IP {args.public_ip}. "
+                         f"Use this multiaddr: {public_p2p_maddr}"
+                     )
+                     p2p_maddrs.append(public_p2p_maddr)
+ 
++                # ✅ DHT에는 'public IP + public port' multiaddr만 남기기
++                # (10.x / 127.0.0.1 / 0.0.0.0 등 내부 주소가 먼저 선택되어 연결 실패 → peer 제외되는 문제 방지)
++                p2p_maddrs = [m for m in p2p_maddrs if f"/ip4/{args.public_ip}/" in m]
++                if public_p2p_maddr not in p2p_maddrs:
++                    p2p_maddrs.append(public_p2p_maddr)
++                # dedupe (preserve order)
++                p2p_maddrs = list(dict.fromkeys(p2p_maddrs))
++
+             if p2p_maddrs:
+                 logger.info(f"Stage{args.stage} P2P listen maddrs: {p2p_maddrs}")
+ 
