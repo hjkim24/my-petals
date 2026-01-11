@@ -86,9 +86,9 @@ def run_rank0(args, device, splits):
             return f"tuple(len={len(past)}, first={first})"
         return str(type(past))
 
-    # ✅ Full LB 모드에서는 Stage0가 임베딩만 하고(= layer 0개),
-    #    나머지는 petals:module route로 처리
-    stage0_end = 0 if args.use_load_balancing else splits[0]
+    # ✅ 너의 4-stage splits 구조에서는 Stage0가 첫 구간(splits[0])까지 로컬로 계산하고,
+    #    나머지 블록(splits[0]..total_blocks-1)을 petals:module 라우팅으로 처리
+    stage0_end = splits[0]  # ✅ LB여도 Stage0는 첫 구간(splits[0])까지 로컬로 계산
 
     full = load_stage_model(args.model, device, role="stage0", end=stage0_end, dtype=args.dtype)
     s0 = Stage0(full, stage0_end).to(device)
@@ -123,7 +123,7 @@ def run_rank0(args, device, splits):
         routing=("module" if args.use_load_balancing else "stage"),
         model_name=args.model,
         total_blocks=total_blocks,
-        start_block=0,
+        start_block=stage0_end,
     )
 
     prompt = args.prompt
@@ -335,6 +335,9 @@ def run_stage_server_with_load_balancing(args, device, splits, num_blocks, total
         except Exception:
             total_blocks = 32
 
+    # ✅ Stage0가 splits[0]까지 로컬로 계산하므로, LB 서버는 그 다음 블록부터만 담당
+    lb_min_block = int(splits[0])
+
     balance_quality = getattr(args, 'balance_quality', 0.75)
     mean_balance_check_period = getattr(args, 'mean_balance_check_period', 120.0)
 
@@ -356,10 +359,12 @@ def run_stage_server_with_load_balancing(args, device, splits, num_blocks, total
                 retry_delay *= 1.5
 
             if len(module_infos) == 0:
-                block_indices = list(range(min(num_blocks, total_blocks)))
-                logger.info(f"No existing servers found, selecting first {num_blocks} blocks: {block_indices}")
+                start = lb_min_block
+                end = min(lb_min_block + num_blocks, total_blocks)
+                block_indices = list(range(start, end))
+                logger.info(f"No existing servers found, selecting blocks from {start} to {end-1}: {block_indices}")
             else:
-                block_indices = choose_best_blocks(num_blocks, module_infos, total_blocks)
+                block_indices = choose_best_blocks(num_blocks, module_infos, total_blocks, min_block=lb_min_block)
                 logger.info(f"Load balancing selected blocks: {block_indices}")
 
             start_block = min(block_indices)
@@ -397,14 +402,10 @@ def run_stage_server_with_load_balancing(args, device, splits, num_blocks, total
                 logger.warning(f"Failed to measure throughput, using default: {e}")
                 throughput = 10.0
 
-            # ✅ IMPORTANT:
-            # - LB 서버는 dht.peer_id로 등록하면 안 됨 (P2P peer_id로 등록해야 stage0가 RPC 연결 가능)
-            # - 등록은 _setup_and_run_server_with_rebalancing()의 heartbeat에서 수행
-
             should_rebalance = _setup_and_run_server_with_rebalancing(
                 args, device, stage_model, final_stage, dht,
                 block_indices, throughput, balance_quality, mean_balance_check_period,
-                args.model, total_blocks
+                args.model, total_blocks, lb_min_block
             )
 
             if not should_rebalance:
@@ -556,7 +557,8 @@ def _setup_and_run_server_with_rebalancing(
     balance_quality,
     mean_balance_check_period,
     model_name,
-    total_blocks
+    total_blocks,
+    lb_min_block: int,
 ) -> bool:
     """
     Load Balancing 서버 실행 (주기적 재조정 포함)
@@ -696,7 +698,7 @@ def _setup_and_run_server_with_rebalancing(
                         if stop_event.is_set():
                             break
 
-                        # 처리량 측정 갱신 (module entry에 반영되도록 current_throughput만 갱신하면 heartbeat가 덮어씀)
+                        # 처리량 측정 갱신
                         try:
                             hidden_size = getattr(stage_model.config, 'hidden_size', 4096)
                             new_thr = get_server_throughput(
@@ -709,7 +711,7 @@ def _setup_and_run_server_with_rebalancing(
 
                         # 재조정 필요 여부 확인
                         module_infos = get_remote_module_infos(dht, model_name, total_blocks)
-                        if should_choose_other_blocks(p2p.peer_id, module_infos, balance_quality, total_blocks):
+                        if should_choose_other_blocks(p2p.peer_id, module_infos, balance_quality, total_blocks, min_block=lb_min_block):
                             logger.info("Load balancing detected imbalance, will rebalance blocks")
                             should_rebalance = True
                             stop_event.set()
@@ -726,7 +728,6 @@ def _setup_and_run_server_with_rebalancing(
             await handler.add_p2p_handlers(p2p)
             logger.info(f"Load Balancing server ready, blocks={block_indices}, throughput={current_throughput['value']:.2f} rps")
 
-            # ✅ stop_event가 set되면 종료(재밸런싱/종료)
             await stop_event.wait()
 
         except KeyboardInterrupt:
