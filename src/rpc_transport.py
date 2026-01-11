@@ -18,10 +18,12 @@ from hivemind import DHT, PeerID, serialize_torch_tensor, MSGPackSerializer
 from hivemind.compression.serialization import deserialize_torch_tensor
 from hivemind.p2p import P2P
 from hivemind.p2p.p2p_daemon_bindings.control import DEFAULT_MAX_MSG_SIZE, MAX_UNARY_PAYLOAD_SIZE
+
 try:
     from hivemind.p2p.p2p_daemon_bindings.utils import P2PDaemonError, P2PHandlerError
 except ImportError:
     from hivemind.p2p.p2p_daemon_bindings import P2PDaemonError, P2PHandlerError
+
 from hivemind.proto import runtime_pb2
 from hivemind.utils.asyncio import aiter_with_timeout, iter_as_aiter
 from hivemind.utils.logging import get_logger
@@ -146,20 +148,69 @@ class RpcTransport:
         except Exception:
             return "127.0.0.1"
 
+    # ✅ FIX: event loop 관련 RuntimeError만 처리하고, 코루틴 내부 예외는 재실행하지 않음
     def _run_async(self, coro):
         try:
             loop = asyncio.get_event_loop()
-            if loop.is_running():
-                with concurrent.futures.ThreadPoolExecutor() as executor:
-                    future = executor.submit(asyncio.run, coro)
-                    return future.result()
-            else:
-                return loop.run_until_complete(coro)
         except RuntimeError:
+            # no current event loop
             return asyncio.run(coro)
+
+        if loop.is_closed():
+            return asyncio.run(coro)
+
+        if loop.is_running():
+            # run coroutine in a separate thread with its own event loop
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                future = executor.submit(asyncio.run, coro)
+                return future.result()
+        else:
+            return loop.run_until_complete(coro)
 
     async def _create_p2p(self) -> P2P:
         return await P2P.create()
+
+    def _filter_maddrs_for_connect(self, maddrs: List[str]) -> List["Multiaddr"]:
+        """
+        Convert list[str] multiaddrs to list[Multiaddr] suitable for hivemind connect.
+        Strips /p2p/<peer_id> suffix if present.
+        """
+        try:
+            from multiaddr import Multiaddr
+        except Exception:
+            return []
+
+        filtered = []
+        for m in maddrs or []:
+            try:
+                base = m.split("/p2p/")[0]  # keep /ip4/.../tcp/...
+                ma = Multiaddr(base)
+                # Multiaddr protocols are like ip4 -> tcp
+                protos = [p.name for p in ma.protocols()]
+                # accept typical transports
+                if any(p in ("ip4", "ip6") for p in protos) and any(p in ("tcp", "quic") for p in protos):
+                    filtered.append(ma)
+            except Exception:
+                continue
+        return filtered
+
+    async def _connect_peer_if_possible(self, stage_key: str, peer_id: PeerID, maddrs: List[str]) -> None:
+        """
+        ✅ Full LB 핵심: remote_info가 이미 있어도(connect 안 한 상태) RPC가 나가면
+        'failed to find any peer in table'가 뜬다.
+        그래서 info가 있든 없든 maddrs가 있으면 항상 connect를 시도한다.
+        """
+        if self.p2p is None:
+            return
+        if not maddrs:
+            return
+        try:
+            filtered = self._filter_maddrs_for_connect(maddrs)
+            if filtered:
+                await self.p2p._client.connect(peer_id, filtered)
+                logger.info(f"Connected to {stage_key} via maddrs: {maddrs}")
+        except Exception as e:
+            logger.warning(f"Could not connect to {stage_key} via maddrs {maddrs}: {e}")
 
     async def _discover_peer(
         self,
@@ -205,7 +256,6 @@ class RpcTransport:
                 return []
 
             if isinstance(value, dict):
-                debug_entries = []
                 excluded_peers = []
                 for subk, v in value.items():
                     entry = v
@@ -230,9 +280,6 @@ class RpcTransport:
                     maddrs = entry.get("p2p_maddrs") or []
                     ts = entry.get("timestamp", 0)
                     candidates.append((peer_id_str, maddrs, ts))
-                    debug_entries.append(
-                        {"subkey": str(subk), "peer_id": peer_id_str, "maddrs": maddrs, "timestamp": ts}
-                    )
 
                 logger.info(
                     f"{stage_key}: DHT discovery - total_entries={len(value)}, "
@@ -275,6 +322,7 @@ class RpcTransport:
     async def _ensure_ready(self, stage_key: str, force_refresh: bool = False):
         if self.stage != 0:
             raise RuntimeError("RpcTransport client helpers should only be used on stage0")
+
         if self.p2p is None:
             self.p2p = await self._create_p2p()
             self.peer_id = self.p2p.peer_id
@@ -283,33 +331,26 @@ class RpcTransport:
             self.remote_info.pop(stage_key, None)
 
         info = self.remote_info.get(stage_key)
+
+        # ✅ 1) info가 없으면 DHT에서 찾는다
         if info is None:
             exclude = self.failed_peers.get(stage_key, set())
             peer_id, maddrs = await self._discover_peer(stage_key, exclude_peer_ids=exclude)
             info = {"peer_id": peer_id, "maddrs": maddrs}
             self.remote_info[stage_key] = info
 
-            # connect 시도
-            if maddrs:
-                try:
-                    from multiaddr import Multiaddr
-                    filtered = []
-                    for m in maddrs:
-                        try:
-                            base = m.split("/p2p/")[0]
-                            ma = Multiaddr(base)
-                            if ma.protocols()[0].name in ("ip4", "ip6", "tcp", "quic"):
-                                filtered.append(ma)
-                        except Exception:
-                            pass
-                    if filtered:
-                        await self.p2p._client.connect(peer_id, filtered)
-                        logger.info(f"Connected to {stage_key} via maddrs: {maddrs}")
-                except Exception as e:
-                    logger.warning(f"Could not connect to {stage_key} via maddrs {maddrs}: {e}")
-
+        # ✅ 2) Full LB(module routing)에서 핵심:
+        # info가 이미 있어도(=route 계산으로 pin 되어 있어도) connect를 반드시 시도해야 한다.
         try:
-            await asyncio.wait_for(self.p2p.wait_for_at_least_n_peers(1), timeout=5)
+            peer_id = info["peer_id"]
+            maddrs = info.get("maddrs") or []
+            await self._connect_peer_if_possible(stage_key, peer_id, maddrs)
+        except Exception as e:
+            logger.warning(f"_ensure_ready connect step failed for {stage_key}: {e}")
+
+        # (optional) wait a bit; not strictly required to have >=1 peers, but harmless
+        try:
+            await asyncio.wait_for(self.p2p.wait_for_at_least_n_peers(1), timeout=2)
         except Exception:
             pass
 
@@ -321,11 +362,9 @@ class RpcTransport:
         if self.total_blocks is None:
             raise ValueError("total_blocks is required when routing='module'")
 
-        # DHT에서 module 엔트리들을 직접 읽어 greedy로 route 구성
         cur = int(self.start_block)
         route: List[Tuple[str, bool]] = []
 
-        # 안전장치
         hops = 0
         while cur < self.total_blocks:
             mk = get_module_key(cur, self.model_name)
@@ -377,7 +416,6 @@ class RpcTransport:
         last_peer_obj = self.remote_info[last_key]["peer_id"]
         last_peer = last_peer_obj.to_base58()
 
-        # last_key(=block start)의 엔트리들에서 final_stage 확인
         last_res = self.dht.get(last_key, latest=True)
         ok = False
         if last_res is not None and isinstance(getattr(last_res, "value", None), dict):
@@ -435,6 +473,7 @@ class RpcTransport:
             if not response.tensors:
                 raise ValueError(f"{stage_key} returned no tensors")
             return deserialize_torch_tensor(response.tensors[0])
+
         token_id = self._extract_token_id(response)
         if token_id is None:
             raise ValueError(f"{stage_key} returned no token")
@@ -544,24 +583,8 @@ class RpcTransport:
                     )
 
                     self.remote_info[stage_key] = {"peer_id": new_peer_id, "maddrs": new_maddrs}
-                    await self._ensure_ready(stage_key, force_refresh=True)
-
-                    if self.p2p and new_maddrs:
-                        try:
-                            from multiaddr import Multiaddr
-                            filtered = []
-                            for m in new_maddrs:
-                                try:
-                                    base = m.split("/p2p/")[0]
-                                    ma = Multiaddr(base)
-                                    if ma.protocols()[0].name in ("ip4", "ip6", "tcp", "quic"):
-                                        filtered.append(ma)
-                                except Exception:
-                                    pass
-                            if filtered:
-                                await self.p2p._client.connect(new_peer_id, filtered)
-                        except Exception as conn_e:
-                            logger.warning(f"Failed to reconnect to {stage_key}: {conn_e}")
+                    # force_refresh=True면 DHT로 다시 가버릴 수 있으니, 여기서는 connect만 다시 시도해도 충분
+                    await self._connect_peer_if_possible(stage_key, new_peer_id, new_maddrs)
 
                     if (stage_key in self.client_cache and
                         session_id in self.client_cache[stage_key] and
