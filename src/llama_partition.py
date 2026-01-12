@@ -47,7 +47,8 @@ def quantize_module(model: nn.Module, *, quant_type: QuantType) -> nn.Module:
 
         # Skip critical projection layers used for KV cache correctness
         # q_proj / k_proj / v_proj / o_proj must stay in higher precision
-        skip_names = {"lm_head", "score", "q_proj", "k_proj", "v_proj", "o_proj"}
+        # TODO: Temporarily allowing attention quantization for testing - can revert if issues occur
+        skip_names = {"lm_head", "score"}  # , "q_proj", "k_proj", "v_proj", "o_proj"}  # Commented out to enable attention quantization
 
         if isinstance(module, torch.nn.Linear) and n not in skip_names:
             # Ensure the module is on CPU before quantization
