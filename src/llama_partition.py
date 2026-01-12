@@ -125,8 +125,8 @@ def _convert_layers(raw_layers: nn.ModuleList, config) -> nn.ModuleList:
     Convert HF layers to OptimizedLlamaDecoderLayer if available.
     Otherwise keep as-is to stay close to HF reference.
     
-    Note: Quantized layers are not converted to OptimizedLlamaDecoderLayer
-    because they have incompatible weight formats.
+    For quantized layers, copy modules directly instead of using load_state_dict
+    to avoid shape mismatch issues with quantized weight formats.
     """
     converted = []
     for idx, layer in enumerate(raw_layers):
@@ -134,20 +134,57 @@ def _convert_layers(raw_layers: nn.ModuleList, config) -> nn.ModuleList:
             if isinstance(layer, OptimizedLlamaDecoderLayer):
                 converted.append(layer)
                 continue
-            # Skip conversion if layer contains quantized modules
-            if _has_quantized_layers(layer):
-                logger.debug(f"Layer {idx}: contains quantized modules, skipping OptimizedLlamaDecoderLayer conversion")
-                converted.append(layer)
-                continue
+            
             if isinstance(layer, LlamaDecoderLayer):
-                opt_layer = OptimizedLlamaDecoderLayer(config)
-                missing, unexpected = opt_layer.load_state_dict(layer.state_dict(), strict=False)
-                if missing or unexpected:
-                    logger.warning(
-                        f"Layer {idx}: optimized load missing={len(missing)}, unexpected={len(unexpected)}"
-                    )
-                converted.append(opt_layer)
-                continue
+                if _has_quantized_layers(layer):
+                    # For quantized layers, create OptimizedLlamaDecoderLayer and copy modules directly
+                    # to avoid shape mismatch from load_state_dict
+                    try:
+                        opt_layer = OptimizedLlamaDecoderLayer(config)
+                        orig_attn = layer.self_attn
+                        opt_attn = opt_layer.self_attn
+                        
+                        # Copy attention projection layers (q_proj, k_proj, v_proj, o_proj)
+                        # These are not quantized (excluded from quantization), so safe to copy
+                        for proj_name in ['q_proj', 'k_proj', 'v_proj', 'o_proj']:
+                            if hasattr(orig_attn, proj_name) and hasattr(opt_attn, proj_name):
+                                orig_proj = getattr(orig_attn, proj_name)
+                                setattr(opt_attn, proj_name, orig_proj)
+                        
+                        # Copy rotary embedding (if exists)
+                        if hasattr(orig_attn, 'rotary_emb') and hasattr(opt_attn, 'rotary_emb'):
+                            opt_attn.rotary_emb = orig_attn.rotary_emb
+                        
+                        # Copy MLP (may contain quantized layers)
+                        opt_layer.mlp = layer.mlp
+                        
+                        # Copy layernorms (not quantized, safe to copy)
+                        opt_layer.input_layernorm = layer.input_layernorm
+                        opt_layer.post_attention_layernorm = layer.post_attention_layernorm
+                        
+                        logger.debug(
+                            f"Layer {idx}: converted quantized layer to OptimizedLlamaDecoderLayer "
+                            f"(copied modules directly to avoid shape mismatch)"
+                        )
+                        converted.append(opt_layer)
+                        continue
+                    except Exception as e:
+                        logger.warning(
+                            f"Layer {idx}: failed to convert quantized layer to OptimizedLlamaDecoderLayer: {e}. "
+                            "Keeping original layer."
+                        )
+                        converted.append(layer)
+                        continue
+                else:
+                    # Non-quantized: use standard conversion with load_state_dict
+                    opt_layer = OptimizedLlamaDecoderLayer(config)
+                    missing, unexpected = opt_layer.load_state_dict(layer.state_dict(), strict=False)
+                    if missing or unexpected:
+                        logger.warning(
+                            f"Layer {idx}: optimized load missing={len(missing)}, unexpected={len(unexpected)}"
+                        )
+                    converted.append(opt_layer)
+                    continue
         converted.append(layer)
     return nn.ModuleList(converted)
 
@@ -216,69 +253,32 @@ class Stage0(nn.Module):
             layer_pos = position_ids if position_ids is not None else default_position_ids(
                 layer_past, x.shape[1], x.device
             )
-            # For quantized layers, manually handle KV cache creation
-            if _has_quantized_layers(layer) and use_cache:
-                # Quantized layers may not return KV cache, so we need to create it manually
-                # Step 1: Apply input layernorm
-                residual = x
-                normed_x = layer.input_layernorm(x)
-                
-                # Step 2: Call attention directly to get KV cache
-                attn_outputs = layer.self_attn(
-                    hidden_states=normed_x,
-                    attention_mask=None,
-                    position_ids=layer_pos,
-                    past_key_value=_to_cache(layer_past),
-                    output_attentions=False,
-                    use_cache=True,
-                )
-                # attn_outputs: (attn_output, attn_weights, past_key_value)
-                attn_output = attn_outputs[0]
-                present = attn_outputs[2] if len(attn_outputs) > 2 else None
-                
-                # Step 3: Apply residual connection
-                x = residual + attn_output
-                
-                # Step 4: Apply MLP
-                residual = x
-                x = layer.post_attention_layernorm(x)
-                x = layer.mlp(x)
-                x = residual + x
-                
-                # Convert present_key_value format
-                present = _from_cache(present)
-                
-                if present is None:
-                    logger.warning(
-                        f"Stage0: layer {i} (quantized) attention returned None KV cache "
-                        f"even after direct call"
+            # Use standard layer forward
+            # OptimizedLlamaDecoderLayer (including quantized ones) properly returns KV cache
+            out = layer(
+                x,
+                attention_mask=None,
+                position_ids=layer_pos,
+                past_key_value=_to_cache(layer_past),
+                use_cache=use_cache,
+                output_attentions=False,
+            )
+            
+            # Validate output structure
+            if not isinstance(out, (tuple, list)) or len(out) == 0:
+                raise RuntimeError(f"Stage0: layer {i} returned invalid output: {type(out)}")
+            
+            x = out[0]
+            if use_cache:
+                if len(out) < 2:
+                    logger.error(
+                        f"Stage0: layer {i} output too short for use_cache=True "
+                        f"(out_len={len(out)}, expected >= 2, layer_type={type(layer).__name__})"
                     )
-            else:
-                # Normal case: use standard layer forward
-                out = layer(
-                    x,
-                    attention_mask=None,
-                    position_ids=layer_pos,
-                    past_key_value=_to_cache(layer_past),
-                    use_cache=use_cache,
-                    output_attentions=False,
-                )
-                
-                # Validate output structure
-                if not isinstance(out, (tuple, list)) or len(out) == 0:
-                    raise RuntimeError(f"Stage0: layer {i} returned invalid output: {type(out)}")
-                
-                x = out[0]
-                if use_cache:
-                    if len(out) < 2:
-                        logger.error(
-                            f"Stage0: layer {i} output too short for use_cache=True "
-                            f"(out_len={len(out)}, expected >= 2, layer_type={type(layer).__name__})"
-                        )
-                        present = None
-                    else:
-                        present = out[-1]  # Last element should be past_key_value
-                        present = _from_cache(present)
+                    present = None
+                else:
+                    present = out[-1]  # Last element should be past_key_value
+                    present = _from_cache(present)
             
             if use_cache:
                 # Check if layer returned KV cache
@@ -344,28 +344,16 @@ class StageSegment(nn.Module):
             layer_pos = position_ids if position_ids is not None else default_position_ids(
                 layer_past, x.shape[1], x.device
             )
-            # For quantized layers, we need to ensure KV cache is returned
-            # Quantized layers may not return KV cache properly, so we need to handle it specially
-            if _has_quantized_layers(layer) and use_cache:
-                # For quantized layers, call with output_attentions=True to ensure we get all outputs
-                out = layer(
-                    x,
-                    attention_mask=None,
-                    position_ids=layer_pos,
-                    past_key_value=_to_cache(layer_past),
-                    use_cache=use_cache,
-                    output_attentions=True,  # Force output_attentions=True for quantized layers
-                )
-            else:
-                # Normal case: output_attentions=False
-                out = layer(
-                    x,
-                    attention_mask=None,
-                    position_ids=layer_pos,
-                    past_key_value=_to_cache(layer_past),
-                    use_cache=use_cache,
-                    output_attentions=False,
-                )
+            # Use standard layer forward
+            # OptimizedLlamaDecoderLayer (including quantized ones) properly returns KV cache
+            out = layer(
+                x,
+                attention_mask=None,
+                position_ids=layer_pos,
+                past_key_value=_to_cache(layer_past),
+                use_cache=use_cache,
+                output_attentions=False,
+            )
             
             # Validate output structure
             if not isinstance(out, (tuple, list)) or len(out) == 0:
@@ -373,9 +361,6 @@ class StageSegment(nn.Module):
             
             x = out[0]
             if use_cache:
-                # LlamaDecoderLayer output format:
-                # - (hidden_states, past_key_value) when output_attentions=False, use_cache=True
-                # - (hidden_states, attentions, past_key_value) when output_attentions=True, use_cache=True
                 if len(out) < 2:
                     logger.error(
                         f"StageSegment: layer {i} output too short for use_cache=True "
@@ -390,8 +375,7 @@ class StageSegment(nn.Module):
                 if present is None:
                     logger.warning(
                         f"StageSegment: layer {i} returned no KV cache "
-                        f"(out_len={len(out)}, layer_type={type(layer).__name__}, "
-                        f"out_types={[type(o).__name__ for o in out]})"
+                        f"(layer_type={type(layer).__name__})"
                     )
                 elif isinstance(present, (tuple, list)) and len(present) == 2:
                     if present[0] is None or present[1] is None:
@@ -450,69 +434,32 @@ class StageLast(nn.Module):
             layer_pos = position_ids if position_ids is not None else default_position_ids(
                 layer_past, x.shape[1], x.device
             )
-            # For quantized layers, manually handle KV cache creation
-            if _has_quantized_layers(layer) and use_cache:
-                # Quantized layers may not return KV cache, so we need to create it manually
-                # Step 1: Apply input layernorm
-                residual = x
-                normed_x = layer.input_layernorm(x)
-                
-                # Step 2: Call attention directly to get KV cache
-                attn_outputs = layer.self_attn(
-                    hidden_states=normed_x,
-                    attention_mask=None,
-                    position_ids=layer_pos,
-                    past_key_value=_to_cache(layer_past),
-                    output_attentions=False,
-                    use_cache=True,
-                )
-                # attn_outputs: (attn_output, attn_weights, past_key_value)
-                attn_output = attn_outputs[0]
-                present = attn_outputs[2] if len(attn_outputs) > 2 else None
-                
-                # Step 3: Apply residual connection
-                x = residual + attn_output
-                
-                # Step 4: Apply MLP
-                residual = x
-                x = layer.post_attention_layernorm(x)
-                x = layer.mlp(x)
-                x = residual + x
-                
-                # Convert present_key_value format
-                present = _from_cache(present)
-                
-                if present is None:
-                    logger.warning(
-                        f"StageLast: layer {i} (quantized) attention returned None KV cache "
-                        f"even after direct call"
+            # Use standard layer forward
+            # OptimizedLlamaDecoderLayer (including quantized ones) properly returns KV cache
+            out = layer(
+                x,
+                attention_mask=None,
+                position_ids=layer_pos,
+                past_key_value=_to_cache(layer_past),
+                use_cache=use_cache,
+                output_attentions=False,
+            )
+            
+            # Validate output structure
+            if not isinstance(out, (tuple, list)) or len(out) == 0:
+                raise RuntimeError(f"StageLast: layer {i} returned invalid output: {type(out)}")
+            
+            x = out[0]
+            if use_cache:
+                if len(out) < 2:
+                    logger.error(
+                        f"StageLast: layer {i} output too short for use_cache=True "
+                        f"(out_len={len(out)}, expected >= 2, layer_type={type(layer).__name__})"
                     )
-            else:
-                # Normal case: use standard layer forward
-                out = layer(
-                    x,
-                    attention_mask=None,
-                    position_ids=layer_pos,
-                    past_key_value=_to_cache(layer_past),
-                    use_cache=use_cache,
-                    output_attentions=False,
-                )
-                
-                # Validate output structure
-                if not isinstance(out, (tuple, list)) or len(out) == 0:
-                    raise RuntimeError(f"StageLast: layer {i} returned invalid output: {type(out)}")
-                
-                x = out[0]
-                if use_cache:
-                    if len(out) < 2:
-                        logger.error(
-                            f"StageLast: layer {i} output too short for use_cache=True "
-                            f"(out_len={len(out)}, expected >= 2, layer_type={type(layer).__name__})"
-                        )
-                        present = None
-                    else:
-                        present = out[-1]  # Last element should be past_key_value
-                        present = _from_cache(present)
+                    present = None
+                else:
+                    present = out[-1]  # Last element should be past_key_value
+                    present = _from_cache(present)
             
             if use_cache:
                 # Check if layer returned KV cache
