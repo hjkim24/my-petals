@@ -39,6 +39,8 @@ def quantize_module(model: nn.Module, *, quant_type: QuantType) -> nn.Module:
             "Install it with: pip install bitsandbytes"
         )
 
+    quantized_in_this_call = []
+    
     for n, module in model.named_children():
         if len(list(module.children())) > 0:
             quantize_module(module, quant_type=quant_type)
@@ -88,6 +90,15 @@ def quantize_module(model: nn.Module, *, quant_type: QuantType) -> nn.Module:
             else:
                 raise ValueError(f"Unsupported quant_type='{quant_type}'")
             model._modules[n].bias = module.bias
+            quantized_in_this_call.append(n)
+    
+    # Log quantization summary (only for top-level calls to avoid duplicates)
+    if quantized_in_this_call and len(list(model.named_children())) > 5:  # Heuristic: top-level if many children
+        logger.info(
+            f"Quantization applied: {len(quantized_in_this_call)} Linear layers quantized to {quant_type.name}"
+        )
+        logger.debug(f"Quantized layer names: {quantized_in_this_call[:10]}{'...' if len(quantized_in_this_call) > 10 else ''}")
+    
     return model
 
 # Prefer petals optimized block (uses rotary_emb cache) when available
@@ -120,6 +131,25 @@ def _has_quantized_layers(layer: nn.Module) -> bool:
     return False
 
 
+def _count_quantized_modules(layer: nn.Module) -> dict:
+    """Count quantized modules in a layer."""
+    try:
+        import bitsandbytes as bnb
+    except ImportError:
+        return {"int8": 0, "nf4": 0, "total": 0}
+    
+    int8_count = 0
+    nf4_count = 0
+    
+    for module in layer.modules():
+        if isinstance(module, bnb.nn.Linear8bitLt):
+            int8_count += 1
+        elif isinstance(module, bnb.nn.LinearNF4):
+            nf4_count += 1
+    
+    return {"int8": int8_count, "nf4": nf4_count, "total": int8_count + nf4_count}
+
+
 def _convert_layers(raw_layers: nn.ModuleList, config) -> nn.ModuleList:
     """
     Convert HF layers to OptimizedLlamaDecoderLayer if available.
@@ -129,10 +159,15 @@ def _convert_layers(raw_layers: nn.ModuleList, config) -> nn.ModuleList:
     to avoid shape mismatch issues with quantized weight formats.
     """
     converted = []
+    quantized_converted = 0
+    non_quantized_converted = 0
+    already_optimized = 0
+    
     for idx, layer in enumerate(raw_layers):
         if OPT_AVAILABLE:
             if isinstance(layer, OptimizedLlamaDecoderLayer):
                 converted.append(layer)
+                already_optimized += 1
                 continue
             
             if isinstance(layer, LlamaDecoderLayer):
@@ -162,11 +197,15 @@ def _convert_layers(raw_layers: nn.ModuleList, config) -> nn.ModuleList:
                         opt_layer.input_layernorm = layer.input_layernorm
                         opt_layer.post_attention_layernorm = layer.post_attention_layernorm
                         
-                        logger.debug(
+                        # Log quantization status
+                        quant_stats = _count_quantized_modules(opt_layer)
+                        logger.info(
                             f"Layer {idx}: converted quantized layer to OptimizedLlamaDecoderLayer "
-                            f"(copied modules directly to avoid shape mismatch)"
+                            f"(quantized modules: {quant_stats['total']} total, "
+                            f"{quant_stats['int8']} INT8, {quant_stats['nf4']} NF4)"
                         )
                         converted.append(opt_layer)
+                        quantized_converted += 1
                         continue
                     except Exception as e:
                         logger.warning(
@@ -184,8 +223,18 @@ def _convert_layers(raw_layers: nn.ModuleList, config) -> nn.ModuleList:
                             f"Layer {idx}: optimized load missing={len(missing)}, unexpected={len(unexpected)}"
                         )
                     converted.append(opt_layer)
+                    non_quantized_converted += 1
                     continue
         converted.append(layer)
+    
+    # Log conversion summary
+    if quantized_converted > 0 or non_quantized_converted > 0:
+        logger.info(
+            f"Layer conversion summary: {quantized_converted} quantized layers converted, "
+            f"{non_quantized_converted} non-quantized layers converted, "
+            f"{already_optimized} already optimized"
+        )
+    
     return nn.ModuleList(converted)
 
 
@@ -234,7 +283,20 @@ class Stage0(nn.Module):
 
         self.layers = _convert_layers(nn.ModuleList(raw_layers), full.config)
         self.config = full.config
-        logger.info(f"Stage0 initialized with {len(self.layers)} layers (end={end})")
+        
+        # Log layer status
+        quantized_layers = sum(1 for layer in self.layers if _has_quantized_layers(layer))
+        if OPT_AVAILABLE and OptimizedLlamaDecoderLayer is not None:
+            optimized_layers = sum(1 for layer in self.layers if isinstance(layer, OptimizedLlamaDecoderLayer))
+            logger.info(
+                f"Stage0 initialized with {len(self.layers)} layers (end={end}): "
+                f"{quantized_layers} quantized, {optimized_layers} OptimizedLlamaDecoderLayer"
+            )
+        else:
+            logger.info(
+                f"Stage0 initialized with {len(self.layers)} layers (end={end}): "
+                f"{quantized_layers} quantized"
+            )
 
     def forward(
         self,
@@ -326,7 +388,19 @@ class StageSegment(nn.Module):
         if len(self.layers) == 0:
             logger.warning(f"StageSegment initialized with 0 layers (start={start}, end={end})")
         else:
-            logger.info(f"StageSegment initialized with {len(self.layers)} layers (start={start}, end={end})")
+            # Log layer status
+            quantized_layers = sum(1 for layer in self.layers if _has_quantized_layers(layer))
+            if OPT_AVAILABLE and OptimizedLlamaDecoderLayer is not None:
+                optimized_layers = sum(1 for layer in self.layers if isinstance(layer, OptimizedLlamaDecoderLayer))
+                logger.info(
+                    f"StageSegment initialized with {len(self.layers)} layers (start={start}, end={end}): "
+                    f"{quantized_layers} quantized, {optimized_layers} OptimizedLlamaDecoderLayer"
+                )
+            else:
+                logger.info(
+                    f"StageSegment initialized with {len(self.layers)} layers (start={start}, end={end}): "
+                    f"{quantized_layers} quantized"
+                )
 
     def forward(
         self,
@@ -416,7 +490,20 @@ class StageLast(nn.Module):
         self.layers = _convert_layers(nn.ModuleList(raw_layers), full.config)
         self.lm_head = full.lm_head
         self.config = full.config
-        logger.info(f"StageLast initialized with {len(self.layers)} layers (start={start})")
+        
+        # Log layer status
+        quantized_layers = sum(1 for layer in self.layers if _has_quantized_layers(layer))
+        if OPT_AVAILABLE and OptimizedLlamaDecoderLayer is not None:
+            optimized_layers = sum(1 for layer in self.layers if isinstance(layer, OptimizedLlamaDecoderLayer))
+            logger.info(
+                f"StageLast initialized with {len(self.layers)} layers (start={start}): "
+                f"{quantized_layers} quantized, {optimized_layers} OptimizedLlamaDecoderLayer"
+            )
+        else:
+            logger.info(
+                f"StageLast initialized with {len(self.layers)} layers (start={start}): "
+                f"{quantized_layers} quantized"
+            )
 
     def forward(
         self,
@@ -576,6 +663,40 @@ def load_stage_model(
         
         # Apply quantization
         full = quantize_module(full, quant_type=quant_type)
+        
+        # Verify quantization was applied
+        try:
+            import bitsandbytes as bnb
+            quantized_modules = []
+            linear_modules = []
+            for name, m in full.named_modules():
+                if isinstance(m, torch.nn.Linear):
+                    linear_modules.append(name)
+                if isinstance(m, (bnb.nn.LinearNF4, bnb.nn.Linear8bitLt)):
+                    quantized_modules.append(name)
+            
+            total_quantized = len(quantized_modules)
+            total_linear = len(linear_modules)
+            quant_ratio = (total_quantized / total_linear * 100) if total_linear > 0 else 0
+            
+            logger.info(
+                f"Quantization verification: {total_quantized} quantized Linear layers "
+                f"out of {total_linear} total Linear layers ({quant_ratio:.1f}%)"
+            )
+            if quantized_modules:
+                logger.debug(
+                    f"Quantized modules (first 10): {quantized_modules[:10]}"
+                    f"{'...' if len(quantized_modules) > 10 else ''}"
+                )
+            if linear_modules:
+                non_quantized = [name for name in linear_modules if name not in quantized_modules]
+                logger.debug(
+                    f"Non-quantized Linear modules (first 10): {non_quantized[:10]}"
+                    f"{'...' if len(non_quantized) > 10 else ''}"
+                )
+        except ImportError:
+            pass
+        
         logger.info(f"Quantization with {quant_type.name} completed")
 
     # Move model to target device
