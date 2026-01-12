@@ -220,15 +220,44 @@ class Stage0(nn.Module):
                 use_cache=use_cache,
                 output_attentions=False,
             )
+            
+            # Validate output structure
+            if not isinstance(out, (tuple, list)) or len(out) == 0:
+                raise RuntimeError(f"Stage0: layer {i} returned invalid output: {type(out)}")
+            
             x = out[0]
             if use_cache:
-                present = out[-1] if len(out) > 1 else None
-                present = _from_cache(present)
-                # if present is None:
-                #     logger.warning(f"Stage0: layer {i} returned no KV cache")
-                # else:
-                #     cache_len = present[0].shape[-2] if isinstance(present, tuple) else "cache_obj"
-                #     logger.info(f"Stage0 layer {i} present cache_len={cache_len}")
+                # LlamaDecoderLayer output format:
+                # - (hidden_states, past_key_value) when output_attentions=False, use_cache=True
+                # - (hidden_states, attentions, past_key_value) when output_attentions=True, use_cache=True
+                if len(out) < 2:
+                    logger.error(
+                        f"Stage0: layer {i} output too short for use_cache=True "
+                        f"(out_len={len(out)}, expected >= 2, layer_type={type(layer).__name__})"
+                    )
+                    present = None
+                else:
+                    present = out[-1]  # Last element should be past_key_value
+                    present = _from_cache(present)
+                
+                # Check if layer returned KV cache
+                if present is None:
+                    logger.warning(
+                        f"Stage0: layer {i} returned no KV cache "
+                        f"(out_len={len(out)}, layer_type={type(layer).__name__}, "
+                        f"out_types={[type(o).__name__ for o in out]})"
+                    )
+                elif isinstance(present, (tuple, list)) and len(present) == 2:
+                    if present[0] is None or present[1] is None:
+                        logger.warning(
+                            f"Stage0: layer {i} KV cache contains None "
+                            f"(key={present[0] is not None}, value={present[1] is not None})"
+                        )
+                else:
+                    logger.debug(
+                        f"Stage0: layer {i} KV cache format: {type(present)}, "
+                        f"len={len(present) if isinstance(present, (tuple, list)) else 'N/A'}"
+                    )
                 tuple_cache.append(present)
 
         if not use_cache:
@@ -283,15 +312,38 @@ class StageSegment(nn.Module):
                 use_cache=use_cache,
                 output_attentions=False,
             )
+            
+            # Validate output structure
+            if not isinstance(out, (tuple, list)) or len(out) == 0:
+                raise RuntimeError(f"StageSegment: layer {i} returned invalid output: {type(out)}")
+            
             x = out[0]
             if use_cache:
-                present = out[-1] if len(out) > 1 else None
-                present = _from_cache(present)
+                # LlamaDecoderLayer output format:
+                # - (hidden_states, past_key_value) when output_attentions=False, use_cache=True
+                if len(out) < 2:
+                    logger.error(
+                        f"StageSegment: layer {i} output too short for use_cache=True "
+                        f"(out_len={len(out)}, expected >= 2, layer_type={type(layer).__name__})"
+                    )
+                    present = None
+                else:
+                    present = out[-1]  # Last element should be past_key_value
+                    present = _from_cache(present)
+                
+                # Check if layer returned KV cache
                 if present is None:
-                    logger.warning(f"StageSegment: layer {i} returned no KV cache")
-                # else:
-                    # cache_len = present[0].shape[-2] if isinstance(present, tuple) else "cache_obj"
-                    # logger.info(f"StageSegment layer {i} present cache_len={cache_len}")
+                    logger.warning(
+                        f"StageSegment: layer {i} returned no KV cache "
+                        f"(out_len={len(out)}, layer_type={type(layer).__name__}, "
+                        f"out_types={[type(o).__name__ for o in out]})"
+                    )
+                elif isinstance(present, (tuple, list)) and len(present) == 2:
+                    if present[0] is None or present[1] is None:
+                        logger.warning(
+                            f"StageSegment: layer {i} KV cache contains None "
+                            f"(key={present[0] is not None}, value={present[1] is not None})"
+                        )
                 tuple_cache.append(present)
 
         if not use_cache:
@@ -351,15 +403,38 @@ class StageLast(nn.Module):
                 use_cache=use_cache,
                 output_attentions=False,
             )
+            
+            # Validate output structure
+            if not isinstance(out, (tuple, list)) or len(out) == 0:
+                raise RuntimeError(f"StageLast: layer {i} returned invalid output: {type(out)}")
+            
             x = out[0]
             if use_cache:
-                present = out[-1] if len(out) > 1 else None
-                present = _from_cache(present)
+                # LlamaDecoderLayer output format:
+                # - (hidden_states, past_key_value) when output_attentions=False, use_cache=True
+                if len(out) < 2:
+                    logger.error(
+                        f"StageLast: layer {i} output too short for use_cache=True "
+                        f"(out_len={len(out)}, expected >= 2, layer_type={type(layer).__name__})"
+                    )
+                    present = None
+                else:
+                    present = out[-1]  # Last element should be past_key_value
+                    present = _from_cache(present)
+                
+                # Check if layer returned KV cache
                 if present is None:
-                    logger.warning(f"StageLast: layer {i} returned no KV cache")
-                # else:
-                #     cache_len = present[0].shape[-2] if isinstance(present, tuple) else "cache_obj"
-                #     logger.info(f"StageLast layer {i} present cache_len={cache_len}")
+                    logger.warning(
+                        f"StageLast: layer {i} returned no KV cache "
+                        f"(out_len={len(out)}, layer_type={type(layer).__name__}, "
+                        f"out_types={[type(o).__name__ for o in out]})"
+                    )
+                elif isinstance(present, (tuple, list)) and len(present) == 2:
+                    if present[0] is None or present[1] is None:
+                        logger.warning(
+                            f"StageLast: layer {i} KV cache contains None "
+                            f"(key={present[0] is not None}, value={present[1] is not None})"
+                        )
                 tuple_cache.append(present)
 
         x = self.norm(x)
