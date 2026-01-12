@@ -43,7 +43,11 @@ def quantize_module(model: nn.Module, *, quant_type: QuantType) -> nn.Module:
         if len(list(module.children())) > 0:
             quantize_module(module, quant_type=quant_type)
 
-        if isinstance(module, torch.nn.Linear) and n not in ["lm_head", "score"]:
+        # Skip critical projection layers used for KV cache correctness
+        # q_proj / k_proj / v_proj / o_proj must stay in higher precision
+        skip_names = {"lm_head", "score", "q_proj", "k_proj", "v_proj", "o_proj"}
+
+        if isinstance(module, torch.nn.Linear) and n not in skip_names:
             # Ensure the module is on CPU before quantization
             # Note: We load the model on CPU initially, so this should already be on CPU
             if module.weight.device.type != "cpu":
