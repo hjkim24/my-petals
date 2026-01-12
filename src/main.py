@@ -19,6 +19,7 @@ try:
     from .llama_partition import load_stage_model, Stage0, StageSegment, StageLast, QuantType
     from .rpc_transport import RpcTransport
     from .rpc_handler import StageConnectionHandler
+    from .utils import benchmark_server_performance
 except ImportError:
     # 직접 실행될 때 (python src/main.py)
     import sys
@@ -28,6 +29,7 @@ except ImportError:
     from src.llama_partition import load_stage_model, Stage0, StageSegment, StageLast, QuantType
     from src.rpc_transport import RpcTransport
     from src.rpc_handler import StageConnectionHandler
+    from src.utils import benchmark_server_performance
 
 logger = get_logger(__name__)
 # Ensure logs are emitted when running from terminal
@@ -323,6 +325,24 @@ def run_stage_server(args, device, splits):
     else:
         raise ValueError("stage must be 1, 2, or 3 for server")
 
+    # 벤치마크 실행: 모델 로드 후, DHT 등록 전
+    logger.info("Running server performance benchmark...")
+    num_layers = len(stage_model.layers) if hasattr(stage_model, 'layers') else 0
+    benchmark_results = benchmark_server_performance(
+        stage_model=stage_model,
+        device=device,
+        config=full.config,
+        num_layers=num_layers,
+        quant_type=args.quant_type,
+    )
+    server_throughput = benchmark_results["throughput"]
+    logger.info(
+        f"Server benchmark complete: "
+        f"network={benchmark_results['network_rps']:.1f} tokens/s, "
+        f"gpu={benchmark_results['gpu_rps']:.1f} tokens/s, "
+        f"final throughput={server_throughput:.1f} tokens/s"
+    )
+
     dht_peers = args.dht_initial_peers.split(",") if args.dht_initial_peers else []
     initial_peers_list = _format_initial_peers(args.dht_initial_peers)
     local_ip = _get_local_ip()
@@ -434,6 +454,8 @@ def run_stage_server(args, device, splits):
                 "peer_id": str(p2p.peer_id),          # 서버 고유 ID (subkey로도 사용)
                 "timestamp": get_dht_time(),
                 "stage": args.stage,
+                "throughput": server_throughput,  # tokens/s (min of network and GPU)
+                "benchmark_time": get_dht_time(),  # 벤치마크 실행 시점
             }
             if p2p_maddrs:
                 peer_info["p2p_maddrs"] = p2p_maddrs

@@ -230,14 +230,16 @@ class RpcTransport:
                     # maddrs
                     maddrs = entry.get("p2p_maddrs") or []
                     ts = entry.get("timestamp", 0)
+                    throughput = entry.get("throughput", 0.0)  # 기본값 0 (성능 정보 없음)
 
-                    candidates.append((peer_id_str, maddrs, ts))
+                    candidates.append((peer_id_str, maddrs, ts, throughput))
                     debug_entries.append(
                         {
                             "subkey": str(subk),
                             "peer_id": peer_id_str,
                             "maddrs": maddrs,
                             "timestamp": ts,
+                            "throughput": throughput,
                         }
                     )
 
@@ -265,7 +267,8 @@ class RpcTransport:
                     if peer_id_str and peer_id_str not in exclude_peer_ids:
                         maddrs = value.get("p2p_maddrs") or []
                         ts = value.get("timestamp", 0)
-                        candidates.append((peer_id_str, maddrs, ts))
+                        throughput = value.get("throughput", 0.0)  # 기본값 0 (성능 정보 없음)
+                        candidates.append((peer_id_str, maddrs, ts, throughput))
                         logger.info(
                             f"{stage_key}: DHT single entry="
                             f"{{'peer_id': {peer_id_str}, 'maddrs': {maddrs}, 'timestamp': {ts}}}"
@@ -282,19 +285,33 @@ class RpcTransport:
                 candidates = await loop.run_in_executor(None, _get_candidates_sync)
 
                 if candidates:
-                    # 선택 정책:
-                    # 1) timestamp 최신순으로 상위 몇 개 추려서
-                    # 2) 그 중 랜덤 선택 (부하 분산 + 최신 고집 방지)
-                    candidates.sort(key=lambda x: x[2], reverse=True)
-                    top = candidates[: min(5, len(candidates))]
-                    peer_id_str, maddrs, _ts = random.choice(top)
+                    # 선택 정책: throughput 기반 선택
+                    # 1) throughput 높은 순으로 정렬
+                    # 2) 최고 성능 서버 선택 (동일 throughput일 경우 랜덤 선택)
+                    candidates.sort(key=lambda x: x[3], reverse=True)  # x[3] = throughput
+                    
+                    if candidates:
+                        top_throughput = candidates[0][3]
+                        # 동일 throughput을 가진 서버들 중에서 선택
+                        top_candidates = [c for c in candidates if c[3] == top_throughput]
+                        peer_id_str, maddrs, _ts, _throughput = random.choice(top_candidates)
 
-                    logger.info(
-                        f"{stage_key}: Selected peer from {len(candidates)} candidates - "
-                        f"peer_id={peer_id_str[:8]}..., "
-                        f"timestamp={_ts}, "
-                        f"maddrs_count={len(maddrs)}"
-                    )
+                        logger.info(
+                            f"{stage_key}: Selected peer from {len(candidates)} candidates - "
+                            f"peer_id={peer_id_str[:8]}..., "
+                            f"timestamp={_ts}, "
+                            f"throughput={_throughput:.1f} tokens/s, "
+                            f"maddrs_count={len(maddrs)}, "
+                            f"top_candidates={len(top_candidates)}"
+                        )
+                    else:
+                        # Fallback (should not happen)
+                        peer_id_str, maddrs, _ts, _throughput = candidates[0]
+                        logger.warning(
+                            f"{stage_key}: Fallback selection - "
+                            f"peer_id={peer_id_str[:8]}..., "
+                            f"throughput={_throughput:.1f} tokens/s"
+                        )
                     peer_id = PeerID.from_base58(peer_id_str)
                     return peer_id, maddrs
 
