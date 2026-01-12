@@ -101,15 +101,38 @@ except Exception:
     Cache, DynamicCache = None, None
 
 
+def _has_quantized_layers(layer: nn.Module) -> bool:
+    """
+    Check if a layer contains quantized Linear layers (bitsandbytes).
+    """
+    try:
+        import bitsandbytes as bnb
+    except ImportError:
+        return False
+    
+    for module in layer.modules():
+        if isinstance(module, (bnb.nn.LinearNF4, bnb.nn.Linear8bitLt)):
+            return True
+    return False
+
+
 def _convert_layers(raw_layers: nn.ModuleList, config) -> nn.ModuleList:
     """
     Convert HF layers to OptimizedLlamaDecoderLayer if available.
     Otherwise keep as-is to stay close to HF reference.
+    
+    Note: Quantized layers are not converted to OptimizedLlamaDecoderLayer
+    because they have incompatible weight formats.
     """
     converted = []
     for idx, layer in enumerate(raw_layers):
         if OPT_AVAILABLE:
             if isinstance(layer, OptimizedLlamaDecoderLayer):
+                converted.append(layer)
+                continue
+            # Skip conversion if layer contains quantized modules
+            if _has_quantized_layers(layer):
+                logger.debug(f"Layer {idx}: contains quantized modules, skipping OptimizedLlamaDecoderLayer conversion")
                 converted.append(layer)
                 continue
             if isinstance(layer, LlamaDecoderLayer):
