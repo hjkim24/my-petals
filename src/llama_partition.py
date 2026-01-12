@@ -212,14 +212,28 @@ class Stage0(nn.Module):
             layer_pos = position_ids if position_ids is not None else default_position_ids(
                 layer_past, x.shape[1], x.device
             )
-            out = layer(
-                x,
-                attention_mask=None,
-                position_ids=layer_pos,
-                past_key_value=_to_cache(layer_past),
-                use_cache=use_cache,
-                output_attentions=False,
-            )
+            # For quantized layers, we need to ensure KV cache is returned
+            # Quantized layers may not return KV cache properly, so we need to handle it specially
+            if _has_quantized_layers(layer) and use_cache:
+                # For quantized layers, call with output_attentions=True to ensure we get all outputs
+                out = layer(
+                    x,
+                    attention_mask=None,
+                    position_ids=layer_pos,
+                    past_key_value=_to_cache(layer_past),
+                    use_cache=use_cache,
+                    output_attentions=True,  # Force output_attentions=True for quantized layers
+                )
+            else:
+                # Normal case: output_attentions=False
+                out = layer(
+                    x,
+                    attention_mask=None,
+                    position_ids=layer_pos,
+                    past_key_value=_to_cache(layer_past),
+                    use_cache=use_cache,
+                    output_attentions=False,
+                )
             
             # Validate output structure
             if not isinstance(out, (tuple, list)) or len(out) == 0:
@@ -304,14 +318,28 @@ class StageSegment(nn.Module):
             layer_pos = position_ids if position_ids is not None else default_position_ids(
                 layer_past, x.shape[1], x.device
             )
-            out = layer(
-                x,
-                attention_mask=None,
-                position_ids=layer_pos,
-                past_key_value=_to_cache(layer_past),
-                use_cache=use_cache,
-                output_attentions=False,
-            )
+            # For quantized layers, we need to ensure KV cache is returned
+            # Quantized layers may not return KV cache properly, so we need to handle it specially
+            if _has_quantized_layers(layer) and use_cache:
+                # For quantized layers, call with output_attentions=True to ensure we get all outputs
+                out = layer(
+                    x,
+                    attention_mask=None,
+                    position_ids=layer_pos,
+                    past_key_value=_to_cache(layer_past),
+                    use_cache=use_cache,
+                    output_attentions=True,  # Force output_attentions=True for quantized layers
+                )
+            else:
+                # Normal case: output_attentions=False
+                out = layer(
+                    x,
+                    attention_mask=None,
+                    position_ids=layer_pos,
+                    past_key_value=_to_cache(layer_past),
+                    use_cache=use_cache,
+                    output_attentions=False,
+                )
             
             # Validate output structure
             if not isinstance(out, (tuple, list)) or len(out) == 0:
@@ -321,6 +349,7 @@ class StageSegment(nn.Module):
             if use_cache:
                 # LlamaDecoderLayer output format:
                 # - (hidden_states, past_key_value) when output_attentions=False, use_cache=True
+                # - (hidden_states, attentions, past_key_value) when output_attentions=True, use_cache=True
                 if len(out) < 2:
                     logger.error(
                         f"StageSegment: layer {i} output too short for use_cache=True "
@@ -395,14 +424,28 @@ class StageLast(nn.Module):
             layer_pos = position_ids if position_ids is not None else default_position_ids(
                 layer_past, x.shape[1], x.device
             )
-            out = layer(
-                x,
-                attention_mask=None,
-                position_ids=layer_pos,
-                past_key_value=_to_cache(layer_past),
-                use_cache=use_cache,
-                output_attentions=False,
-            )
+            # For quantized layers, we need to ensure KV cache is returned
+            # Quantized layers may not return KV cache properly, so we need to handle it specially
+            if _has_quantized_layers(layer) and use_cache:
+                # For quantized layers, call with output_attentions=True to ensure we get all outputs
+                out = layer(
+                    x,
+                    attention_mask=None,
+                    position_ids=layer_pos,
+                    past_key_value=_to_cache(layer_past),
+                    use_cache=use_cache,
+                    output_attentions=True,  # Force output_attentions=True for quantized layers
+                )
+            else:
+                # Normal case: output_attentions=False
+                out = layer(
+                    x,
+                    attention_mask=None,
+                    position_ids=layer_pos,
+                    past_key_value=_to_cache(layer_past),
+                    use_cache=use_cache,
+                    output_attentions=False,
+                )
             
             # Validate output structure
             if not isinstance(out, (tuple, list)) or len(out) == 0:
@@ -412,6 +455,7 @@ class StageLast(nn.Module):
             if use_cache:
                 # LlamaDecoderLayer output format:
                 # - (hidden_states, past_key_value) when output_attentions=False, use_cache=True
+                # - (hidden_states, attentions, past_key_value) when output_attentions=True, use_cache=True
                 if len(out) < 2:
                     logger.error(
                         f"StageLast: layer {i} output too short for use_cache=True "
