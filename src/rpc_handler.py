@@ -40,6 +40,21 @@ from hivemind.utils.logging import get_logger
 logger = get_logger(__name__)
 
 
+def _has_quantized_layers(model) -> bool:
+    """
+    Check if model contains quantized Linear layers (bitsandbytes).
+    """
+    try:
+        import bitsandbytes as bnb
+    except ImportError:
+        return False
+    
+    for module in model.modules():
+        if isinstance(module, (bnb.nn.LinearNF4, bnb.nn.Linear8bitLt)):
+            return True
+    return False
+
+
 class StageConnectionHandler(ConnectionHandler):
     """Connection handler for Stage1 that processes forward requests."""
 
@@ -236,8 +251,18 @@ class StageConnectionHandler(ConnectionHandler):
 
         with torch.inference_mode():
             cfg_dtype = getattr(getattr(self.stage_model, "config", None), "torch_dtype", None)
-            first_param = next(self.stage_model.parameters(), None)
-            model_dtype = cfg_dtype or (first_param.dtype if first_param is not None else hidden_states.dtype)
+            
+            # For quantized models, KV cache and activations should use fp16
+            # even though weights are quantized
+            if _has_quantized_layers(self.stage_model):
+                # Quantized models: use fp16 for activations and KV cache
+                model_dtype = torch.float16
+                logger.debug(f"[{session_id[:8]}] {stage_name}: Detected quantized model, using fp16 for KV cache")
+            else:
+                # Non-quantized models: use config dtype or infer from parameters
+                first_param = next(self.stage_model.parameters(), None)
+                model_dtype = cfg_dtype or (first_param.dtype if first_param is not None else hidden_states.dtype)
+            
             inputs = hidden_states.to(self.device, dtype=model_dtype)
             # logger.info(f"[{session_id[:8]}] {stage_name}: Converted inputs dtype={inputs.dtype} (model_dtype={model_dtype})")
             
@@ -254,6 +279,28 @@ class StageConnectionHandler(ConnectionHandler):
                     past_key_values=past_key_values,
                     use_cache=True,
                 )
+                
+                # Validate KV cache for quantized models
+                if _has_quantized_layers(self.stage_model) and new_past is not None:
+                    if isinstance(new_past, (tuple, list)) and len(new_past) > 0:
+                        first_cache = new_past[0]
+                        if isinstance(first_cache, (tuple, list)) and len(first_cache) == 2:
+                            key, value = first_cache
+                            if key is not None and value is not None:
+                                logger.debug(
+                                    f"[{session_id[:8]}] {stage_name}: KV cache returned - "
+                                    f"key dtype={key.dtype}, value dtype={value.dtype}, "
+                                    f"key shape={key.shape}, value shape={value.shape}"
+                                )
+                            else:
+                                logger.warning(
+                                    f"[{session_id[:8]}] {stage_name}: KV cache contains None values"
+                                )
+                    else:
+                        logger.warning(
+                            f"[{session_id[:8]}] {stage_name}: Unexpected KV cache format: {type(new_past)}"
+                        )
+                        
             except StopIteration as e:
                 logger.error(
                     f"[{session_id[:8]}] StopIteration from stage_model: "
@@ -263,6 +310,11 @@ class StageConnectionHandler(ConnectionHandler):
                 raise RuntimeError("stage_model raised StopIteration") from e
 
         # KV 캐시 업데이트 (replay 모드에서도 복구를 위해 필요)
+        if new_past is None:
+            logger.warning(
+                f"[{session_id[:8]}] {stage_name}: No KV cache returned from model "
+                f"(use_cache=True but new_past is None)"
+            )
         self._kv_cache[session_id] = new_past
 
         if self.final_stage:
