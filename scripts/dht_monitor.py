@@ -27,7 +27,23 @@ def _format_initial_peers(dht_initial_peers: str) -> list:
     """Format DHT initial peers from comma-separated string."""
     if not dht_initial_peers:
         return []
-    peers = [p.strip() for p in dht_initial_peers.split(",") if p.strip()]
+    peers = []
+    for p in dht_initial_peers.split(","):
+        p = p.strip()
+        if not p:
+            continue
+        # Require full multiaddr with peer ID to avoid invalid p2p multiaddr errors
+        if "/p2p/" in p:
+            peers.append(p)
+        elif ":" in p:
+            logger.warning(
+                f"Initial peer '{p}' is missing '/p2p/<peer_id>'. "
+                "Use the full multiaddr printed by Stage1 (e.g., /ip4/127.0.0.1/tcp/8000/p2p/<peer_id>)."
+            )
+            # Try to use it anyway, but warn
+            peers.append(p)
+        else:
+            peers.append(p)
     return peers
 
 
@@ -188,17 +204,42 @@ async def monitor_dht(
     # Initialize DHT (read-only, no model loading)
     logger.info(f"Connecting to DHT network on {local_ip}:{dht_port}")
     if initial_peers_list:
-        logger.info(f"Initial peers: {initial_peers_list}")
+        logger.info(f"Initial peers ({len(initial_peers_list)}):")
+        for i, peer in enumerate(initial_peers_list, 1):
+            logger.info(f"  {i}. {peer}")
     else:
         logger.warning("No initial peers provided. DHT may not connect to existing network.")
     
-    dht = DHT(
-        start=True,
-        initial_peers=initial_peers_list if initial_peers_list else None,
-        host_maddrs=[f"/ip4/{local_ip}/tcp/{dht_port}"],
-    )
-    
-    logger.info(f"DHT connected. Peer ID: {dht.peer_id}")
+    try:
+        logger.info("Initializing DHT...")
+        dht = DHT(
+            start=True,
+            initial_peers=initial_peers_list if initial_peers_list else None,
+            host_maddrs=[f"/ip4/{local_ip}/tcp/{dht_port}"],
+        )
+        logger.info(f"DHT initialized. Peer ID: {dht.peer_id}")
+        
+        # Wait a bit for connections to establish
+        logger.info("Waiting for DHT connections to establish...")
+        await asyncio.sleep(2.0)
+        
+        # Check if we have any peers
+        try:
+            visible_maddrs = dht.get_visible_maddrs()
+            logger.info(f"DHT visible maddrs: {visible_maddrs}")
+        except Exception as e:
+            logger.warning(f"Could not get visible maddrs: {e}")
+        
+    except Exception as e:
+        logger.error(f"Failed to initialize DHT: {e}")
+        logger.error("This might be due to:")
+        logger.error("  1. Invalid initial_peers format (should be full multiaddr with /p2p/<peer_id>)")
+        logger.error("  2. Network connectivity issues")
+        logger.error("  3. Bootstrap peers are not reachable")
+        logger.error("  4. Port conflicts")
+        if initial_peers_list:
+            logger.error(f"  Provided initial_peers: {initial_peers_list}")
+        raise
     logger.info(f"Monitoring stage keys: mini_petals:stage1, mini_petals:stage2, mini_petals:stage3")
     logger.info(f"Refresh interval: {refresh_interval}s")
     logger.info("Press Ctrl+C to stop\n")
