@@ -7,7 +7,7 @@ from enum import Enum
 
 import torch
 import torch.nn as nn
-from transformers import AutoConfig, AutoModelForCausalLM
+from transformers import AutoConfig, AutoModelForCausalLM, PretrainedConfig
 from transformers.models.llama.modeling_llama import LlamaDecoderLayer
 from huggingface_hub import hf_hub_download, HfApi
 
@@ -587,6 +587,88 @@ class StageLast(nn.Module):
         return logits, tuple(tuple_cache)
 
 
+def _create_stage_config(config: PretrainedConfig, role: str, start: int, end: Optional[int]) -> PretrainedConfig:
+    """
+    Create a modified config with only the required number of layers.
+    This reduces memory usage when creating model structure.
+    
+    Args:
+        config: Original model config
+        role: Stage role ("stage0", "segment", "last")
+        start: Start layer index
+        end: End layer index (None for "last")
+    
+    Returns:
+        Modified config with reduced num_hidden_layers
+    """
+    # Config 복사
+    stage_config = config.__class__(**config.to_dict())
+    
+    # 필요한 레이어 수 계산
+    if role == "stage0":
+        num_layers_needed = end
+    elif role == "segment":
+        num_layers_needed = end - start
+    elif role == "last":
+        num_layers_needed = config.num_hidden_layers - start
+    else:
+        num_layers_needed = config.num_hidden_layers
+    
+    # num_hidden_layers 수정 (메모리 절약을 위해 작은 구조 생성)
+    stage_config.num_hidden_layers = num_layers_needed
+    
+    logger.info(f"Created stage config: role={role}, original_layers={config.num_hidden_layers}, "
+                f"stage_layers={num_layers_needed}, start={start}, end={end}")
+    
+    return stage_config
+
+
+def _remap_state_dict_keys(state_dict: Dict[str, torch.Tensor], role: str, start: int, end: Optional[int]) -> Dict[str, torch.Tensor]:
+    """
+    Remap state_dict keys to match the smaller model structure.
+    
+    For segment/last roles, layer indices need to be remapped:
+    - Original: model.layers.10.* -> Remapped: model.layers.0.*
+    - Original: model.layers.11.* -> Remapped: model.layers.1.*
+    etc.
+    
+    Args:
+        state_dict: Original state_dict with full layer indices
+        role: Stage role ("stage0", "segment", "last")
+        start: Start layer index in original model
+        end: End layer index in original model
+    
+    Returns:
+        Remapped state_dict with layer indices starting from 0
+    """
+    remapped = {}
+    
+    for key, value in state_dict.items():
+        new_key = key
+        
+        # Stage0는 인덱스가 0부터 시작하므로 재매핑 불필요
+        if role == "segment" or role == "last":
+            # model.layers.{start}.* -> model.layers.0.*
+            # model.layers.{start+1}.* -> model.layers.1.*
+            # etc.
+            if key.startswith("model.layers."):
+                parts = key.split(".")
+                if len(parts) >= 3:
+                    try:
+                        layer_idx = int(parts[2])
+                        if layer_idx >= start:
+                            # 레이어 인덱스를 0부터 시작하도록 재매핑
+                            new_layer_idx = layer_idx - start
+                            new_key = f"model.layers.{new_layer_idx}." + ".".join(parts[3:])
+                    except ValueError:
+                        # 레이어 인덱스가 아닌 경우 그대로 유지
+                        pass
+        
+        remapped[new_key] = value
+    
+    return remapped
+
+
 def _get_required_tensor_keys(role: str, start: int, end: Optional[int], config) -> Set[str]:
     """
     Get the set of tensor key prefixes required for a given stage.
@@ -690,7 +772,7 @@ def load_stage_model(
     end: Optional[int] = None,
     dtype=torch.float16,
     quant_type: QuantType = QuantType.NONE,
-    use_selective_loading: bool = False,  # Disabled: causes OOM, use full download + pruning instead
+    use_selective_loading: bool = True,  # Enabled: uses modified config to prevent OOM
 ):
     """
     Load only the layers needed for a stage to reduce memory (LLaMA-only).
@@ -744,11 +826,19 @@ def load_stage_model(
     else:
         # Build model structure with selective weights
         logger.info("Building model structure with selectively loaded weights")
-        # Create model structure without loading weights
-        full = AutoModelForCausalLM.from_config(config)
+        
+        # Create a modified config with only required layers (OOM 방지)
+        stage_config = _create_stage_config(config, role, start, end)
+        
+        # Create model structure with smaller config (메모리 절약)
+        full = AutoModelForCausalLM.from_config(stage_config)
+        
+        # Remap state_dict keys to match the smaller model structure
+        # (segment/last의 경우 layer indices를 0부터 시작하도록 재매핑)
+        remapped_state_dict = _remap_state_dict_keys(selective_state_dict, role, start, end)
         
         # Load only the required weights
-        missing_keys, unexpected_keys = full.load_state_dict(selective_state_dict, strict=False)
+        missing_keys, unexpected_keys = full.load_state_dict(remapped_state_dict, strict=False)
         
         if missing_keys:
             logger.warning(f"Missing keys in selective loading: {len(missing_keys)} keys")
@@ -775,23 +865,49 @@ def load_stage_model(
         else:
             raise ValueError(f"Unsupported model architecture for pruning: {type(obj)}")
 
-    if role == "stage0":
-        _prune_layers(full, 0, end)
-        if hasattr(full, "lm_head"):
-            full.lm_head = None
-        if hasattr(full, "model") and hasattr(full.model, "norm"):
-            full.model.norm = None
-    elif role == "segment":
-        _prune_layers(full, start, end)
-        if hasattr(full, "lm_head"):
-            full.lm_head = None
-        if hasattr(full, "model") and hasattr(full.model, "norm"):
-            full.model.norm = None
-    elif role == "last":
-        _prune_layers(full, start, None)
-        # keep norm/head
+    # Pruning: 선택적 로딩을 사용한 경우 이미 작은 구조이므로 인덱스 조정 필요
+    if selective_state_dict is not None:
+        # 선택적 로딩 사용: 이미 작은 구조이므로 모든 레이어 유지 (pruning 불필요)
+        # 하지만 role에 따라 불필요한 부분 제거는 여전히 필요
+        if role == "stage0":
+            # Stage0: 모든 레이어 유지 (이미 작은 구조)
+            pass  # layers[0:end]는 이미 작은 구조에 포함됨
+            if hasattr(full, "lm_head"):
+                full.lm_head = None
+            if hasattr(full, "model") and hasattr(full.model, "norm"):
+                full.model.norm = None
+        elif role == "segment":
+            # Segment: 모든 레이어 유지 (이미 작은 구조, layers[0:end-start])
+            pass  # layers[0:end-start]는 이미 작은 구조에 포함됨
+            if hasattr(full, "lm_head"):
+                full.lm_head = None
+            if hasattr(full, "model") and hasattr(full.model, "norm"):
+                full.model.norm = None
+        elif role == "last":
+            # Last: 모든 레이어 유지 (이미 작은 구조, layers[0:num_layers-start])
+            pass  # layers[0:num_layers-start]는 이미 작은 구조에 포함됨
+            # norm과 lm_head는 유지
+        else:
+            raise ValueError(f"Unknown role: {role}")
     else:
-        raise ValueError(f"Unknown role: {role}")
+        # 전체 다운로드 사용: 기존 pruning 로직 사용
+        if role == "stage0":
+            _prune_layers(full, 0, end)
+            if hasattr(full, "lm_head"):
+                full.lm_head = None
+            if hasattr(full, "model") and hasattr(full.model, "norm"):
+                full.model.norm = None
+        elif role == "segment":
+            _prune_layers(full, start, end)
+            if hasattr(full, "lm_head"):
+                full.lm_head = None
+            if hasattr(full, "model") and hasattr(full.model, "norm"):
+                full.model.norm = None
+        elif role == "last":
+            _prune_layers(full, start, None)
+            # keep norm/head
+        else:
+            raise ValueError(f"Unknown role: {role}")
 
     # Log resulting layer counts to catch empty segments early
     if hasattr(full, "model") and hasattr(full.model, "layers"):
