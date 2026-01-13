@@ -227,7 +227,9 @@ def main():
             next_token_logits = logits[:, -1, :]  # [1, vocab]
         
         # EOS 토큰 마스킹 (disable_eos 옵션이 켜져있으면)
-        if args.disable_eos and eos_token_id is not None:
+        # inference_mode 밖에서 수정해야 하므로 clone 사용
+        if disable_eos and eos_token_id is not None:
+            next_token_logits = next_token_logits.clone()
             next_token_logits[0, eos_token_id] = float('-inf')
         
         # 샘플링 (temperature, top_p, top_k 적용)
