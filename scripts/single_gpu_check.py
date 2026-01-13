@@ -128,13 +128,16 @@ def main():
         if quant_type == QuantType.NONE:
             model = model.to(torch.device("cpu"))
         
-        # 레이어 접근 (LLaMA 구조)
+        # 레이어 접근 (다양한 모델 구조 지원)
+        layers = None
         if hasattr(model, "model") and hasattr(model.model, "layers"):
+            # LLaMA/Mistral 구조
             layers = model.model.layers
         elif hasattr(model, "transformer") and hasattr(model.transformer, "h"):
+            # GPT/BLOOM 구조
             layers = model.transformer.h
         else:
-            raise ValueError("Unsupported model architecture: cannot find layers")
+            raise ValueError(f"Unsupported model architecture: cannot find layers. Model type: {type(model)}, has model.model: {hasattr(model, 'model')}, has transformer: {hasattr(model, 'transformer')}")
         
         # 레이어별 device 추적
         layer_devices = {}
@@ -200,23 +203,93 @@ def main():
             layer.forward = types.MethodType(wrapped_fn, layer)
         
         # Embeddings와 norm, lm_head는 항상 GPU에 유지 (작고 자주 사용)
+        # LLaMA 구조
         if hasattr(model, "model") and hasattr(model.model, "embed_tokens"):
             model.model.embed_tokens = model.model.embed_tokens.to(device)
+        # GPT 구조
         elif hasattr(model, "transformer") and hasattr(model.transformer, "wte"):
             model.transformer.wte = model.transformer.wte.to(device)
+        # BLOOM 구조
+        elif hasattr(model, "transformer") and hasattr(model.transformer, "word_embeddings"):
+            model.transformer.word_embeddings = model.transformer.word_embeddings.to(device)
+            # BLOOM의 word_embeddings_layernorm도 GPU로 이동
+            if hasattr(model.transformer, "word_embeddings_layernorm"):
+                model.transformer.word_embeddings_layernorm = model.transformer.word_embeddings_layernorm.to(device)
 
+        # Rotary embeddings (LLaMA/Mistral)
         if hasattr(model, "model") and hasattr(model.model, "rotary_emb"):
             model.model.rotary_emb = model.model.rotary_emb.to(device)
         elif hasattr(model, "transformer") and hasattr(model.transformer, "rotary_emb"):
             model.transformer.rotary_emb = model.transformer.rotary_emb.to(device)
         
+        # Final layer norm
         if hasattr(model, "model") and hasattr(model.model, "norm"):
             model.model.norm = model.model.norm.to(device)
         elif hasattr(model, "transformer") and hasattr(model.transformer, "ln_f"):
             model.transformer.ln_f = model.transformer.ln_f.to(device)
         
+        # Language model head
         if hasattr(model, "lm_head"):
             model.lm_head = model.lm_head.to(device)
+        
+        # 모델의 forward pass를 래핑하여 입력 처리 전에 필요한 모듈들을 GPU로 이동
+        original_forward = model.__class__.forward
+        
+        def wrapped_model_forward(self, *args, **kwargs):
+            # 입력 텐서를 GPU로 이동 (이미 GPU에 있으면 no-op)
+            if args and len(args) > 0 and isinstance(args[0], torch.Tensor):
+                args = (args[0].to(device),) + args[1:]
+            if "input_ids" in kwargs and isinstance(kwargs["input_ids"], torch.Tensor):
+                kwargs["input_ids"] = kwargs["input_ids"].to(device)
+            if "inputs_embeds" in kwargs and isinstance(kwargs["inputs_embeds"], torch.Tensor):
+                kwargs["inputs_embeds"] = kwargs["inputs_embeds"].to(device)
+            if "attention_mask" in kwargs and isinstance(kwargs["attention_mask"], torch.Tensor):
+                kwargs["attention_mask"] = kwargs["attention_mask"].to(device)
+            if "position_ids" in kwargs and isinstance(kwargs["position_ids"], torch.Tensor):
+                kwargs["position_ids"] = kwargs["position_ids"].to(device)
+            
+            # Embeddings와 norm이 GPU에 있는지 확인하고 없으면 이동
+            def check_and_move(module, target_device):
+                """모듈이 target_device에 없으면 이동"""
+                try:
+                    param = next(module.parameters(), None)
+                    if param is not None and param.device != target_device:
+                        module.to(target_device)
+                except StopIteration:
+                    # 파라미터가 없는 경우에도 디바이스 확인
+                    try:
+                        buffer = next(module.buffers(), None)
+                        if buffer is not None and buffer.device != target_device:
+                            module.to(target_device)
+                    except StopIteration:
+                        # 파라미터와 버퍼가 모두 없는 경우에도 이동 시도
+                        module.to(target_device)
+            
+            # LLaMA 구조
+            if hasattr(self, "model") and hasattr(self.model, "embed_tokens"):
+                check_and_move(self.model.embed_tokens, device)
+            # GPT 구조
+            elif hasattr(self, "transformer") and hasattr(self.transformer, "wte"):
+                check_and_move(self.transformer.wte, device)
+            # BLOOM 구조
+            elif hasattr(self, "transformer") and hasattr(self.transformer, "word_embeddings"):
+                check_and_move(self.transformer.word_embeddings, device)
+                if hasattr(self.transformer, "word_embeddings_layernorm"):
+                    check_and_move(self.transformer.word_embeddings_layernorm, device)
+            
+            # Final norm
+            if hasattr(self, "model") and hasattr(self.model, "norm"):
+                check_and_move(self.model.norm, device)
+            elif hasattr(self, "transformer") and hasattr(self.transformer, "ln_f"):
+                check_and_move(self.transformer.ln_f, device)
+            
+            # LM head
+            if hasattr(self, "lm_head"):
+                check_and_move(self.lm_head, device)
+            
+            return original_forward(self, *args, **kwargs)
+        
+        model.forward = types.MethodType(wrapped_model_forward, model)
         
         print(f"CPU offloading enabled: Model loaded with lazy GPU loading (keep {args.keep_layers_on_gpu} layers on GPU)")
     else:
