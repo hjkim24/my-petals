@@ -536,11 +536,34 @@ def main():
     if args.dtype in ["int4", "int8"]:
         try:
             import bitsandbytes as bnb
+            # Test if bitsandbytes is actually working
+            try:
+                # Try to access a module to verify CUDA setup
+                _ = bnb.nn.LinearNF4
+            except (AttributeError, RuntimeError) as e:
+                logger.error(
+                    f"bitsandbytes CUDA setup failed: {e}\n"
+                    "Please fix bitsandbytes CUDA setup or use --dtype bf16/fp16 instead.\n"
+                    "Run: ./scripts/fix_bitsandbytes.sh or see docs/BITSANDBYTES_FIX.md"
+                )
+                raise RuntimeError(
+                    "bitsandbytes CUDA setup failed. Please fix CUDA setup or use --dtype bf16/fp16 instead."
+                ) from e
         except ImportError:
             raise ImportError(
                 "bitsandbytes is required for int4/int8 quantization. "
                 "Install it with: pip install bitsandbytes"
             )
+        except RuntimeError as e:
+            # bitsandbytes import succeeded but CUDA setup failed
+            logger.error(
+                f"bitsandbytes CUDA setup failed: {e}\n"
+                "Please fix bitsandbytes CUDA setup or use --dtype bf16/fp16 instead.\n"
+                "Run: ./scripts/fix_bitsandbytes.sh or see docs/BITSANDBYTES_FIX.md"
+            )
+            raise RuntimeError(
+                "bitsandbytes CUDA setup failed. Please fix CUDA setup or use --dtype bf16/fp16 instead."
+            ) from e
         
         # Convert dtype string to QuantType
         if args.dtype == "int4":

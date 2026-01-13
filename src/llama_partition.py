@@ -375,40 +375,55 @@ def _from_cache(present):
 
 
 class Stage0(nn.Module):
-    """LLaMA-only Stage0; keep Cache end-to-end (no manual recompute)."""
+    """Stage0 for LLaMA-style and GPT-style (BLOOM) models; keep Cache end-to-end (no manual recompute)."""
 
     def __init__(self, full, end: int):
         super().__init__()
         model_type = getattr(full.config, "model_type", "").lower()
-        if "llama" not in model_type and "mistral" not in model_type and "mixtral" not in model_type and "qwen" not in model_type:
-            raise ValueError("Only LLaMA-style models (LLaMA, Mistral, Mixtral, Qwen) are supported in Stage0.")
+        is_llama_style = "llama" in model_type or "mistral" in model_type or "mixtral" in model_type or "qwen" in model_type
+        is_gpt_style = "bloom" in model_type or "gpt" in model_type
+        if not is_llama_style and not is_gpt_style:
+            raise ValueError(f"Unsupported model type: {model_type}. Supported: LLaMA-style (llama, mistral, mixtral, qwen) or GPT-style (bloom, gpt)")
 
+        # LLaMA-style models (LLaMA, Mistral, Mixtral, Qwen)
         if hasattr(full, "model") and hasattr(full.model, "embed_tokens"):
             self.embed_tokens = full.model.embed_tokens
+            self.pos_embed = None  # LLaMA uses RoPE, no positional embeddings
             raw_layers = full.model.layers  # already pruned in load_stage_model
+        # GPT-style models (BLOOM, GPT-2, etc.)
         elif hasattr(full, "transformer") and hasattr(full.transformer, "wte"):
             self.embed_tokens = full.transformer.wte
-            self.pos_embed = getattr(full.transformer, "wpe", None)
+            self.pos_embed = getattr(full.transformer, "wpe", None)  # Positional embeddings for GPT-style
             raw_layers = full.transformer.h  # already pruned in load_stage_model
         else:
-            raise ValueError(f"Unsupported LLaMA architecture: {type(full)}.")
+            raise ValueError(f"Unsupported model architecture: {type(full)}. Expected LLaMA-style (model.embed_tokens) or GPT-style (transformer.wte)")
 
-        self.layers = _convert_layers(nn.ModuleList(raw_layers), full.config)
+        # For BLOOM/GPT models, don't use OptimizedLlamaDecoderLayer (incompatible architecture)
+        # For LLaMA-style models, try to use OptimizedLlamaDecoderLayer if available
+        self.is_gpt_style = is_gpt_style  # Store for use in forward method
+        if is_gpt_style:
+            # BLOOM/GPT models: use original layers without optimization
+            self.layers = nn.ModuleList(raw_layers)
+            logger.info(f"Stage0 initialized with {len(self.layers)} layers (end={end}) for GPT-style model (BLOOM/GPT)")
+        else:
+            # LLaMA-style models: try to convert to OptimizedLlamaDecoderLayer
+            self.layers = _convert_layers(nn.ModuleList(raw_layers), full.config)
         self.config = full.config
         
-        # Log layer status
-        quantized_layers = sum(1 for layer in self.layers if _has_quantized_layers(layer))
-        if OPT_AVAILABLE and OptimizedLlamaDecoderLayer is not None:
-            optimized_layers = sum(1 for layer in self.layers if isinstance(layer, OptimizedLlamaDecoderLayer))
-            logger.info(
-                f"Stage0 initialized with {len(self.layers)} layers (end={end}): "
-                f"{quantized_layers} quantized, {optimized_layers} OptimizedLlamaDecoderLayer"
-            )
-        else:
-            logger.info(
-                f"Stage0 initialized with {len(self.layers)} layers (end={end}): "
-                f"{quantized_layers} quantized"
-            )
+        # Log layer status (only for LLaMA-style models)
+        if not is_gpt_style:
+            quantized_layers = sum(1 for layer in self.layers if _has_quantized_layers(layer))
+            if OPT_AVAILABLE and OptimizedLlamaDecoderLayer is not None:
+                optimized_layers = sum(1 for layer in self.layers if isinstance(layer, OptimizedLlamaDecoderLayer))
+                logger.info(
+                    f"Stage0 initialized with {len(self.layers)} layers (end={end}): "
+                    f"{quantized_layers} quantized, {optimized_layers} OptimizedLlamaDecoderLayer"
+                )
+            else:
+                logger.info(
+                    f"Stage0 initialized with {len(self.layers)} layers (end={end}): "
+                    f"{quantized_layers} quantized"
+                )
 
     def forward(
         self,
@@ -419,24 +434,40 @@ class Stage0(nn.Module):
         use_cache: bool = True,
     ):
         x = self.embed_tokens(input_ids)
+        # Add positional embeddings for GPT-style models (BLOOM, GPT-2)
+        if self.pos_embed is not None:
+            if position_ids is None:
+                # Generate position_ids if not provided
+                seq_length = input_ids.shape[1]
+                position_ids = torch.arange(seq_length, dtype=torch.long, device=input_ids.device).unsqueeze(0)
+            x = x + self.pos_embed(position_ids)
         cache_obj = None
         tuple_cache = []
 
         for i, layer in enumerate(self.layers):
             layer_past = None if past_key_values is None else past_key_values[i]
-            layer_pos = position_ids if position_ids is not None else default_position_ids(
-                layer_past, x.shape[1], x.device
-            )
-            # Use standard layer forward
-            # OptimizedLlamaDecoderLayer (including quantized ones) properly returns KV cache
-            out = layer(
-                x,
-                attention_mask=None,
-                position_ids=layer_pos,
-                past_key_value=_to_cache(layer_past),
-                use_cache=use_cache,
-                output_attentions=False,
-            )
+            # BLOOM/GPT models don't use position_ids, LLaMA-style models do
+            if self.is_gpt_style:
+                # BLOOM/GPT models: use layer_past format, no position_ids
+                out = layer(
+                    x,
+                    attention_mask=attention_mask,
+                    layer_past=_to_cache(layer_past),
+                    use_cache=use_cache,
+                )
+            else:
+                # LLaMA-style models: use position_ids and past_key_value
+                layer_pos = position_ids if position_ids is not None else default_position_ids(
+                    layer_past, x.shape[1], x.device
+                )
+                out = layer(
+                    x,
+                    attention_mask=None,
+                    position_ids=layer_pos,
+                    past_key_value=_to_cache(layer_past),
+                    use_cache=use_cache,
+                    output_attentions=False,
+                )
             
             # Validate output structure
             if not isinstance(out, (tuple, list)) or len(out) == 0:
@@ -480,38 +511,50 @@ class Stage0(nn.Module):
 
 
 class StageSegment(nn.Module):
-    """LLaMA-only middle segment; keep Cache end-to-end."""
+    """Middle segment for LLaMA-style and GPT-style (BLOOM) models; keep Cache end-to-end."""
 
     def __init__(self, full, start: int, end: int):
         super().__init__()
         model_type = getattr(full.config, "model_type", "").lower()
-        if "llama" not in model_type and "mistral" not in model_type and "mixtral" not in model_type and "qwen" not in model_type:
-            raise ValueError("Only LLaMA-style models (LLaMA, Mistral, Mixtral, Qwen) are supported in StageSegment.")
+        is_llama_style = "llama" in model_type or "mistral" in model_type or "mixtral" in model_type or "qwen" in model_type
+        is_gpt_style = "bloom" in model_type or "gpt" in model_type
+        if not is_llama_style and not is_gpt_style:
+            raise ValueError(f"Unsupported model type: {model_type}. Supported: LLaMA-style (llama, mistral, mixtral, qwen) or GPT-style (bloom, gpt)")
 
         if hasattr(full, "model") and hasattr(full.model, "layers"):
             raw_layers = full.model.layers  # already pruned in load_stage_model
         elif hasattr(full, "transformer") and hasattr(full.transformer, "h"):
             raw_layers = full.transformer.h  # already pruned in load_stage_model
         else:
-            raise ValueError(f"Unsupported LLaMA architecture: {type(full)}.")
+            raise ValueError(f"Unsupported model architecture: {type(full)}. Expected LLaMA-style (model.layers) or GPT-style (transformer.h)")
 
-        self.layers = _convert_layers(nn.ModuleList(raw_layers), full.config)
+        # For BLOOM/GPT models, don't use OptimizedLlamaDecoderLayer (incompatible architecture)
+        self.is_gpt_style = is_gpt_style  # Store for use in forward method
+        if is_gpt_style:
+            self.layers = nn.ModuleList(raw_layers)
+        else:
+            self.layers = _convert_layers(nn.ModuleList(raw_layers), full.config)
         self.config = full.config
         if len(self.layers) == 0:
             logger.warning(f"StageSegment initialized with 0 layers (start={start}, end={end})")
         else:
-            # Log layer status
-            quantized_layers = sum(1 for layer in self.layers if _has_quantized_layers(layer))
-            if OPT_AVAILABLE and OptimizedLlamaDecoderLayer is not None:
-                optimized_layers = sum(1 for layer in self.layers if isinstance(layer, OptimizedLlamaDecoderLayer))
-                logger.info(
-                    f"StageSegment initialized with {len(self.layers)} layers (start={start}, end={end}): "
-                    f"{quantized_layers} quantized, {optimized_layers} OptimizedLlamaDecoderLayer"
-                )
+            # Log layer status (only for LLaMA-style models)
+            if not is_gpt_style:
+                quantized_layers = sum(1 for layer in self.layers if _has_quantized_layers(layer))
+                if OPT_AVAILABLE and OptimizedLlamaDecoderLayer is not None:
+                    optimized_layers = sum(1 for layer in self.layers if isinstance(layer, OptimizedLlamaDecoderLayer))
+                    logger.info(
+                        f"StageSegment initialized with {len(self.layers)} layers (start={start}, end={end}): "
+                        f"{quantized_layers} quantized, {optimized_layers} OptimizedLlamaDecoderLayer"
+                    )
+                else:
+                    logger.info(
+                        f"StageSegment initialized with {len(self.layers)} layers (start={start}, end={end}): "
+                        f"{quantized_layers} quantized"
+                    )
             else:
                 logger.info(
-                    f"StageSegment initialized with {len(self.layers)} layers (start={start}, end={end}): "
-                    f"{quantized_layers} quantized"
+                    f"StageSegment initialized with {len(self.layers)} layers (start={start}, end={end}) for GPT-style model (BLOOM/GPT)"
                 )
 
     def forward(
@@ -527,19 +570,28 @@ class StageSegment(nn.Module):
 
         for i, layer in enumerate(self.layers):
             layer_past = None if past_key_values is None else past_key_values[i]
-            layer_pos = position_ids if position_ids is not None else default_position_ids(
-                layer_past, x.shape[1], x.device
-            )
-            # Use standard layer forward
-            # OptimizedLlamaDecoderLayer (including quantized ones) properly returns KV cache
-            out = layer(
-                x,
-                attention_mask=None,
-                position_ids=layer_pos,
-                past_key_value=_to_cache(layer_past),
-                use_cache=use_cache,
-                output_attentions=False,
-            )
+            # BLOOM/GPT models don't use position_ids, LLaMA-style models do
+            if self.is_gpt_style:
+                # BLOOM/GPT models: use layer_past format, no position_ids
+                out = layer(
+                    x,
+                    attention_mask=attention_mask,
+                    layer_past=_to_cache(layer_past),
+                    use_cache=use_cache,
+                )
+            else:
+                # LLaMA-style models: use position_ids and past_key_value
+                layer_pos = position_ids if position_ids is not None else default_position_ids(
+                    layer_past, x.shape[1], x.device
+                )
+                out = layer(
+                    x,
+                    attention_mask=None,
+                    position_ids=layer_pos,
+                    past_key_value=_to_cache(layer_past),
+                    use_cache=use_cache,
+                    output_attentions=False,
+                )
             
             # Validate output structure
             if not isinstance(out, (tuple, list)) or len(out) == 0:
@@ -577,13 +629,15 @@ class StageSegment(nn.Module):
 
 
 class StageLast(nn.Module):
-    """LLaMA-only last stage; keep Cache end-to-end."""
+    """Last stage for LLaMA-style and GPT-style (BLOOM) models; keep Cache end-to-end."""
 
     def __init__(self, full, start: int):
         super().__init__()
         model_type = getattr(full.config, "model_type", "").lower()
-        if "llama" not in model_type and "mistral" not in model_type and "mixtral" not in model_type and "qwen" not in model_type:
-            raise ValueError("Only LLaMA-style models (LLaMA, Mistral, Mixtral, Qwen) are supported in StageLast.")
+        is_llama_style = "llama" in model_type or "mistral" in model_type or "mixtral" in model_type or "qwen" in model_type
+        is_gpt_style = "bloom" in model_type or "gpt" in model_type
+        if not is_llama_style and not is_gpt_style:
+            raise ValueError(f"Unsupported model type: {model_type}. Supported: LLaMA-style (llama, mistral, mixtral, qwen) or GPT-style (bloom, gpt)")
 
         if hasattr(full, "model") and hasattr(full.model, "layers"):
             raw_layers = full.model.layers  # already pruned in load_stage_model
@@ -597,24 +651,34 @@ class StageLast(nn.Module):
             raw_layers = full.transformer.h  # already pruned in load_stage_model
             self.norm = full.transformer.ln_f
         else:
-            raise ValueError(f"Unsupported LLaMA architecture: {type(full)}.")
+            raise ValueError(f"Unsupported model architecture: {type(full)}. Expected LLaMA-style (model.layers) or GPT-style (transformer.h)")
 
-        self.layers = _convert_layers(nn.ModuleList(raw_layers), full.config)
+        # For BLOOM/GPT models, don't use OptimizedLlamaDecoderLayer (incompatible architecture)
+        self.is_gpt_style = is_gpt_style  # Store for use in forward method
+        if is_gpt_style:
+            self.layers = nn.ModuleList(raw_layers)
+        else:
+            self.layers = _convert_layers(nn.ModuleList(raw_layers), full.config)
         self.lm_head = full.lm_head
         self.config = full.config
         
-        # Log layer status
-        quantized_layers = sum(1 for layer in self.layers if _has_quantized_layers(layer))
-        if OPT_AVAILABLE and OptimizedLlamaDecoderLayer is not None:
-            optimized_layers = sum(1 for layer in self.layers if isinstance(layer, OptimizedLlamaDecoderLayer))
-            logger.info(
-                f"StageLast initialized with {len(self.layers)} layers (start={start}): "
-                f"{quantized_layers} quantized, {optimized_layers} OptimizedLlamaDecoderLayer"
-            )
+        # Log layer status (only for LLaMA-style models)
+        if not is_gpt_style:
+            quantized_layers = sum(1 for layer in self.layers if _has_quantized_layers(layer))
+            if OPT_AVAILABLE and OptimizedLlamaDecoderLayer is not None:
+                optimized_layers = sum(1 for layer in self.layers if isinstance(layer, OptimizedLlamaDecoderLayer))
+                logger.info(
+                    f"StageLast initialized with {len(self.layers)} layers (start={start}): "
+                    f"{quantized_layers} quantized, {optimized_layers} OptimizedLlamaDecoderLayer"
+                )
+            else:
+                logger.info(
+                    f"StageLast initialized with {len(self.layers)} layers (start={start}): "
+                    f"{quantized_layers} quantized"
+                )
         else:
             logger.info(
-                f"StageLast initialized with {len(self.layers)} layers (start={start}): "
-                f"{quantized_layers} quantized"
+                f"StageLast initialized with {len(self.layers)} layers (start={start}) for GPT-style model (BLOOM/GPT)"
             )
 
     def forward(
@@ -630,19 +694,28 @@ class StageLast(nn.Module):
 
         for i, layer in enumerate(self.layers):
             layer_past = None if past_key_values is None else past_key_values[i]
-            layer_pos = position_ids if position_ids is not None else default_position_ids(
-                layer_past, x.shape[1], x.device
-            )
-            # Use standard layer forward
-            # OptimizedLlamaDecoderLayer (including quantized ones) properly returns KV cache
-            out = layer(
-                x,
-                attention_mask=None,
-                position_ids=layer_pos,
-                past_key_value=_to_cache(layer_past),
-                use_cache=use_cache,
-                output_attentions=False,
-            )
+            # BLOOM/GPT models don't use position_ids, LLaMA-style models do
+            if self.is_gpt_style:
+                # BLOOM/GPT models: use layer_past format, no position_ids
+                out = layer(
+                    x,
+                    attention_mask=attention_mask,
+                    layer_past=_to_cache(layer_past),
+                    use_cache=use_cache,
+                )
+            else:
+                # LLaMA-style models: use position_ids and past_key_value
+                layer_pos = position_ids if position_ids is not None else default_position_ids(
+                    layer_past, x.shape[1], x.device
+                )
+                out = layer(
+                    x,
+                    attention_mask=None,
+                    position_ids=layer_pos,
+                    past_key_value=_to_cache(layer_past),
+                    use_cache=use_cache,
+                    output_attentions=False,
+                )
             
             # Validate output structure
             if not isinstance(out, (tuple, list)) or len(out) == 0:
