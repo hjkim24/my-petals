@@ -135,12 +135,18 @@ def _has_quantized_layers(layer: nn.Module) -> bool:
     """
     try:
         import bitsandbytes as bnb
-    except ImportError:
+    except (ImportError, RuntimeError):
+        # ImportError: bitsandbytes not installed
+        # RuntimeError: bitsandbytes CUDA setup failed
         return False
     
-    for module in layer.modules():
-        if isinstance(module, (bnb.nn.LinearNF4, bnb.nn.Linear8bitLt)):
-            return True
+    try:
+        for module in layer.modules():
+            if isinstance(module, (bnb.nn.LinearNF4, bnb.nn.Linear8bitLt)):
+                return True
+    except (AttributeError, RuntimeError):
+        # bitsandbytes가 설치되어 있지만 제대로 작동하지 않는 경우
+        return False
     return False
 
 
@@ -148,19 +154,25 @@ def _count_quantized_modules(layer: nn.Module) -> dict:
     """Count quantized modules in a layer."""
     try:
         import bitsandbytes as bnb
-    except ImportError:
+    except (ImportError, RuntimeError):
+        # ImportError: bitsandbytes not installed
+        # RuntimeError: bitsandbytes CUDA setup failed
         return {"int8": 0, "nf4": 0, "total": 0}
     
-    int8_count = 0
-    nf4_count = 0
-    
-    for module in layer.modules():
-        if isinstance(module, bnb.nn.Linear8bitLt):
-            int8_count += 1
-        elif isinstance(module, bnb.nn.LinearNF4):
-            nf4_count += 1
-    
-    return {"int8": int8_count, "nf4": nf4_count, "total": int8_count + nf4_count}
+    try:
+        int8_count = 0
+        nf4_count = 0
+        
+        for module in layer.modules():
+            if isinstance(module, bnb.nn.Linear8bitLt):
+                int8_count += 1
+            elif isinstance(module, bnb.nn.LinearNF4):
+                nf4_count += 1
+        
+        return {"int8": int8_count, "nf4": nf4_count, "total": int8_count + nf4_count}
+    except (AttributeError, RuntimeError):
+        # bitsandbytes가 설치되어 있지만 제대로 작동하지 않는 경우
+        return {"int8": 0, "nf4": 0, "total": 0}
 
 
 def _convert_layers(raw_layers: nn.ModuleList, config) -> nn.ModuleList:
