@@ -29,6 +29,8 @@ def main():
                        help="Nucleus sampling p")
     parser.add_argument("--top_k", type=int, default=50,
                        help="Top-k sampling")
+    parser.add_argument("--disable_eos", action="store_true",
+                       help="Disable EOS token generation (mask EOS token in sampling)")
     parser.add_argument("--use_cpu_offload", action="store_true",
                        help="Enable CPU offloading: keep model parameters on CPU and move to GPU only when needed")
     parser.add_argument("--keep_layers_on_gpu", type=int, default=0,
@@ -50,6 +52,7 @@ def main():
     temperature = args.temperature
     top_p = args.top_p
     top_k = args.top_k
+    disable_eos = args.disable_eos
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
@@ -222,6 +225,10 @@ def main():
             logits = outputs.logits  # [1, 1, vocab]
             past_key_values = outputs.past_key_values
             next_token_logits = logits[:, -1, :]  # [1, vocab]
+        
+        # EOS 토큰 마스킹 (disable_eos 옵션이 켜져있으면)
+        if args.disable_eos and eos_token_id is not None:
+            next_token_logits[0, eos_token_id] = float('-inf')
         
         # 샘플링 (temperature, top_p, top_k 적용)
         if temperature > 0:
