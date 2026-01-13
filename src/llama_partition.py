@@ -4,19 +4,23 @@ from enum import Enum
 
 import torch
 import torch.nn as nn
-from transformers import AutoModelForCausalLM
+from transformers import AutoModelForCausalLM, AutoConfig
 from transformers.models.llama.modeling_llama import LlamaDecoderLayer
+from transformers.models.llama.configuration_llama import LlamaConfig
 
 # Qwen 모델 지원을 위한 import (선택적)
 try:
     from transformers.models.qwen2.modeling_qwen2 import Qwen2DecoderLayer
+    from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
     QWEN_AVAILABLE = True
 except ImportError:
     try:
         from transformers.models.qwen.modeling_qwen import QwenDecoderLayer as Qwen2DecoderLayer
+        from transformers.models.qwen.configuration_qwen import QwenConfig as Qwen2Config
         QWEN_AVAILABLE = True
     except ImportError:
         Qwen2DecoderLayer = None
+        Qwen2Config = None
         QWEN_AVAILABLE = False
 
 from .utils import default_position_ids
@@ -175,6 +179,76 @@ def _count_quantized_modules(layer: nn.Module) -> dict:
         return {"int8": 0, "nf4": 0, "total": 0}
 
 
+def _convert_config_to_llama_config(config):
+    """
+    Convert Qwen2Config (or other LLaMA-compatible configs) to LlamaConfig
+    for use with OptimizedLlamaDecoderLayer.
+    
+    This creates a LlamaConfig with the same parameters as the original config,
+    ensuring compatibility with OptimizedLlamaDecoderLayer.
+    """
+    # If already LlamaConfig, return as-is
+    if isinstance(config, LlamaConfig):
+        return config
+    
+    # Check if it's a Qwen config
+    is_qwen_config = QWEN_AVAILABLE and isinstance(config, Qwen2Config)
+    
+    if is_qwen_config or getattr(config, "model_type", "").lower() in ["qwen", "qwen2"]:
+        # Create LlamaConfig from Qwen2Config parameters
+        llama_config = LlamaConfig(
+            vocab_size=getattr(config, 'vocab_size', 151936),
+            hidden_size=config.hidden_size,
+            intermediate_size=config.intermediate_size,
+            num_hidden_layers=config.num_hidden_layers,
+            num_attention_heads=config.num_attention_heads,
+            num_key_value_heads=getattr(config, 'num_key_value_heads', config.num_attention_heads),
+            hidden_act=config.hidden_act,
+            max_position_embeddings=getattr(config, 'max_position_embeddings', 32768),
+            initializer_range=getattr(config, 'initializer_range', 0.02),
+            rms_norm_eps=config.rms_norm_eps,
+            use_cache=getattr(config, 'use_cache', True),
+            pad_token_id=getattr(config, 'pad_token_id', None),
+            bos_token_id=getattr(config, 'bos_token_id', None),
+            eos_token_id=getattr(config, 'eos_token_id', None),
+            tie_word_embeddings=getattr(config, 'tie_word_embeddings', False),
+            rope_theta=getattr(config, 'rope_theta', 10000.0),
+            attention_bias=False,  # Qwen doesn't use attention bias
+            pretraining_tp=1,     # Default: no tensor parallelism
+        )
+        logger.debug(f"Converted Qwen2Config to LlamaConfig for OptimizedLlamaDecoderLayer compatibility")
+        return llama_config
+    
+    # For other configs, try to create LlamaConfig with available attributes
+    # This is a fallback for other LLaMA-compatible models
+    try:
+        llama_config = LlamaConfig(
+            vocab_size=getattr(config, 'vocab_size', 32000),
+            hidden_size=config.hidden_size,
+            intermediate_size=config.intermediate_size,
+            num_hidden_layers=config.num_hidden_layers,
+            num_attention_heads=config.num_attention_heads,
+            num_key_value_heads=getattr(config, 'num_key_value_heads', config.num_attention_heads),
+            hidden_act=getattr(config, 'hidden_act', 'silu'),
+            max_position_embeddings=getattr(config, 'max_position_embeddings', 2048),
+            initializer_range=getattr(config, 'initializer_range', 0.02),
+            rms_norm_eps=getattr(config, 'rms_norm_eps', 1e-6),
+            use_cache=getattr(config, 'use_cache', True),
+            attention_bias=False,
+            pretraining_tp=1,
+        )
+        logger.debug(f"Converted {type(config).__name__} to LlamaConfig for OptimizedLlamaDecoderLayer compatibility")
+        return llama_config
+    except Exception as e:
+        logger.warning(f"Failed to convert config to LlamaConfig: {e}. Using original config.")
+        # Fallback: add missing attributes to original config
+        if not hasattr(config, 'attention_bias'):
+            config.attention_bias = False
+        if not hasattr(config, 'pretraining_tp'):
+            config.pretraining_tp = 1
+        return config
+
+
 def _convert_layers(raw_layers: nn.ModuleList, config) -> nn.ModuleList:
     """
     Convert HF layers to OptimizedLlamaDecoderLayer if available.
@@ -187,6 +261,13 @@ def _convert_layers(raw_layers: nn.ModuleList, config) -> nn.ModuleList:
     quantized_converted = 0
     non_quantized_converted = 0
     already_optimized = 0
+    
+    # Convert config to LlamaConfig for OptimizedLlamaDecoderLayer compatibility
+    # This ensures Qwen2Config and other LLaMA-compatible configs work properly
+    if OPT_AVAILABLE:
+        optimized_config = _convert_config_to_llama_config(config)
+    else:
+        optimized_config = config
     
     for idx, layer in enumerate(raw_layers):
         if OPT_AVAILABLE:
@@ -204,7 +285,8 @@ def _convert_layers(raw_layers: nn.ModuleList, config) -> nn.ModuleList:
                     # For quantized layers, create OptimizedLlamaDecoderLayer and copy modules directly
                     # to avoid shape mismatch from load_state_dict
                     try:
-                        opt_layer = OptimizedLlamaDecoderLayer(config)
+                        # Use optimized_config (LlamaConfig) for OptimizedLlamaDecoderLayer
+                        opt_layer = OptimizedLlamaDecoderLayer(optimized_config)
                         orig_attn = layer.self_attn
                         opt_attn = opt_layer.self_attn
                         
@@ -245,7 +327,8 @@ def _convert_layers(raw_layers: nn.ModuleList, config) -> nn.ModuleList:
                         continue
                 else:
                     # Non-quantized: use standard conversion with load_state_dict
-                    opt_layer = OptimizedLlamaDecoderLayer(config)
+                    # Use optimized_config (LlamaConfig) for OptimizedLlamaDecoderLayer
+                    opt_layer = OptimizedLlamaDecoderLayer(optimized_config)
                     missing, unexpected = opt_layer.load_state_dict(layer.state_dict(), strict=False)
                     if missing or unexpected:
                         logger.warning(
