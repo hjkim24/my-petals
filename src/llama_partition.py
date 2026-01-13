@@ -93,15 +93,22 @@ def quantize_module(model: nn.Module, *, quant_type: QuantType, compute_dtype: O
                 compress_statistics = True
                 # compute_dtype이 지정되지 않으면 기본값 사용 (기본값은 float32)
                 # float16으로 설정하면 입력 dtype과 일치하여 경고 방지 및 성능 향상
-                nf4_kwargs = {
-                    "in_features": module.in_features,
-                    "out_features": module.out_features,
-                    "bias": module.bias is not None,
-                    "compress_statistics": compress_statistics,
-                }
+                # LinearNF4는 위치 인자로 input_features, output_features를 받음
                 if compute_dtype is not None:
-                    nf4_kwargs["compute_dtype"] = compute_dtype
-                model._modules[n] = bnb.nn.LinearNF4(**nf4_kwargs)
+                    model._modules[n] = bnb.nn.LinearNF4(
+                        module.in_features,
+                        module.out_features,
+                        bias=module.bias is not None,
+                        compress_statistics=compress_statistics,
+                        compute_dtype=compute_dtype,
+                    )
+                else:
+                    model._modules[n] = bnb.nn.LinearNF4(
+                        module.in_features,
+                        module.out_features,
+                        bias=module.bias is not None,
+                        compress_statistics=compress_statistics,
+                    )
                 model._modules[n].weight = bnb.nn.Params4bit(
                     module.weight.data,
                     requires_grad=False,
