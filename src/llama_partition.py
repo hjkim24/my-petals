@@ -7,6 +7,18 @@ import torch.nn as nn
 from transformers import AutoModelForCausalLM
 from transformers.models.llama.modeling_llama import LlamaDecoderLayer
 
+# Qwen 모델 지원을 위한 import (선택적)
+try:
+    from transformers.models.qwen2.modeling_qwen2 import Qwen2DecoderLayer
+    QWEN_AVAILABLE = True
+except ImportError:
+    try:
+        from transformers.models.qwen.modeling_qwen import QwenDecoderLayer as Qwen2DecoderLayer
+        QWEN_AVAILABLE = True
+    except ImportError:
+        Qwen2DecoderLayer = None
+        QWEN_AVAILABLE = False
+
 from .utils import default_position_ids
 
 logger = logging.getLogger(__name__)
@@ -171,7 +183,11 @@ def _convert_layers(raw_layers: nn.ModuleList, config) -> nn.ModuleList:
                 already_optimized += 1
                 continue
             
-            if isinstance(layer, LlamaDecoderLayer):
+            # Support both LlamaDecoderLayer and Qwen2DecoderLayer (Qwen2.5 uses LLaMA-based architecture)
+            is_llama_layer = isinstance(layer, LlamaDecoderLayer)
+            is_qwen_layer = QWEN_AVAILABLE and isinstance(layer, Qwen2DecoderLayer)
+            
+            if is_llama_layer or is_qwen_layer:
                 if _has_quantized_layers(layer):
                     # For quantized layers, create OptimizedLlamaDecoderLayer and copy modules directly
                     # to avoid shape mismatch from load_state_dict
@@ -269,8 +285,8 @@ class Stage0(nn.Module):
     def __init__(self, full, end: int):
         super().__init__()
         model_type = getattr(full.config, "model_type", "").lower()
-        if "llama" not in model_type and "mistral" not in model_type and "mixtral" not in model_type:
-            raise ValueError("Only LLaMA-style models are supported in Stage0.")
+        if "llama" not in model_type and "mistral" not in model_type and "mixtral" not in model_type and "qwen" not in model_type:
+            raise ValueError("Only LLaMA-style models (LLaMA, Mistral, Mixtral, Qwen) are supported in Stage0.")
 
         if hasattr(full, "model") and hasattr(full.model, "embed_tokens"):
             self.embed_tokens = full.model.embed_tokens
@@ -374,8 +390,8 @@ class StageSegment(nn.Module):
     def __init__(self, full, start: int, end: int):
         super().__init__()
         model_type = getattr(full.config, "model_type", "").lower()
-        if "llama" not in model_type and "mistral" not in model_type and "mixtral" not in model_type:
-            raise ValueError("Only LLaMA-style models are supported in StageSegment.")
+        if "llama" not in model_type and "mistral" not in model_type and "mixtral" not in model_type and "qwen" not in model_type:
+            raise ValueError("Only LLaMA-style models (LLaMA, Mistral, Mixtral, Qwen) are supported in StageSegment.")
 
         if hasattr(full, "model") and hasattr(full.model, "layers"):
             raw_layers = full.model.layers  # already pruned in load_stage_model
@@ -471,8 +487,8 @@ class StageLast(nn.Module):
     def __init__(self, full, start: int):
         super().__init__()
         model_type = getattr(full.config, "model_type", "").lower()
-        if "llama" not in model_type and "mistral" not in model_type and "mixtral" not in model_type:
-            raise ValueError("Only LLaMA-style models are supported in StageLast.")
+        if "llama" not in model_type and "mistral" not in model_type and "mixtral" not in model_type and "qwen" not in model_type:
+            raise ValueError("Only LLaMA-style models (LLaMA, Mistral, Mixtral, Qwen) are supported in StageLast.")
 
         if hasattr(full, "model") and hasattr(full.model, "layers"):
             raw_layers = full.model.layers  # already pruned in load_stage_model
