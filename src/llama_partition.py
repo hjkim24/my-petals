@@ -690,7 +690,7 @@ def load_stage_model(
     end: Optional[int] = None,
     dtype=torch.float16,
     quant_type: QuantType = QuantType.NONE,
-    use_selective_loading: bool = True,
+    use_selective_loading: bool = False,  # Disabled: causes OOM, use full download + pruning instead
 ):
     """
     Load only the layers needed for a stage to reduce memory (LLaMA-only).
