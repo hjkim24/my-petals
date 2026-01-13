@@ -837,17 +837,25 @@ def load_stage_model(
         logger.info("Building model structure with selectively loaded weights")
         
         # Create a modified config with only required layers (OOM 방지)
+        logger.info("Step 1/4: Creating stage config...")
         stage_config = _create_stage_config(config, role, start, end)
+        logger.info("Step 1/4: Stage config created successfully")
         
         # Create model structure with smaller config (메모리 절약)
+        logger.info("Step 2/4: Creating model structure from config (this may take a while)...")
         full = AutoModelForCausalLM.from_config(stage_config)
+        logger.info("Step 2/4: Model structure created successfully")
         
         # Remap state_dict keys to match the smaller model structure
         # (segment/last의 경우 layer indices를 0부터 시작하도록 재매핑)
+        logger.info("Step 3/4: Remapping state_dict keys to match model structure...")
         remapped_state_dict = _remap_state_dict_keys(selective_state_dict, role, start, end)
+        logger.info(f"Step 3/4: Remapped {len(remapped_state_dict)} tensor keys")
         
         # Load only the required weights
+        logger.info("Step 4/4: Loading weights into model structure (this may take a while)...")
         missing_keys, unexpected_keys = full.load_state_dict(remapped_state_dict, strict=False)
+        logger.info("Step 4/4: Weights loaded successfully")
         
         if missing_keys:
             logger.warning(f"Missing keys in selective loading: {len(missing_keys)} keys")
