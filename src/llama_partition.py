@@ -1,11 +1,24 @@
+import json
 import logging
-from typing import Optional, Tuple
+import os
+from pathlib import Path
+from typing import Dict, List, Optional, Set, Tuple
 from enum import Enum
 
 import torch
 import torch.nn as nn
-from transformers import AutoModelForCausalLM
+from transformers import AutoConfig, AutoModelForCausalLM
 from transformers.models.llama.modeling_llama import LlamaDecoderLayer
+from huggingface_hub import hf_hub_download, HfApi
+
+logger = logging.getLogger(__name__)
+
+try:
+    from safetensors import safe_open
+    SAFETENSORS_AVAILABLE = True
+except ImportError:
+    SAFETENSORS_AVAILABLE = False
+    # Don't warn here, will warn in function if needed
 
 from .utils import default_position_ids
 
@@ -574,6 +587,100 @@ class StageLast(nn.Module):
         return logits, tuple(tuple_cache)
 
 
+def _get_required_tensor_keys(role: str, start: int, end: Optional[int], config) -> Set[str]:
+    """
+    Get the set of tensor key prefixes required for a given stage.
+    Returns a set of tensor key prefixes that need to be loaded.
+    """
+    required_prefixes = set()
+    num_layers = config.num_hidden_layers
+    
+    # Embedding layers
+    if role == "stage0":
+        required_prefixes.add("model.embed_tokens")
+        # Layers from 0 to end
+        for i in range(end):
+            required_prefixes.add(f"model.layers.{i}.")
+    elif role == "segment":
+        # Layers from start to end
+        for i in range(start, end):
+            required_prefixes.add(f"model.layers.{i}.")
+    elif role == "last":
+        # Layers from start to end
+        for i in range(start, num_layers):
+            required_prefixes.add(f"model.layers.{i}.")
+        required_prefixes.add("model.norm")
+        required_prefixes.add("lm_head")
+    
+    return required_prefixes
+
+
+def _load_selective_weights(
+    model_name: str,
+    required_keys: Set[str],
+    cache_dir: Optional[str] = None,
+) -> Dict[str, torch.Tensor]:
+    """
+    Load only the required weights from sharded safetensors files.
+    Returns a state_dict with only the required tensors.
+    """
+    if not SAFETENSORS_AVAILABLE:
+        raise ImportError("safetensors is required for selective loading")
+    
+    try:
+        from transformers.utils import SAFE_WEIGHTS_INDEX_NAME, SAFE_WEIGHTS_NAME
+    except ImportError:
+        SAFE_WEIGHTS_INDEX_NAME = "model.safetensors.index.json"
+        SAFE_WEIGHTS_NAME = "model.safetensors"
+    
+    api = HfApi()
+    
+    # Try to get index file
+    try:
+        index_path = hf_hub_download(
+            repo_id=model_name,
+            filename=SAFE_WEIGHTS_INDEX_NAME,
+            cache_dir=cache_dir,
+        )
+        
+        with open(index_path, 'r') as f:
+            index_data = json.load(f)
+        
+        weight_map = index_data.get("weight_map", {})
+        state_dict = {}
+        
+        # Find which shard files contain our required keys
+        shard_files = set()
+        for tensor_key, shard_file in weight_map.items():
+            # Match keys that start with any required prefix
+            if any(tensor_key.startswith(req_prefix) for req_prefix in required_keys):
+                shard_files.add(shard_file)
+        
+        logger.info(f"Selective loading: {len(shard_files)} shard files needed for {len(required_keys)} required prefixes")
+        
+        # Download and load only required shard files
+        for shard_file in shard_files:
+            shard_path = hf_hub_download(
+                repo_id=model_name,
+                filename=shard_file,
+                cache_dir=cache_dir,
+            )
+            
+            with safe_open(shard_path, framework="pt", device="cpu") as f:
+                for tensor_key in f.keys():
+                    # Check if this tensor is needed (matches any required prefix)
+                    if any(tensor_key.startswith(req_prefix) for req_prefix in required_keys):
+                        state_dict[tensor_key] = f.get_tensor(tensor_key)
+        
+        logger.info(f"Selective loading: loaded {len(state_dict)} tensors")
+        return state_dict
+        
+    except Exception as e:
+        logger.warning(f"Selective loading failed: {e}, falling back to full download")
+        # Fallback: return empty dict to trigger full download
+        return {}
+
+
 def load_stage_model(
     model_name: str,
     device: torch.device,
@@ -583,6 +690,7 @@ def load_stage_model(
     end: Optional[int] = None,
     dtype=torch.float16,
     quant_type: QuantType = QuantType.NONE,
+    use_selective_loading: bool = True,
 ):
     """
     Load only the layers needed for a stage to reduce memory (LLaMA-only).
@@ -592,25 +700,67 @@ def load_stage_model(
       - 'last': keep layers[start:], norm, lm_head
     quant_type: Quantization type (QuantType.NONE, QuantType.INT8, or QuantType.NF4)
                 If quantization is enabled, model will be loaded on CPU, quantized, then moved to device
+    use_selective_loading: If True, try to download only required layers (requires safetensors)
     """
-    # Always load model on CPU first (required for quantization, and safe for normal loading)
-    # Try device_map="cpu" first, fallback to manual CPU loading if not supported
-    try:
-        full = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            torch_dtype=dtype,
-            low_cpu_mem_usage=True,
-            device_map="cpu"  # Explicitly load on CPU for quantization compatibility
-        )
-    except TypeError:
-        # Fallback for older transformers versions that don't support device_map="cpu"
-        logger.warning("device_map='cpu' not supported, loading model and moving to CPU manually")
-        full = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            torch_dtype=dtype,
-            low_cpu_mem_usage=True,
-        )
+    # Load config first (always needed)
+    config = AutoConfig.from_pretrained(model_name)
+    
+    # Try selective loading if enabled and safetensors is available
+    selective_state_dict = None
+    if use_selective_loading and SAFETENSORS_AVAILABLE:
+        try:
+            required_keys = _get_required_tensor_keys(role, start, end, config)
+            logger.info(f"Attempting selective loading for {len(required_keys)} required keys")
+            selective_state_dict = _load_selective_weights(model_name, required_keys)
+            
+            if not selective_state_dict:
+                logger.info("Selective loading returned empty dict, falling back to full download")
+                selective_state_dict = None
+        except Exception as e:
+            logger.warning(f"Selective loading failed: {e}, falling back to full download")
+            selective_state_dict = None
+    
+    # If selective loading failed or is disabled, use full download
+    if selective_state_dict is None:
+        logger.info("Loading full model (will prune after loading)")
+        # Always load model on CPU first (required for quantization, and safe for normal loading)
+        # Try device_map="cpu" first, fallback to manual CPU loading if not supported
+        try:
+            full = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                torch_dtype=dtype,
+                low_cpu_mem_usage=True,
+                device_map="cpu"  # Explicitly load on CPU for quantization compatibility
+            )
+        except TypeError:
+            # Fallback for older transformers versions that don't support device_map="cpu"
+            logger.warning("device_map='cpu' not supported, loading model and moving to CPU manually")
+            full = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                torch_dtype=dtype,
+                low_cpu_mem_usage=True,
+            )
+            full = full.cpu()
+    else:
+        # Build model structure with selective weights
+        logger.info("Building model structure with selectively loaded weights")
+        # Create model structure without loading weights
+        full = AutoModelForCausalLM.from_config(config)
+        
+        # Load only the required weights
+        missing_keys, unexpected_keys = full.load_state_dict(selective_state_dict, strict=False)
+        
+        if missing_keys:
+            logger.warning(f"Missing keys in selective loading: {len(missing_keys)} keys")
+            logger.debug(f"First 10 missing keys: {missing_keys[:10]}")
+        if unexpected_keys:
+            logger.warning(f"Unexpected keys in selective loading: {len(unexpected_keys)} keys")
+        
+        # Move to CPU and set dtype
         full = full.cpu()
+        if dtype is not None:
+            full = full.to(dtype)
+    
     try:
         full.config.use_cache = True
     except Exception:
