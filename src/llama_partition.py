@@ -31,7 +31,7 @@ class QuantType(Enum):
     NF4 = 2  # 4-bit as in the QLoRA paper
 
 
-def quantize_module(model: nn.Module, *, quant_type: QuantType) -> nn.Module:
+def quantize_module(model: nn.Module, *, quant_type: QuantType, compute_dtype: Optional[torch.dtype] = None) -> nn.Module:
     """
     Quantize a model module by replacing Linear layers with quantized versions.
     This is based on the original Petals implementation.
@@ -39,6 +39,9 @@ def quantize_module(model: nn.Module, *, quant_type: QuantType) -> nn.Module:
     Args:
         model: The model module to quantize
         quant_type: Type of quantization (INT8 or NF4)
+        compute_dtype: Compute dtype for NF4 quantization (e.g., torch.float16).
+                      If None, uses default (torch.float32). Setting to float16
+                      matches input dtype and avoids warnings.
     
     Returns:
         The quantized model (modified in-place)
@@ -56,7 +59,7 @@ def quantize_module(model: nn.Module, *, quant_type: QuantType) -> nn.Module:
     
     for n, module in model.named_children():
         if len(list(module.children())) > 0:
-            quantize_module(module, quant_type=quant_type)
+            quantize_module(module, quant_type=quant_type, compute_dtype=compute_dtype)
 
         # Skip critical projection layers used for KV cache correctness
         # q_proj / k_proj / v_proj / o_proj must stay in higher precision
@@ -88,12 +91,17 @@ def quantize_module(model: nn.Module, *, quant_type: QuantType) -> nn.Module:
                 ).to(module.weight.dtype)
             elif quant_type == QuantType.NF4:
                 compress_statistics = True
-                model._modules[n] = bnb.nn.LinearNF4(
-                    module.in_features,
-                    module.out_features,
-                    module.bias is not None,
-                    compress_statistics=compress_statistics,
-                )
+                # compute_dtype이 지정되지 않으면 기본값 사용 (기본값은 float32)
+                # float16으로 설정하면 입력 dtype과 일치하여 경고 방지 및 성능 향상
+                nf4_kwargs = {
+                    "in_features": module.in_features,
+                    "out_features": module.out_features,
+                    "bias": module.bias is not None,
+                    "compress_statistics": compress_statistics,
+                }
+                if compute_dtype is not None:
+                    nf4_kwargs["compute_dtype"] = compute_dtype
+                model._modules[n] = bnb.nn.LinearNF4(**nf4_kwargs)
                 model._modules[n].weight = bnb.nn.Params4bit(
                     module.weight.data,
                     requires_grad=False,
