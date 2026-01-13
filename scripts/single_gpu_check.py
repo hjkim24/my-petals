@@ -77,6 +77,16 @@ def main():
     
     # 양자화가 필요한 경우 CPU에 로드 (양자화는 CPU에서 수행)
     if quant_type != QuantType.NONE:
+        # bitsandbytes compute dtype 설정 (입력 dtype과 일치시켜 경고 방지)
+        try:
+            import bitsandbytes as bnb
+            if quant_type == QuantType.NF4:
+                # 4bit 양자화: compute dtype을 float16으로 설정 (입력 dtype과 일치)
+                bnb.nn.modules.BNBLinear.compute_dtype = torch.float16
+                print("Set bitsandbytes 4bit compute dtype to float16")
+        except ImportError:
+            pass
+        
         print("Loading model on CPU for quantization...")
         model = AutoModelForCausalLM.from_pretrained(
             model_name,
