@@ -60,6 +60,18 @@ def _get_local_ip() -> str:
         return "127.0.0.1"
 
 
+def _is_port_available(host: str, port: int) -> bool:
+    """Check if a port is available for binding."""
+    import socket
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind((host, port))
+            return True
+    except OSError:
+        return False
+
+
 def query_dht_nodes(dht: DHT, stage_key: str) -> List[Dict[str, Any]]:
     """
     Query DHT for all nodes registered under a stage key.
@@ -201,6 +213,21 @@ async def monitor_dht(
     initial_peers_list = _format_initial_peers(dht_initial_peers)
     local_ip = _get_local_ip()
     
+    # Check if port is available
+    logger.info(f"Checking if port {dht_port} is available on {local_ip}...")
+    if not _is_port_available(local_ip, dht_port):
+        logger.warning(f"Port {dht_port} is not available. This might be due to:")
+        logger.warning(f"  1. Another process is using the port")
+        logger.warning(f"  2. Previous DHT instance didn't fully release the port (TIME_WAIT state)")
+        logger.warning(f"  3. Port is in TIME_WAIT state (usually clears in 30-60 seconds)")
+        logger.warning(f"")
+        logger.warning(f"Solutions:")
+        logger.warning(f"  - Wait 30-60 seconds and try again")
+        logger.warning(f"  - Use a different port with --dht_port")
+        logger.warning(f"  - Check for zombie processes: lsof -i :{dht_port} or netstat -an | grep {dht_port}")
+        logger.warning(f"")
+        logger.warning(f"Attempting to bind anyway (may fail)...")
+    
     # Initialize DHT (read-only, no model loading)
     logger.info(f"Connecting to DHT network on {local_ip}:{dht_port}")
     if initial_peers_list:
@@ -281,8 +308,12 @@ async def monitor_dht(
         logger.error(f"Error in monitoring loop: {e}", exc_info=True)
     finally:
         try:
+            logger.info("Shutting down DHT...")
             dht.shutdown()
             logger.info("DHT disconnected")
+            # Give the port some time to be released
+            logger.info("Waiting for port to be released...")
+            await asyncio.sleep(1.0)
         except Exception as e:
             logger.warning(f"Error shutting down DHT: {e}")
 

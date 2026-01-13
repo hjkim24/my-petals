@@ -10,7 +10,8 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-# 분산 추론용 import 제거 - 단일 GPU에서는 불필요
+# 양자화 관련 import
+from src.llama_partition import QuantType, quantize_module
 
 
 def main():
@@ -19,8 +20,8 @@ def main():
                        help="Model name or path")
     parser.add_argument("--prompt", type=str, default="Hello, how are you?",
                        help="Input prompt for text generation")
-    parser.add_argument("--dtype", type=str, default="fp16", choices=["fp16", "bf16", "fp32"],
-                       help="Model dtype: fp16 (default), bf16, fp32")
+    parser.add_argument("--dtype", type=str, default="fp16", choices=["fp16", "bf16", "fp32", "int4", "int8"],
+                       help="Model dtype: fp16 (default), bf16, fp32, int4 (NF4), int8")
     parser.add_argument("--max_new_tokens", type=int, default=64,
                        help="Maximum number of new tokens to generate")
     parser.add_argument("--temperature", type=float, default=1.0,
@@ -38,13 +39,23 @@ def main():
     
     args = parser.parse_args()
     
-    # dtype 변환
+    # dtype 변환 및 양자화 타입 결정
     dtype_map = {
         "fp16": torch.float16,
         "bf16": torch.bfloat16,
         "fp32": torch.float32,
     }
-    dtype = dtype_map[args.dtype]
+    
+    # 양자화 타입 결정
+    if args.dtype == "int4":
+        quant_type = QuantType.NF4
+        dtype = torch.float16  # 양자화 시 base dtype은 fp16 사용
+    elif args.dtype == "int8":
+        quant_type = QuantType.INT8
+        dtype = torch.float16  # 양자화 시 base dtype은 fp16 사용
+    else:
+        quant_type = QuantType.NONE
+        dtype = dtype_map[args.dtype]
     
     model_name = args.model
     prompt = args.prompt
@@ -60,16 +71,58 @@ def main():
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
     
-    # 모델 로드 (CPU 오프로딩 지원)
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        torch_dtype=dtype,
-        low_cpu_mem_usage=True,
-    )
+    # 모델 로드 (양자화를 위해 항상 CPU에 먼저 로드)
+    print(f"Loading model: {model_name}")
+    print(f"Quantization: {quant_type.name if quant_type != QuantType.NONE else 'None'}")
+    
+    # 양자화가 필요한 경우 CPU에 로드 (양자화는 CPU에서 수행)
+    if quant_type != QuantType.NONE:
+        print("Loading model on CPU for quantization...")
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            torch_dtype=dtype,
+            low_cpu_mem_usage=True,
+            device_map="cpu",  # 양자화를 위해 CPU에 로드
+        )
+        
+        # 양자화 적용
+        print(f"Applying {quant_type.name} quantization...")
+        model = quantize_module(model, quant_type=quant_type)
+        
+        # 양자화 검증
+        try:
+            import bitsandbytes as bnb
+            quantized_modules = []
+            linear_modules = []
+            for name, m in model.named_modules():
+                if isinstance(m, torch.nn.Linear):
+                    linear_modules.append(name)
+                if isinstance(m, (bnb.nn.LinearNF4, bnb.nn.Linear8bitLt)):
+                    quantized_modules.append(name)
+            
+            total_quantized = len(quantized_modules)
+            total_linear = len(linear_modules)
+            quant_ratio = (total_quantized / total_linear * 100) if total_linear > 0 else 0
+            
+            print(f"Quantization verification: {total_quantized} quantized Linear layers "
+                  f"out of {total_linear} total Linear layers ({quant_ratio:.1f}%)")
+        except ImportError:
+            pass
+        
+        print(f"Quantization with {quant_type.name} completed")
+    else:
+        # 양자화 없이 일반 로드
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            torch_dtype=dtype,
+            low_cpu_mem_usage=True,
+        )
     
     if args.use_cpu_offload:
         # CPU 오프로딩 모드: 모델을 CPU에 로드하고 forward 시 필요한 레이어만 GPU로 이동
-        model = model.to(torch.device("cpu"))
+        # 양자화된 모델은 이미 CPU에 있으므로 이동 불필요
+        if quant_type == QuantType.NONE:
+            model = model.to(torch.device("cpu"))
         
         # 레이어 접근 (LLaMA 구조)
         if hasattr(model, "model") and hasattr(model.model, "layers"):
@@ -164,7 +217,13 @@ def main():
         print(f"CPU offloading enabled: Model loaded with lazy GPU loading (keep {args.keep_layers_on_gpu} layers on GPU)")
     else:
         # 일반 모드: 전체 모델을 GPU에 로드
-        model = model.to(device)
+        # 양자화된 모델은 bitsandbytes가 자동으로 device placement 처리
+        if quant_type == QuantType.NONE:
+            model = model.to(device)
+        else:
+            # 양자화된 모델은 GPU로 이동 (bitsandbytes가 자동 처리)
+            print("Moving quantized model to GPU (bitsandbytes will handle device placement)...")
+            model = model.to(device)
     
     model.eval()
     
