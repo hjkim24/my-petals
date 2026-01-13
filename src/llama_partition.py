@@ -738,23 +738,32 @@ def _load_selective_weights(
             if any(tensor_key.startswith(req_prefix) for req_prefix in required_keys):
                 shard_files.add(shard_file)
         
-        logger.info(f"Selective loading: {len(shard_files)} shard files needed for {len(required_keys)} required prefixes")
+        shard_files = sorted(shard_files)  # 정렬하여 일관된 순서 보장
+        total_shards = len(shard_files)
+        logger.info(f"Selective loading: {total_shards} shard files needed for {len(required_keys)} required prefixes")
+        logger.info(f"Selective loading: Starting download of {total_shards} shard files...")
         
         # Download and load only required shard files
-        for shard_file in shard_files:
+        for idx, shard_file in enumerate(shard_files, 1):
+            logger.info(f"Selective loading: Downloading shard {idx}/{total_shards}: {shard_file}")
             shard_path = hf_hub_download(
                 repo_id=model_name,
                 filename=shard_file,
                 cache_dir=cache_dir,
             )
+            logger.info(f"Selective loading: Shard {idx}/{total_shards} downloaded/loaded from cache: {shard_path}")
             
+            logger.info(f"Selective loading: Loading tensors from shard {idx}/{total_shards}...")
+            tensors_loaded_from_shard = 0
             with safe_open(shard_path, framework="pt", device="cpu") as f:
                 for tensor_key in f.keys():
                     # Check if this tensor is needed (matches any required prefix)
                     if any(tensor_key.startswith(req_prefix) for req_prefix in required_keys):
                         state_dict[tensor_key] = f.get_tensor(tensor_key)
+                        tensors_loaded_from_shard += 1
+            logger.info(f"Selective loading: Loaded {tensors_loaded_from_shard} tensors from shard {idx}/{total_shards}")
         
-        logger.info(f"Selective loading: loaded {len(state_dict)} tensors")
+        logger.info(f"Selective loading: Completed! Loaded {len(state_dict)} total tensors from {total_shards} shard files")
         return state_dict
         
     except Exception as e:
