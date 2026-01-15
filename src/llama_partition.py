@@ -306,14 +306,21 @@ class Stage0(nn.Module):
             raise ValueError("Only LLaMA-style models are supported in Stage0.")
 
         if hasattr(full, "model") and hasattr(full.model, "embed_tokens"):
+            # LLaMA-style
             self.embed_tokens = full.model.embed_tokens
             raw_layers = full.model.layers  # already pruned in load_stage_model
         elif hasattr(full, "transformer") and hasattr(full.transformer, "wte"):
+            # GPT-2 style (with wte)
             self.embed_tokens = full.transformer.wte
             self.pos_embed = getattr(full.transformer, "wpe", None)
             raw_layers = full.transformer.h  # already pruned in load_stage_model
+        elif hasattr(full, "transformer") and hasattr(full.transformer, "word_embeddings"):
+            # BLOOM style (with word_embeddings)
+            self.embed_tokens = full.transformer.word_embeddings
+            self.pos_embed = None  # BLOOM doesn't have positional embeddings
+            raw_layers = full.transformer.h  # already pruned in load_stage_model
         else:
-            raise ValueError(f"Unsupported LLaMA architecture: {type(full)}.")
+            raise ValueError(f"Unsupported architecture: {type(full)}.")
 
         self.layers = _convert_layers(nn.ModuleList(raw_layers), full.config)
         self.config = full.config
@@ -407,8 +414,10 @@ class StageSegment(nn.Module):
     def __init__(self, full, start: int, end: int):
         super().__init__()
         model_type = getattr(full.config, "model_type", "").lower()
-        if "llama" not in model_type and "mistral" not in model_type and "mixtral" not in model_type:
-            raise ValueError("Only LLaMA-style models are supported in StageSegment.")
+        # Support LLaMA, Mistral, Mixtral, and BLOOM models
+        is_supported = ("llama" in model_type or "mistral" in model_type or "mixtral" in model_type or "bloom" in model_type)
+        if not is_supported:
+            raise ValueError(f"Unsupported model type '{model_type}' in StageSegment. Supported: LLaMA, Mistral, Mixtral, BLOOM.")
 
         if hasattr(full, "model") and hasattr(full.model, "layers"):
             raw_layers = full.model.layers  # already pruned in load_stage_model
@@ -504,8 +513,10 @@ class StageLast(nn.Module):
     def __init__(self, full, start: int):
         super().__init__()
         model_type = getattr(full.config, "model_type", "").lower()
-        if "llama" not in model_type and "mistral" not in model_type and "mixtral" not in model_type:
-            raise ValueError("Only LLaMA-style models are supported in StageLast.")
+        # Support LLaMA, Mistral, Mixtral, and BLOOM models
+        is_supported = ("llama" in model_type or "mistral" in model_type or "mixtral" in model_type or "bloom" in model_type)
+        if not is_supported:
+            raise ValueError(f"Unsupported model type '{model_type}' in StageLast. Supported: LLaMA, Mistral, Mixtral, BLOOM.")
 
         if hasattr(full, "model") and hasattr(full.model, "layers"):
             raw_layers = full.model.layers  # already pruned in load_stage_model
@@ -1008,6 +1019,7 @@ def load_stage_model(
                 # Still on meta device, need to materialize manually using accelerate
                 logger.warning("Model still has meta tensors after load_state_dict, materializing to CPU...")
                 from accelerate.utils import set_module_tensor_to_device
+                materialized_count = 0
                 for name, tensor in remapped_state_dict.items():
                     try:
                         # Extract module path (everything except last part)
@@ -1016,12 +1028,24 @@ def load_stage_model(
                             module_path = ".".join(parts[:-1])
                             param_name = parts[-1]
                             set_module_tensor_to_device(full, module_path, param_name, "cpu", value=tensor)
+                            materialized_count += 1
                         else:
                             # Direct parameter (shouldn't happen for BLOOM/LLaMA)
                             setattr(full, name, tensor.to("cpu"))
+                            materialized_count += 1
                     except Exception as e:
                         logger.debug(f"Failed to materialize {name}: {e}")
-                logger.info("Meta tensors materialized to CPU")
+                logger.info(f"Materialized {materialized_count} tensors from meta to CPU")
+                
+                # Verify all tensors are now on CPU (not meta)
+                try:
+                    check_param = next(full.parameters())
+                    if check_param.device.type == "meta":
+                        logger.error("Some tensors are still on meta device after materialization!")
+                    else:
+                        logger.info("All tensors successfully materialized to CPU")
+                except StopIteration:
+                    pass
             else:
                 # Normal case: move to CPU
                 full = full.cpu()
@@ -1161,13 +1185,45 @@ def load_stage_model(
         # Quantized Linear layers will handle device placement during forward pass
         # But we need to move embeddings and other non-quantized components
         try:
-            # Move the entire model structure, bitsandbytes will handle quantized layers
-            full = full.to(device)
+            # Verify no meta tensors before moving
+            has_meta = False
+            try:
+                for param in full.parameters():
+                    if param.device.type == "meta":
+                        has_meta = True
+                        break
+            except:
+                pass
+            
+            if has_meta:
+                logger.error("Model still has meta tensors! Cannot move to device. This should not happen after materialization.")
+                raise RuntimeError("Model has meta tensors that were not materialized")
+            else:
+                # Move the entire model structure, bitsandbytes will handle quantized layers
+                full = full.to(device)
         except Exception as e:
             logger.warning(f"Failed to move quantized model to {device}: {e}. "
                          "Quantized layers may handle device placement automatically during forward pass.")
     else:
-        # Normal model: just move to device
-        full = full.to(device)
+        # Normal model: verify no meta tensors before moving
+        try:
+            has_meta = False
+            try:
+                for param in full.parameters():
+                    if param.device.type == "meta":
+                        has_meta = True
+                        break
+            except:
+                pass
+            
+            if has_meta:
+                logger.error("Model still has meta tensors! Cannot move to device. This should not happen after materialization.")
+                raise RuntimeError("Model has meta tensors that were not materialized")
+            else:
+                full = full.to(device)
+        except StopIteration:
+            logger.warning("Model has no parameters")
+        except Exception as e:
+            logger.warning(f"Failed to move model to {device}: {e}")
     
     return full
