@@ -69,16 +69,19 @@ def quantize_module(model: nn.Module, *, quant_type: QuantType, compute_dtype: O
         skip_names = {"lm_head", "score"}  # , "q_proj", "k_proj", "v_proj", "o_proj"}  # Commented out to enable attention quantization
 
         if isinstance(module, torch.nn.Linear) and n not in skip_names:
-            # Ensure the module is on CPU before quantization
-            # Note: We load the model on CPU initially, so this should already be on CPU
-            if module.weight.device.type != "cpu":
-                # If somehow on GPU, move to CPU first
-                logger.warning(
-                    f"Linear layer '{n}' is on {module.weight.device}, moving to CPU for quantization"
-                )
-                # Move the actual module in the model
-                model._modules[n] = module.cpu()
-                module = model._modules[n]
+            # Check if weight is on meta device (from device_map="auto")
+            if hasattr(module, 'weight') and hasattr(module.weight, 'device'):
+                if module.weight.device.type == "meta":
+                    logger.warning(f"Linear layer '{n}' is on meta device, skipping quantization (will be loaded later)")
+                    continue
+                elif module.weight.device.type != "cpu":
+                    # If somehow on GPU, move to CPU first
+                    logger.warning(
+                        f"Linear layer '{n}' is on {module.weight.device}, moving to CPU for quantization"
+                    )
+                    # Move the actual module in the model
+                    model._modules[n] = module.cpu()
+                    module = model._modules[n]
             
             if quant_type == QuantType.INT8:
                 model._modules[n] = bnb.nn.Linear8bitLt(
@@ -702,9 +705,10 @@ def _get_required_tensor_keys(role: str, start: int, end: Optional[int], config)
     
     # Determine layer prefix based on architecture
     if is_bloom:
-        layer_prefix = "transformer.h."
-        embed_prefix = "transformer.word_embeddings"
-        norm_prefix = "transformer.ln_f"
+        # BLOOM model uses "h.0." format (without "transformer." prefix in weight_map)
+        layer_prefix = "h."
+        embed_prefix = "word_embeddings"
+        norm_prefix = "ln_f"
         head_prefix = "lm_head"
     elif is_llama:
         layer_prefix = "model.layers."
@@ -899,30 +903,18 @@ def load_stage_model(
             try:
                 # Use accelerate's device_map="auto" with max_memory for better memory management
                 # This allows automatic offloading to disk when memory is constrained
-                try:
-                    full = AutoModelForCausalLM.from_pretrained(
-                        model_name,
-                        torch_dtype=dtype,
-                        low_cpu_mem_usage=True,
-                        device_map="auto",  # Auto device mapping with offloading
-                        max_memory=max_memory,  # 메모리 사용량 제한
-                        offload_folder=offload_folder,  # 디스크 오프로딩
-                        cache_dir=os.environ.get("HF_HOME") or os.environ.get("TRANSFORMERS_CACHE") or None,
-                        use_safetensors=True,  # safetensors 사용 (더 안전하고 메모리 효율적)
-                    )
-                except (TypeError, ValueError) as e:
-                    # Fallback to CPU-only with explicit offloading
-                    logger.warning(f"device_map='auto' failed: {e}, trying device_map='cpu'")
-                    full = AutoModelForCausalLM.from_pretrained(
-                        model_name,
-                        torch_dtype=dtype,
-                        low_cpu_mem_usage=True,
-                        device_map="cpu",  # Explicitly load on CPU for quantization compatibility
-                        max_memory=max_memory,  # 메모리 사용량 제한
-                        offload_folder=offload_folder,  # 디스크 오프로딩
-                        cache_dir=os.environ.get("HF_HOME") or os.environ.get("TRANSFORMERS_CACHE") or None,
-                        use_safetensors=True,
-                    )
+                # Use device_map="cpu" directly to avoid meta tensor issues
+                # device_map="auto" can leave some tensors on meta device which causes issues with quantization
+                full = AutoModelForCausalLM.from_pretrained(
+                    model_name,
+                    torch_dtype=dtype,
+                    low_cpu_mem_usage=True,
+                    device_map="cpu",  # Explicitly load on CPU for quantization compatibility
+                    max_memory=max_memory,  # 메모리 사용량 제한
+                    offload_folder=offload_folder,  # 디스크 오프로딩
+                    cache_dir=os.environ.get("HF_HOME") or os.environ.get("TRANSFORMERS_CACHE") or None,
+                    use_safetensors=True,  # safetensors 사용 (더 안전하고 메모리 효율적)
+                )
             except TypeError:
                 # Fallback for older transformers versions that don't support device_map
                 logger.warning("device_map not supported, loading model and moving to CPU manually")
@@ -1052,11 +1044,18 @@ def load_stage_model(
     if quant_type != QuantType.NONE:
         logger.info(f"Quantizing model with {quant_type.name}...")
         # Ensure model is on CPU for quantization
-        if next(full.parameters()).device.type != "cpu":
-            logger.warning("Moving model to CPU for quantization...")
-            full = full.cpu()
+        # Handle meta device tensors from device_map="auto"
+        try:
+            first_param = next(full.parameters())
+            if first_param.device.type == "meta":
+                logger.warning("Model has meta device tensors from device_map='auto', will skip meta tensors during quantization")
+            elif first_param.device.type != "cpu":
+                logger.warning("Moving model to CPU for quantization...")
+                full = full.cpu()
+        except StopIteration:
+            logger.warning("Model has no parameters, skipping quantization")
         
-        # Apply quantization
+        # Apply quantization (will skip meta device tensors)
         full = quantize_module(full, quant_type=quant_type)
         
         # Verify quantization was applied
