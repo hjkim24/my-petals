@@ -982,9 +982,17 @@ def load_stage_model(
         logger.info(f"Step 3/4: Remapped {len(remapped_state_dict)} tensor keys")
         
         # Load only the required weights
+        # Use assign=True when loading into meta device tensors (from init_empty_weights)
         logger.info("Step 4/4: Loading weights into model structure (this may take a while)...")
-        missing_keys, unexpected_keys = full.load_state_dict(remapped_state_dict, strict=False)
-        logger.info("Step 4/4: Weights loaded successfully")
+        try:
+            # Try with assign=True first (for meta device tensors)
+            missing_keys, unexpected_keys = full.load_state_dict(remapped_state_dict, strict=False, assign=True)
+            logger.info("Step 4/4: Weights loaded successfully (using assign=True for meta tensors)")
+        except TypeError:
+            # Fallback if assign parameter is not supported (older PyTorch versions)
+            logger.warning("assign=True not supported, trying without assign parameter")
+            missing_keys, unexpected_keys = full.load_state_dict(remapped_state_dict, strict=False)
+            logger.info("Step 4/4: Weights loaded successfully")
         
         if missing_keys:
             logger.warning(f"Missing keys in selective loading: {len(missing_keys)} keys")
@@ -993,7 +1001,33 @@ def load_stage_model(
             logger.warning(f"Unexpected keys in selective loading: {len(unexpected_keys)} keys")
         
         # Move to CPU and set dtype
-        full = full.cpu()
+        # After assign=True, check if tensors are still on meta device
+        try:
+            first_param = next(full.parameters())
+            if first_param.device.type == "meta":
+                # Still on meta device, need to materialize manually using accelerate
+                logger.warning("Model still has meta tensors after load_state_dict, materializing to CPU...")
+                from accelerate.utils import set_module_tensor_to_device
+                for name, tensor in remapped_state_dict.items():
+                    try:
+                        # Extract module path (everything except last part)
+                        parts = name.split(".")
+                        if len(parts) > 1:
+                            module_path = ".".join(parts[:-1])
+                            param_name = parts[-1]
+                            set_module_tensor_to_device(full, module_path, param_name, "cpu", value=tensor)
+                        else:
+                            # Direct parameter (shouldn't happen for BLOOM/LLaMA)
+                            setattr(full, name, tensor.to("cpu"))
+                    except Exception as e:
+                        logger.debug(f"Failed to materialize {name}: {e}")
+                logger.info("Meta tensors materialized to CPU")
+            else:
+                # Normal case: move to CPU
+                full = full.cpu()
+        except StopIteration:
+            logger.warning("Model has no parameters")
+        
         if dtype is not None:
             full = full.to(dtype)
     
