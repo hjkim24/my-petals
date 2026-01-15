@@ -78,12 +78,38 @@ def main():
     # 양자화가 필요한 경우 CPU에 로드 (양자화는 CPU에서 수행)
     if quant_type != QuantType.NONE:
         print("Loading model on CPU for quantization...")
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            torch_dtype=dtype,
-            low_cpu_mem_usage=True,
-            device_map="cpu",  # 양자화를 위해 CPU에 로드
-        )
+        # 대용량 모델 로딩을 위한 메모리 제한 및 디스크 오프로딩 설정
+        import psutil
+        import tempfile
+        import os
+        
+        available_memory = psutil.virtual_memory().available
+        # 다른 프로세스와 공유하므로 보수적으로 40%만 사용
+        max_memory_mb = int(available_memory * 0.4 / (1024 * 1024))
+        max_memory = {"cpu": f"{max_memory_mb}MiB"}
+        print(f"Available memory: {available_memory / (1024**3):.1f}GB, limiting to {max_memory_mb / 1024:.1f}GB (40% for safety)")
+        
+        # 디스크 오프로딩을 위한 임시 디렉토리 생성
+        offload_folder = tempfile.mkdtemp(prefix="model_offload_")
+        print(f"Using disk offloading folder: {offload_folder}")
+        
+        try:
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                torch_dtype=dtype,
+                low_cpu_mem_usage=True,
+                device_map="cpu",  # 양자화를 위해 CPU에 로드
+                max_memory=max_memory,  # 메모리 사용량 제한
+                offload_folder=offload_folder,  # 디스크 오프로딩
+            )
+        except Exception as e:
+            # 오프로딩 폴더 정리
+            import shutil
+            try:
+                shutil.rmtree(offload_folder)
+            except:
+                pass
+            raise e
         
         # 양자화 적용
         # 4bit 양자화의 경우 compute_dtype을 float16으로 설정하여 입력 dtype과 일치시킴
@@ -114,13 +140,55 @@ def main():
             pass
         
         print(f"Quantization with {quant_type.name} completed")
+        
+        # 양자화 완료 후 오프로딩 폴더 정리 (메모리 절약)
+        import shutil
+        try:
+            if 'offload_folder' in locals() and os.path.exists(offload_folder):
+                print(f"Cleaning up offload folder: {offload_folder}")
+                shutil.rmtree(offload_folder)
+        except Exception as e:
+            print(f"Warning: Failed to clean up offload folder: {e}")
     else:
         # 양자화 없이 일반 로드
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            torch_dtype=dtype,
-            low_cpu_mem_usage=True,
-        )
+        # CPU offload를 사용할 경우 메모리 제한 및 디스크 오프로딩 사용
+        if args.use_cpu_offload:
+            import psutil
+            import tempfile
+            
+            available_memory = psutil.virtual_memory().available
+            # 다른 프로세스와 공유하므로 보수적으로 40%만 사용
+            max_memory_mb = int(available_memory * 0.4 / (1024 * 1024))
+            max_memory = {"cpu": f"{max_memory_mb}MiB"}
+            print(f"Available memory: {available_memory / (1024**3):.1f}GB, limiting to {max_memory_mb / 1024:.1f}GB (40% for safety)")
+            
+            # 디스크 오프로딩을 위한 임시 디렉토리 생성
+            offload_folder = tempfile.mkdtemp(prefix="model_offload_")
+            print(f"Using disk offloading folder: {offload_folder}")
+            
+            try:
+                model = AutoModelForCausalLM.from_pretrained(
+                    model_name,
+                    torch_dtype=dtype,
+                    low_cpu_mem_usage=True,
+                    device_map="cpu",  # CPU에 직접 로드
+                    max_memory=max_memory,  # 메모리 사용량 제한
+                    offload_folder=offload_folder,  # 디스크 오프로딩
+                )
+            except Exception as e:
+                # 오프로딩 폴더 정리
+                import shutil
+                try:
+                    shutil.rmtree(offload_folder)
+                except:
+                    pass
+                raise e
+        else:
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                torch_dtype=dtype,
+                low_cpu_mem_usage=True,
+            )
     
     if args.use_cpu_offload:
         # CPU 오프로딩 모드: 모델을 CPU에 로드하고 forward 시 필요한 레이어만 GPU로 이동
