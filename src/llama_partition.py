@@ -690,27 +690,53 @@ def _get_required_tensor_keys(role: str, start: int, end: Optional[int], config)
     """
     Get the set of tensor key prefixes required for a given stage.
     Returns a set of tensor key prefixes that need to be loaded.
+    Supports both LLaMA-style (model.layers) and BLOOM-style (transformer.h) architectures.
     """
     required_prefixes = set()
     num_layers = config.num_hidden_layers
     
+    # Detect model architecture from config
+    model_type = getattr(config, "model_type", "").lower()
+    is_bloom = "bloom" in model_type
+    is_llama = "llama" in model_type or "mistral" in model_type or "mixtral" in model_type
+    
+    # Determine layer prefix based on architecture
+    if is_bloom:
+        layer_prefix = "transformer.h."
+        embed_prefix = "transformer.word_embeddings"
+        norm_prefix = "transformer.ln_f"
+        head_prefix = "lm_head"
+    elif is_llama:
+        layer_prefix = "model.layers."
+        embed_prefix = "model.embed_tokens"
+        norm_prefix = "model.norm"
+        head_prefix = "lm_head"
+    else:
+        # Default to LLaMA-style (backward compatibility)
+        layer_prefix = "model.layers."
+        embed_prefix = "model.embed_tokens"
+        norm_prefix = "model.norm"
+        head_prefix = "lm_head"
+        logger.warning(f"Unknown model type '{model_type}', assuming LLaMA-style architecture")
+    
     # Embedding layers
     if role == "stage0":
-        required_prefixes.add("model.embed_tokens")
+        required_prefixes.add(embed_prefix)
         # Layers from 0 to end
         for i in range(end):
-            required_prefixes.add(f"model.layers.{i}.")
+            required_prefixes.add(f"{layer_prefix}{i}.")
     elif role == "segment":
         # Layers from start to end
         for i in range(start, end):
-            required_prefixes.add(f"model.layers.{i}.")
+            required_prefixes.add(f"{layer_prefix}{i}.")
     elif role == "last":
         # Layers from start to end
         for i in range(start, num_layers):
-            required_prefixes.add(f"model.layers.{i}.")
-        required_prefixes.add("model.norm")
-        required_prefixes.add("lm_head")
+            required_prefixes.add(f"{layer_prefix}{i}.")
+        required_prefixes.add(norm_prefix)
+        required_prefixes.add(head_prefix)
     
+    logger.info(f"Detected model type: {model_type}, using layer prefix: {layer_prefix}")
     return required_prefixes
 
 
@@ -838,13 +864,14 @@ def load_stage_model(
         import shutil
         
         available_memory = psutil.virtual_memory().available
-        # BLOOM-176B는 매우 크므로 보수적으로 사용 가능한 메모리의 40%만 사용
-        # 최소 120GB는 보장 (BLOOM-176B INT4는 약 93.5GB 필요)
-        min_required_mb = 120 * 1024  # 최소 120GB
-        calculated_mb = int(available_memory * 0.4 / (1024 * 1024))
+        # BLOOM-176B는 매우 크므로 더 보수적으로 사용 가능한 메모리의 25%만 사용
+        # 전체 모델 로딩 중에는 더 많은 메모리가 필요하므로 더 낮게 설정
+        # 사용 가능한 메모리의 25%를 사용하되, 최소 80GB는 보장
+        min_required_mb = 80 * 1024  # 최소 80GB (더 보수적으로)
+        calculated_mb = int(available_memory * 0.25 / (1024 * 1024))
         max_memory_mb = max(min_required_mb, calculated_mb)
         max_memory = {"cpu": f"{max_memory_mb}MiB"}
-        logger.info(f"Available memory: {available_memory / (1024**3):.1f}GB, limiting to {max_memory_mb / 1024:.1f}GB")
+        logger.info(f"Available memory: {available_memory / (1024**3):.1f}GB, limiting to {max_memory_mb / 1024:.1f}GB (25% of available)")
         
         # 디스크 오프로딩을 위한 임시 디렉토리 생성
         offload_folder = tempfile.mkdtemp(prefix="model_offload_")
@@ -853,19 +880,35 @@ def load_stage_model(
         try:
             # Try device_map="cpu" first, fallback to manual CPU loading if not supported
             try:
-                full = AutoModelForCausalLM.from_pretrained(
-                    model_name,
-                    torch_dtype=dtype,
-                    low_cpu_mem_usage=True,
-                    device_map="cpu",  # Explicitly load on CPU for quantization compatibility
-                    max_memory=max_memory,  # 메모리 사용량 제한
-                    offload_folder=offload_folder,  # 디스크 오프로딩
-                    cache_dir=os.environ.get("HF_HOME") or os.environ.get("TRANSFORMERS_CACHE") or None,
-                    use_safetensors=True,  # safetensors 사용 (더 안전하고 메모리 효율적)
-                )
+                # Use accelerate's device_map="auto" with max_memory for better memory management
+                # This allows automatic offloading to disk when memory is constrained
+                try:
+                    full = AutoModelForCausalLM.from_pretrained(
+                        model_name,
+                        torch_dtype=dtype,
+                        low_cpu_mem_usage=True,
+                        device_map="auto",  # Auto device mapping with offloading
+                        max_memory=max_memory,  # 메모리 사용량 제한
+                        offload_folder=offload_folder,  # 디스크 오프로딩
+                        cache_dir=os.environ.get("HF_HOME") or os.environ.get("TRANSFORMERS_CACHE") or None,
+                        use_safetensors=True,  # safetensors 사용 (더 안전하고 메모리 효율적)
+                    )
+                except (TypeError, ValueError) as e:
+                    # Fallback to CPU-only with explicit offloading
+                    logger.warning(f"device_map='auto' failed: {e}, trying device_map='cpu'")
+                    full = AutoModelForCausalLM.from_pretrained(
+                        model_name,
+                        torch_dtype=dtype,
+                        low_cpu_mem_usage=True,
+                        device_map="cpu",  # Explicitly load on CPU for quantization compatibility
+                        max_memory=max_memory,  # 메모리 사용량 제한
+                        offload_folder=offload_folder,  # 디스크 오프로딩
+                        cache_dir=os.environ.get("HF_HOME") or os.environ.get("TRANSFORMERS_CACHE") or None,
+                        use_safetensors=True,
+                    )
             except TypeError:
-                # Fallback for older transformers versions that don't support device_map="cpu"
-                logger.warning("device_map='cpu' not supported, loading model and moving to CPU manually")
+                # Fallback for older transformers versions that don't support device_map
+                logger.warning("device_map not supported, loading model and moving to CPU manually")
                 full = AutoModelForCausalLM.from_pretrained(
                     model_name,
                     torch_dtype=dtype,
