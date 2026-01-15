@@ -494,15 +494,16 @@ class StageSegment(nn.Module):
                                 key_length += past_seq_len
                     
                     try:
-                        # build_alibi_tensor signature: (num_heads, batch_size, key_length, device=None, dtype=None)
-                        # Use positional arguments instead of keyword arguments
+                        # build_alibi_tensor signature: (num_heads, batch_size, key_length)
+                        # Returns tensor, then move to correct device and dtype
                         alibi = self.build_alibi_tensor(
                             self.num_heads,
                             batch_size,
                             key_length,
-                            device=x.device,
-                            dtype=x.dtype,
                         )
+                        # Move to correct device and dtype
+                        if alibi is not None:
+                            alibi = alibi.to(device=x.device, dtype=x.dtype)
                     except Exception as e:
                         logger.warning(f"Failed to build ALiBi tensor: {e}, using None")
                         alibi = None
