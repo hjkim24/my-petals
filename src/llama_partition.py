@@ -666,22 +666,39 @@ def _remap_state_dict_keys(state_dict: Dict[str, torch.Tensor], role: str, start
     for key, value in state_dict.items():
         new_key = key
         
-        # Stage0는 인덱스가 0부터 시작하므로 재매핑 불필요
-        if role == "segment" or role == "last":
-            # model.layers.{start}.* -> model.layers.0.*
-            # model.layers.{start+1}.* -> model.layers.1.*
-            # etc.
-            if key.startswith("model.layers."):
+        # BLOOM 모델 키 처리: h.{layer_idx}.* 형식
+        if key.startswith("h."):
+            parts = key.split(".")
+            if len(parts) >= 2:
+                try:
+                    layer_idx = int(parts[1])
+                    if role == "stage0":
+                        # stage0는 0부터 시작하므로 prefix만 추가
+                        new_key = f"transformer.h.{layer_idx}." + ".".join(parts[2:])
+                    elif role == "segment" or role == "last":
+                        # segment/last는 인덱스를 0부터 시작하도록 재매핑
+                        if layer_idx >= start:
+                            new_layer_idx = layer_idx - start
+                            new_key = f"transformer.h.{new_layer_idx}." + ".".join(parts[2:])
+                        else:
+                            continue  # Skip keys before start
+                except ValueError:
+                    pass
+        elif key.startswith("word_embeddings"):
+            # BLOOM embedding
+            if role == "stage0":
+                new_key = "transformer." + key
+        elif key.startswith("model.layers."):
+            # LLaMA 모델 키 처리
+            if role == "segment" or role == "last":
                 parts = key.split(".")
                 if len(parts) >= 3:
                     try:
                         layer_idx = int(parts[2])
                         if layer_idx >= start:
-                            # 레이어 인덱스를 0부터 시작하도록 재매핑
                             new_layer_idx = layer_idx - start
                             new_key = f"model.layers.{new_layer_idx}." + ".".join(parts[3:])
                     except ValueError:
-                        # 레이어 인덱스가 아닌 경우 그대로 유지
                         pass
         
         remapped[new_key] = value
@@ -945,9 +962,18 @@ def load_stage_model(
         logger.info("Step 1/4: Stage config created successfully")
         
         # Create model structure with smaller config (메모리 절약)
+        # Use init_empty_weights to create structure without allocating weights (more memory efficient)
         logger.info("Step 2/4: Creating model structure from config (this may take a while)...")
-        full = AutoModelForCausalLM.from_config(stage_config)
-        logger.info("Step 2/4: Model structure created successfully")
+        try:
+            from accelerate import init_empty_weights
+            with init_empty_weights():
+                full = AutoModelForCausalLM.from_config(stage_config)
+            logger.info("Step 2/4: Model structure created successfully (empty weights)")
+        except ImportError:
+            # Fallback if accelerate is not available
+            logger.warning("accelerate not available, using regular from_config (may use more memory)")
+            full = AutoModelForCausalLM.from_config(stage_config)
+            logger.info("Step 2/4: Model structure created successfully")
         
         # Remap state_dict keys to match the smaller model structure
         # (segment/last의 경우 layer indices를 0부터 시작하도록 재매핑)
