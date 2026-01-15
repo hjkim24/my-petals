@@ -460,16 +460,20 @@ class StageSegment(nn.Module):
 
         for i, layer in enumerate(self.layers):
             layer_past = None if past_key_values is None else past_key_values[i]
-            # BLOOM models don't accept position_ids parameter
+            # BLOOM models don't accept position_ids or past_key_value parameters
+            # BLOOM uses layer_past instead
             if self.is_bloom:
-                # BLOOM: only pass attention_mask and past_key_value
-                out = layer(
-                    x,
-                    attention_mask=attention_mask,
-                    past_key_value=_to_cache(layer_past),
-                    use_cache=use_cache,
-                    output_attentions=False,
-                )
+                # BLOOM: only pass attention_mask, layer_past, and use_cache
+                # Build kwargs dict and filter out None values
+                layer_kwargs = {
+                    "attention_mask": attention_mask,
+                    "use_cache": use_cache,
+                    "output_attentions": False,
+                }
+                # Add layer_past only if it's not None
+                if layer_past is not None:
+                    layer_kwargs["layer_past"] = layer_past
+                out = layer(x, **layer_kwargs)
             else:
                 # LLaMA/Mistral/Mixtral: pass position_ids
                 layer_pos = position_ids if position_ids is not None else default_position_ids(
