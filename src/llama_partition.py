@@ -429,6 +429,21 @@ class StageSegment(nn.Module):
         self.layers = _convert_layers(nn.ModuleList(raw_layers), full.config)
         self.config = full.config
         self.is_bloom = "bloom" in model_type
+        
+        # For BLOOM models, we need to prepare ALiBi generation
+        if self.is_bloom:
+            try:
+                from transformers.models.bloom.modeling_bloom import build_alibi_tensor
+                self.build_alibi_tensor = build_alibi_tensor
+                # Get number of heads from config
+                self.num_heads = getattr(full.config, "num_attention_heads", None)
+                if self.num_heads is None:
+                    logger.warning("Could not determine num_attention_heads for BLOOM model, ALiBi generation may fail")
+            except ImportError:
+                logger.warning("Could not import build_alibi_tensor from transformers, ALiBi generation may fail")
+                self.build_alibi_tensor = None
+                self.num_heads = None
+        
         if len(self.layers) == 0:
             logger.warning(f"StageSegment initialized with 0 layers (start={start}, end={end})")
         else:
@@ -464,10 +479,36 @@ class StageSegment(nn.Module):
             # BLOOM uses layer_past instead and requires alibi for ALiBi (Attention with Linear Biases)
             if self.is_bloom:
                 # BLOOM: pass attention_mask, alibi, layer_past, and use_cache
-                # Build kwargs dict and filter out None values
+                # Generate ALiBi tensor for BLOOM
+                alibi = None
+                if self.build_alibi_tensor is not None and self.num_heads is not None:
+                    batch_size, seq_length = x.shape[:2]
+                    # Calculate key length (current sequence + past if applicable)
+                    key_length = seq_length
+                    if layer_past is not None:
+                        # layer_past is tuple of (key, value), key shape is [batch, num_heads, past_seq_len, head_dim]
+                        if isinstance(layer_past, (tuple, list)) and len(layer_past) >= 1:
+                            past_key = layer_past[0]
+                            if past_key is not None and past_key.ndim >= 3:
+                                past_seq_len = past_key.shape[2]
+                                key_length += past_seq_len
+                    
+                    try:
+                        alibi = self.build_alibi_tensor(
+                            num_heads=self.num_heads,
+                            batch_size=batch_size,
+                            key_length=key_length,
+                            device=x.device,
+                            dtype=x.dtype,
+                        )
+                    except Exception as e:
+                        logger.warning(f"Failed to build ALiBi tensor: {e}, using None")
+                        alibi = None
+                
+                # Build kwargs dict
                 layer_kwargs = {
                     "attention_mask": attention_mask,
-                    "alibi": None,  # BLOOM uses ALiBi, but it can be None (model generates it internally)
+                    "alibi": alibi,
                     "use_cache": use_cache,
                     "output_attentions": False,
                 }
