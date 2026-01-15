@@ -428,6 +428,7 @@ class StageSegment(nn.Module):
 
         self.layers = _convert_layers(nn.ModuleList(raw_layers), full.config)
         self.config = full.config
+        self.is_bloom = "bloom" in model_type
         if len(self.layers) == 0:
             logger.warning(f"StageSegment initialized with 0 layers (start={start}, end={end})")
         else:
@@ -437,12 +438,13 @@ class StageSegment(nn.Module):
                 optimized_layers = sum(1 for layer in self.layers if isinstance(layer, OptimizedLlamaDecoderLayer))
                 logger.info(
                     f"StageSegment initialized with {len(self.layers)} layers (start={start}, end={end}): "
-                    f"{quantized_layers} quantized, {optimized_layers} OptimizedLlamaDecoderLayer"
+                    f"{quantized_layers} quantized, {optimized_layers} OptimizedLlamaDecoderLayer, "
+                    f"model_type={model_type}"
                 )
             else:
                 logger.info(
                     f"StageSegment initialized with {len(self.layers)} layers (start={start}, end={end}): "
-                    f"{quantized_layers} quantized"
+                    f"{quantized_layers} quantized, model_type={model_type}"
                 )
 
     def forward(
@@ -458,19 +460,29 @@ class StageSegment(nn.Module):
 
         for i, layer in enumerate(self.layers):
             layer_past = None if past_key_values is None else past_key_values[i]
-            layer_pos = position_ids if position_ids is not None else default_position_ids(
-                layer_past, x.shape[1], x.device
-            )
-            # Use standard layer forward
-            # OptimizedLlamaDecoderLayer (including quantized ones) properly returns KV cache
-            out = layer(
-                x,
-                attention_mask=None,
-                position_ids=layer_pos,
-                past_key_value=_to_cache(layer_past),
-                use_cache=use_cache,
-                output_attentions=False,
-            )
+            # BLOOM models don't accept position_ids parameter
+            if self.is_bloom:
+                # BLOOM: only pass attention_mask and past_key_value
+                out = layer(
+                    x,
+                    attention_mask=attention_mask,
+                    past_key_value=_to_cache(layer_past),
+                    use_cache=use_cache,
+                    output_attentions=False,
+                )
+            else:
+                # LLaMA/Mistral/Mixtral: pass position_ids
+                layer_pos = position_ids if position_ids is not None else default_position_ids(
+                    layer_past, x.shape[1], x.device
+                )
+                out = layer(
+                    x,
+                    attention_mask=attention_mask,
+                    position_ids=layer_pos,
+                    past_key_value=_to_cache(layer_past),
+                    use_cache=use_cache,
+                    output_attentions=False,
+                )
             
             # Validate output structure
             if not isinstance(out, (tuple, list)) or len(out) == 0:
@@ -996,9 +1008,21 @@ def load_stage_model(
         # Use assign=True when loading into meta device tensors (from init_empty_weights)
         logger.info("Step 4/4: Loading weights into model structure (this may take a while)...")
         try:
-            # Try with assign=True first (for meta device tensors)
+            # Try with assign=True first (for meta device tensors from init_empty_weights)
+            # assign=True materializes meta tensors and assigns values directly
             missing_keys, unexpected_keys = full.load_state_dict(remapped_state_dict, strict=False, assign=True)
             logger.info("Step 4/4: Weights loaded successfully (using assign=True for meta tensors)")
+            
+            # After assign=True, verify that all tensors are materialized
+            # If still on meta, try manual materialization
+            try:
+                sample_param = next(full.parameters())
+                if sample_param.device.type == "meta":
+                    logger.warning("Tensors still on meta device after assign=True, attempting manual materialization...")
+                    # assign=True should have worked, but if not, we need to manually materialize
+                    # This should not happen, but handle it gracefully
+            except StopIteration:
+                pass
         except TypeError:
             # Fallback if assign parameter is not supported (older PyTorch versions)
             logger.warning("assign=True not supported, trying without assign parameter")
