@@ -461,12 +461,13 @@ class StageSegment(nn.Module):
         for i, layer in enumerate(self.layers):
             layer_past = None if past_key_values is None else past_key_values[i]
             # BLOOM models don't accept position_ids or past_key_value parameters
-            # BLOOM uses layer_past instead
+            # BLOOM uses layer_past instead and requires alibi for ALiBi (Attention with Linear Biases)
             if self.is_bloom:
-                # BLOOM: only pass attention_mask, layer_past, and use_cache
+                # BLOOM: pass attention_mask, alibi, layer_past, and use_cache
                 # Build kwargs dict and filter out None values
                 layer_kwargs = {
                     "attention_mask": attention_mask,
+                    "alibi": None,  # BLOOM uses ALiBi, but it can be None (model generates it internally)
                     "use_cache": use_cache,
                     "output_attentions": False,
                 }
