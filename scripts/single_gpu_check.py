@@ -84,16 +84,20 @@ def main():
         import os
         
         available_memory = psutil.virtual_memory().available
-        # 다른 프로세스와 공유하므로 보수적으로 40%만 사용
-        max_memory_mb = int(available_memory * 0.4 / (1024 * 1024))
+        # BLOOM-176B INT4는 약 93.5GB 필요, 안전 마진 포함 120GB 이상 필요
+        # 사용 가능한 메모리의 50%를 사용하되, 최소 120GB는 보장
+        min_required_mb = 120 * 1024  # 최소 120GB
+        calculated_mb = int(available_memory * 0.5 / (1024 * 1024))
+        max_memory_mb = max(min_required_mb, calculated_mb)
         max_memory = {"cpu": f"{max_memory_mb}MiB"}
-        print(f"Available memory: {available_memory / (1024**3):.1f}GB, limiting to {max_memory_mb / 1024:.1f}GB (40% for safety)")
+        print(f"Available memory: {available_memory / (1024**3):.1f}GB, limiting to {max_memory_mb / 1024:.1f}GB (min 120GB for BLOOM-176B INT4)")
         
         # 디스크 오프로딩을 위한 임시 디렉토리 생성
         offload_folder = tempfile.mkdtemp(prefix="model_offload_")
         print(f"Using disk offloading folder: {offload_folder}")
         
         try:
+            # 메모리 사용량을 최소화하기 위한 추가 옵션
             model = AutoModelForCausalLM.from_pretrained(
                 model_name,
                 torch_dtype=dtype,
@@ -101,6 +105,8 @@ def main():
                 device_map="cpu",  # 양자화를 위해 CPU에 로드
                 max_memory=max_memory,  # 메모리 사용량 제한
                 offload_folder=offload_folder,  # 디스크 오프로딩
+                # 추가 메모리 최적화 옵션
+                use_safetensors=True,  # safetensors 사용 (더 안전하고 메모리 효율적)
             )
         except Exception as e:
             # 오프로딩 폴더 정리
@@ -157,16 +163,17 @@ def main():
             import tempfile
             
             available_memory = psutil.virtual_memory().available
-            # 다른 프로세스와 공유하므로 보수적으로 40%만 사용
-            max_memory_mb = int(available_memory * 0.4 / (1024 * 1024))
+            # 다른 프로세스와 공유하므로 매우 보수적으로 25%만 사용
+            max_memory_mb = int(available_memory * 0.25 / (1024 * 1024))
             max_memory = {"cpu": f"{max_memory_mb}MiB"}
-            print(f"Available memory: {available_memory / (1024**3):.1f}GB, limiting to {max_memory_mb / 1024:.1f}GB (40% for safety)")
+            print(f"Available memory: {available_memory / (1024**3):.1f}GB, limiting to {max_memory_mb / 1024:.1f}GB (25% for safety)")
             
             # 디스크 오프로딩을 위한 임시 디렉토리 생성
             offload_folder = tempfile.mkdtemp(prefix="model_offload_")
             print(f"Using disk offloading folder: {offload_folder}")
             
             try:
+                # 메모리 사용량을 최소화하기 위한 추가 옵션
                 model = AutoModelForCausalLM.from_pretrained(
                     model_name,
                     torch_dtype=dtype,
@@ -174,6 +181,8 @@ def main():
                     device_map="cpu",  # CPU에 직접 로드
                     max_memory=max_memory,  # 메모리 사용량 제한
                     offload_folder=offload_folder,  # 디스크 오프로딩
+                    # 추가 메모리 최적화 옵션
+                    use_safetensors=True,  # safetensors 사용 (더 안전하고 메모리 효율적)
                 )
             except Exception as e:
                 # 오프로딩 폴더 정리

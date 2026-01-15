@@ -1,6 +1,8 @@
 import json
 import logging
 import os
+import shutil
+import tempfile
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 from enum import Enum
@@ -830,23 +832,57 @@ def load_stage_model(
     if selective_state_dict is None:
         logger.info("Loading full model (will prune after loading)")
         # Always load model on CPU first (required for quantization, and safe for normal loading)
-        # Try device_map="cpu" first, fallback to manual CPU loading if not supported
+        # For large models like BLOOM-176B, use memory limits and disk offloading
+        import psutil
+        import tempfile
+        import shutil
+        
+        available_memory = psutil.virtual_memory().available
+        # BLOOM-176B는 매우 크므로 보수적으로 사용 가능한 메모리의 40%만 사용
+        # 최소 120GB는 보장 (BLOOM-176B INT4는 약 93.5GB 필요)
+        min_required_mb = 120 * 1024  # 최소 120GB
+        calculated_mb = int(available_memory * 0.4 / (1024 * 1024))
+        max_memory_mb = max(min_required_mb, calculated_mb)
+        max_memory = {"cpu": f"{max_memory_mb}MiB"}
+        logger.info(f"Available memory: {available_memory / (1024**3):.1f}GB, limiting to {max_memory_mb / 1024:.1f}GB")
+        
+        # 디스크 오프로딩을 위한 임시 디렉토리 생성
+        offload_folder = tempfile.mkdtemp(prefix="model_offload_")
+        logger.info(f"Using disk offloading folder: {offload_folder}")
+        
         try:
-            full = AutoModelForCausalLM.from_pretrained(
-                model_name,
-                torch_dtype=dtype,
-                low_cpu_mem_usage=True,
-                device_map="cpu"  # Explicitly load on CPU for quantization compatibility
-            )
-        except TypeError:
-            # Fallback for older transformers versions that don't support device_map="cpu"
-            logger.warning("device_map='cpu' not supported, loading model and moving to CPU manually")
-            full = AutoModelForCausalLM.from_pretrained(
-                model_name,
-                torch_dtype=dtype,
-                low_cpu_mem_usage=True,
-            )
-            full = full.cpu()
+            # Try device_map="cpu" first, fallback to manual CPU loading if not supported
+            try:
+                full = AutoModelForCausalLM.from_pretrained(
+                    model_name,
+                    torch_dtype=dtype,
+                    low_cpu_mem_usage=True,
+                    device_map="cpu",  # Explicitly load on CPU for quantization compatibility
+                    max_memory=max_memory,  # 메모리 사용량 제한
+                    offload_folder=offload_folder,  # 디스크 오프로딩
+                    cache_dir=os.environ.get("HF_HOME") or os.environ.get("TRANSFORMERS_CACHE") or None,
+                    use_safetensors=True,  # safetensors 사용 (더 안전하고 메모리 효율적)
+                )
+            except TypeError:
+                # Fallback for older transformers versions that don't support device_map="cpu"
+                logger.warning("device_map='cpu' not supported, loading model and moving to CPU manually")
+                full = AutoModelForCausalLM.from_pretrained(
+                    model_name,
+                    torch_dtype=dtype,
+                    low_cpu_mem_usage=True,
+                    max_memory=max_memory,  # 메모리 사용량 제한
+                    offload_folder=offload_folder,  # 디스크 오프로딩
+                    cache_dir=os.environ.get("HF_HOME") or os.environ.get("TRANSFORMERS_CACHE") or None,
+                    use_safetensors=True,
+                )
+                full = full.cpu()
+        except Exception as e:
+            # 오프로딩 폴더 정리
+            try:
+                shutil.rmtree(offload_folder)
+            except:
+                pass
+            raise e
     else:
         # Build model structure with selective weights
         logger.info("Building model structure with selectively loaded weights")
