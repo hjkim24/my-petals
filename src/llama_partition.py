@@ -480,46 +480,76 @@ class StageSegment(nn.Module):
             if self.is_bloom:
                 # BLOOM: pass attention_mask, alibi, layer_past, and use_cache
                 # Generate ALiBi tensor for BLOOM
+                # build_alibi_tensor signature: build_alibi_tensor(attention_mask, num_heads, dtype)
+                # attention_mask must be a tensor of shape (batch_size, seq_length)
                 alibi = None
                 if self.build_alibi_tensor is not None and self.num_heads is not None:
                     try:
                         batch_size, seq_length = x.shape[:2]
-                        # Calculate key length (current sequence + past if applicable)
-                        key_length = seq_length
+                        
+                        # Calculate total key length (current sequence + past if applicable)
+                        total_seq_length = seq_length
                         if layer_past is not None:
                             # layer_past is tuple of (key, value), key shape is [batch, num_heads, past_seq_len, head_dim]
                             if isinstance(layer_past, (tuple, list)) and len(layer_past) >= 1:
                                 past_key = layer_past[0]
                                 if past_key is not None and past_key.ndim >= 3:
                                     past_seq_len = past_key.shape[2]
-                                    key_length += past_seq_len
+                                    total_seq_length += past_seq_len
                         
-                        # build_alibi_tensor signature: (num_heads, batch_size, key_length, device=None, dtype=None)
-                        # Some versions use keyword arguments, but we'll try positional first
-                        # If that fails, try with device/dtype as keyword arguments
-                        try:
-                            alibi = self.build_alibi_tensor(
-                                self.num_heads,
-                                batch_size,
-                                key_length,
-                                device=x.device,
-                                dtype=x.dtype,
-                            )
-                        except (TypeError, AttributeError):
-                            # Fallback: try positional only, then move to device/dtype
-                            try:
-                                alibi = self.build_alibi_tensor(
-                                    self.num_heads,
-                                    batch_size,
-                                    key_length,
+                        # Create or use attention_mask for ALiBi generation
+                        # If attention_mask is provided, use it (should already have correct shape)
+                        # Otherwise, create a dummy one with shape (batch_size, total_seq_length)
+                        if attention_mask is not None:
+                            # attention_mask might be 2D (batch_size, seq_length) or 4D (batch_size, 1, 1, seq_length)
+                            # For ALiBi, we need 2D shape (batch_size, seq_length)
+                            if attention_mask.ndim == 4:
+                                # Extract the last dimension
+                                alibi_attention_mask = attention_mask.squeeze(1).squeeze(1)  # (batch_size, seq_length)
+                            elif attention_mask.ndim == 2:
+                                alibi_attention_mask = attention_mask
+                            else:
+                                # Fallback: create a dummy mask
+                                alibi_attention_mask = torch.ones(
+                                    (batch_size, total_seq_length),
+                                    device=x.device,
+                                    dtype=torch.bool
                                 )
-                                if alibi is not None:
-                                    alibi = alibi.to(device=x.device, dtype=x.dtype)
-                            except Exception as e2:
-                                logger.warning(f"Failed to build ALiBi tensor with positional args: {e2}")
-                                alibi = None
+                            
+                            # If attention_mask is shorter than total_seq_length, pad it
+                            if alibi_attention_mask.shape[1] < total_seq_length:
+                                # Pad with ones (assuming past tokens are valid)
+                                padding = torch.ones(
+                                    (batch_size, total_seq_length - alibi_attention_mask.shape[1]),
+                                    device=x.device,
+                                    dtype=alibi_attention_mask.dtype
+                                )
+                                alibi_attention_mask = torch.cat([padding, alibi_attention_mask], dim=1)
+                            elif alibi_attention_mask.shape[1] > total_seq_length:
+                                # Truncate to total_seq_length (shouldn't happen, but handle it)
+                                alibi_attention_mask = alibi_attention_mask[:, -total_seq_length:]
+                        else:
+                            # No attention_mask provided, create a dummy one
+                            alibi_attention_mask = torch.ones(
+                                (batch_size, total_seq_length),
+                                device=x.device,
+                                dtype=torch.bool
+                            )
+                        
+                        # build_alibi_tensor(attention_mask, num_heads, dtype)
+                        # attention_mask: (batch_size, seq_length) tensor
+                        # num_heads: int
+                        # dtype: torch.dtype
+                        alibi = self.build_alibi_tensor(
+                            alibi_attention_mask,
+                            self.num_heads,
+                            dtype=x.dtype,
+                        )
+                        
                     except Exception as e:
-                        logger.warning(f"Failed to build ALiBi tensor (error getting x.shape or parameters): {e}, using None")
+                        logger.warning(f"Failed to build ALiBi tensor: {e}, using None")
+                        import traceback
+                        logger.debug(f"ALiBi generation traceback: {traceback.format_exc()}")
                         alibi = None
                 
                 # Build kwargs dict
