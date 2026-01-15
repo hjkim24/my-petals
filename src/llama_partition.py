@@ -482,30 +482,44 @@ class StageSegment(nn.Module):
                 # Generate ALiBi tensor for BLOOM
                 alibi = None
                 if self.build_alibi_tensor is not None and self.num_heads is not None:
-                    batch_size, seq_length = x.shape[:2]
-                    # Calculate key length (current sequence + past if applicable)
-                    key_length = seq_length
-                    if layer_past is not None:
-                        # layer_past is tuple of (key, value), key shape is [batch, num_heads, past_seq_len, head_dim]
-                        if isinstance(layer_past, (tuple, list)) and len(layer_past) >= 1:
-                            past_key = layer_past[0]
-                            if past_key is not None and past_key.ndim >= 3:
-                                past_seq_len = past_key.shape[2]
-                                key_length += past_seq_len
-                    
                     try:
-                        # build_alibi_tensor signature: (num_heads, batch_size, key_length)
-                        # Returns tensor, then move to correct device and dtype
-                        alibi = self.build_alibi_tensor(
-                            self.num_heads,
-                            batch_size,
-                            key_length,
-                        )
-                        # Move to correct device and dtype
-                        if alibi is not None:
-                            alibi = alibi.to(device=x.device, dtype=x.dtype)
+                        batch_size, seq_length = x.shape[:2]
+                        # Calculate key length (current sequence + past if applicable)
+                        key_length = seq_length
+                        if layer_past is not None:
+                            # layer_past is tuple of (key, value), key shape is [batch, num_heads, past_seq_len, head_dim]
+                            if isinstance(layer_past, (tuple, list)) and len(layer_past) >= 1:
+                                past_key = layer_past[0]
+                                if past_key is not None and past_key.ndim >= 3:
+                                    past_seq_len = past_key.shape[2]
+                                    key_length += past_seq_len
+                        
+                        # build_alibi_tensor signature: (num_heads, batch_size, key_length, device=None, dtype=None)
+                        # Some versions use keyword arguments, but we'll try positional first
+                        # If that fails, try with device/dtype as keyword arguments
+                        try:
+                            alibi = self.build_alibi_tensor(
+                                self.num_heads,
+                                batch_size,
+                                key_length,
+                                device=x.device,
+                                dtype=x.dtype,
+                            )
+                        except (TypeError, AttributeError):
+                            # Fallback: try positional only, then move to device/dtype
+                            try:
+                                alibi = self.build_alibi_tensor(
+                                    self.num_heads,
+                                    batch_size,
+                                    key_length,
+                                )
+                                if alibi is not None:
+                                    alibi = alibi.to(device=x.device, dtype=x.dtype)
+                            except Exception as e2:
+                                logger.warning(f"Failed to build ALiBi tensor with positional args: {e2}")
+                                alibi = None
                     except Exception as e:
-                        logger.warning(f"Failed to build ALiBi tensor: {e}, using None")
+                        logger.warning(f"Failed to build ALiBi tensor (error getting x.shape or parameters): {e}, using None")
                         alibi = None
                 
                 # Build kwargs dict
