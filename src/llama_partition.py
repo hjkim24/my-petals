@@ -472,6 +472,25 @@ class StageSegment(nn.Module):
     ):
         x = hidden_states
         tuple_cache = []
+        
+        # For BLOOM models, attention_mask is required - create default if None
+        if self.is_bloom and attention_mask is None:
+            batch_size, seq_length = x.shape[:2]
+            # Calculate total sequence length including past
+            total_seq_length = seq_length
+            if past_key_values is not None and len(past_key_values) > 0:
+                # Check first layer's past_key_value to get past length
+                first_past = past_key_values[0] if isinstance(past_key_values[0], (tuple, list)) else None
+                if first_past is not None and len(first_past) >= 1:
+                    past_key = first_past[0]
+                    if past_key is not None and past_key.ndim >= 3:
+                        total_seq_length += past_key.shape[2]
+            # Create default attention mask (all ones = no masking)
+            attention_mask = torch.ones(
+                (batch_size, total_seq_length),
+                device=x.device,
+                dtype=torch.bool
+            )
 
         for i, layer in enumerate(self.layers):
             layer_past = None if past_key_values is None else past_key_values[i]
