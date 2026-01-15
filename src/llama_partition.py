@@ -494,10 +494,12 @@ class StageSegment(nn.Module):
                                 key_length += past_seq_len
                     
                     try:
+                        # build_alibi_tensor signature: (num_heads, batch_size, key_length, device=None, dtype=None)
+                        # Use positional arguments instead of keyword arguments
                         alibi = self.build_alibi_tensor(
-                            num_heads=self.num_heads,
-                            batch_size=batch_size,
-                            key_length=key_length,
+                            self.num_heads,
+                            batch_size,
+                            key_length,
                             device=x.device,
                             dtype=x.dtype,
                         )
