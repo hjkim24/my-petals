@@ -774,12 +774,29 @@ def _load_selective_weights(
         weight_map = index_data.get("weight_map", {})
         state_dict = {}
         
+        # Debug: Log a few example keys from weight_map
+        sample_keys = list(weight_map.keys())[:5]
+        logger.info(f"Sample tensor keys from weight_map: {sample_keys}")
+        logger.info(f"Required prefixes: {sorted(list(required_keys))[:10]}...")
+        
         # Find which shard files contain our required keys
         shard_files = set()
+        matched_keys = []
         for tensor_key, shard_file in weight_map.items():
             # Match keys that start with any required prefix
-            if any(tensor_key.startswith(req_prefix) for req_prefix in required_keys):
-                shard_files.add(shard_file)
+            for req_prefix in required_keys:
+                if tensor_key.startswith(req_prefix):
+                    shard_files.add(shard_file)
+                    if len(matched_keys) < 10:  # Log first 10 matches for debugging
+                        matched_keys.append((tensor_key, shard_file))
+                    break
+        
+        if matched_keys:
+            logger.info(f"Found {len(shard_files)} shard files with matching keys")
+            logger.info(f"Sample matched keys: {matched_keys[:5]}")
+        else:
+            logger.warning(f"No matching keys found! This may indicate a key format mismatch.")
+            logger.warning(f"First few weight_map keys: {list(weight_map.keys())[:10]}")
         
         shard_files = sorted(shard_files)  # 정렬하여 일관된 순서 보장
         total_shards = len(shard_files)
