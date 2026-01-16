@@ -1155,28 +1155,57 @@ def load_stage_model(
                 # Still on meta device, need to materialize manually using accelerate
                 logger.warning("Model still has meta tensors after load_state_dict, materializing to CPU...")
                 from accelerate.utils import set_module_tensor_to_device
-                materialized_count = 0
-                for name, tensor in remapped_state_dict.items():
-                    try:
-                        # Extract module path (everything except last part)
-                        parts = name.split(".")
-                        if len(parts) > 1:
-                            module_path = ".".join(parts[:-1])
-                            param_name = parts[-1]
-                            set_module_tensor_to_device(full, module_path, param_name, "cpu", value=tensor)
-                            materialized_count += 1
-                        else:
-                            # Direct parameter (shouldn't happen for BLOOM/LLaMA)
-                            setattr(full, name, tensor.to("cpu"))
-                            materialized_count += 1
-                    except Exception as e:
-                        logger.debug(f"Failed to materialize {name}: {e}")
+                
+                # Recursively materialize all parameters and buffers
+                def materialize_module(module, prefix=""):
+                    materialized_count = 0
+                    # Materialize parameters
+                    for name, param in module.named_parameters(recurse=False):
+                        full_name = f"{prefix}.{name}" if prefix else name
+                        if param.device.type == "meta":
+                            # Find corresponding tensor in state_dict
+                            if full_name in remapped_state_dict:
+                                tensor = remapped_state_dict[full_name]
+                                set_module_tensor_to_device(module, name, "cpu", value=tensor)
+                                materialized_count += 1
+                            else:
+                                # If not in state_dict, create empty tensor on CPU
+                                set_module_tensor_to_device(module, name, "cpu", value=torch.zeros_like(param, device="cpu"))
+                                materialized_count += 1
+                    
+                    # Materialize buffers
+                    for name, buffer in module.named_buffers(recurse=False):
+                        full_name = f"{prefix}.{name}" if prefix else name
+                        if buffer.device.type == "meta":
+                            # Find corresponding tensor in state_dict
+                            if full_name in remapped_state_dict:
+                                tensor = remapped_state_dict[full_name]
+                                set_module_tensor_to_device(module, name, "cpu", value=tensor)
+                                materialized_count += 1
+                            else:
+                                # If not in state_dict, create empty tensor on CPU
+                                set_module_tensor_to_device(module, name, "cpu", value=torch.zeros_like(buffer, device="cpu"))
+                                materialized_count += 1
+                    
+                    # Recursively process child modules
+                    for child_name, child_module in module.named_children():
+                        child_prefix = f"{prefix}.{child_name}" if prefix else child_name
+                        materialized_count += materialize_module(child_module, child_prefix)
+                    
+                    return materialized_count
+                
+                materialized_count = materialize_module(full)
                 logger.info(f"Materialized {materialized_count} tensors from meta to CPU")
                 
                 # Verify all tensors are now on CPU (not meta)
                 try:
-                    check_param = next(full.parameters())
-                    if check_param.device.type == "meta":
+                    has_meta = False
+                    for param in full.parameters():
+                        if param.device.type == "meta":
+                            has_meta = True
+                            logger.warning(f"Parameter still on meta: {param}")
+                            break
+                    if has_meta:
                         logger.error("Some tensors are still on meta device after materialization!")
                     else:
                         logger.info("All tensors successfully materialized to CPU")
