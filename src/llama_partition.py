@@ -641,6 +641,22 @@ class StageLast(nn.Module):
         is_supported = ("llama" in model_type or "mistral" in model_type or "mixtral" in model_type or "bloom" in model_type)
         if not is_supported:
             raise ValueError(f"Unsupported model type '{model_type}' in StageLast. Supported: LLaMA, Mistral, Mixtral, BLOOM.")
+        
+        # Store model type for forward pass
+        self.is_bloom = "bloom" in model_type
+        
+        # For BLOOM models, store build_alibi_tensor function and num_heads
+        if self.is_bloom:
+            try:
+                from transformers.models.bloom.modeling_bloom import build_alibi_tensor
+                self.build_alibi_tensor = build_alibi_tensor
+                self.num_heads = getattr(full.config, "num_attention_heads", None)
+                if self.num_heads is None:
+                    logger.warning("BLOOM model config missing num_attention_heads, ALiBi generation may fail")
+            except ImportError:
+                logger.warning("Could not import build_alibi_tensor, ALiBi generation will be disabled")
+                self.build_alibi_tensor = None
+                self.num_heads = None
 
         if hasattr(full, "model") and hasattr(full.model, "layers"):
             raw_layers = full.model.layers  # already pruned in load_stage_model
@@ -684,22 +700,137 @@ class StageLast(nn.Module):
     ):
         x = hidden_states
         tuple_cache = []
+        
+        # For BLOOM models, attention_mask is required - create default if None
+        if self.is_bloom and attention_mask is None:
+            batch_size, seq_length = x.shape[:2]
+            # Calculate total sequence length including past
+            total_seq_length = seq_length
+            if past_key_values is not None and len(past_key_values) > 0:
+                # Check first layer's past_key_value to get past length
+                first_past = past_key_values[0] if isinstance(past_key_values[0], (tuple, list)) else None
+                if first_past is not None and len(first_past) >= 1:
+                    past_key = first_past[0]
+                    if past_key is not None and past_key.ndim >= 3:
+                        total_seq_length += past_key.shape[2]
+            # Create default attention mask (all ones = no masking)
+            attention_mask = torch.ones(
+                (batch_size, total_seq_length),
+                device=x.device,
+                dtype=torch.bool
+            )
 
         for i, layer in enumerate(self.layers):
             layer_past = None if past_key_values is None else past_key_values[i]
-            layer_pos = position_ids if position_ids is not None else default_position_ids(
-                layer_past, x.shape[1], x.device
-            )
-            # Use standard layer forward
-            # OptimizedLlamaDecoderLayer (including quantized ones) properly returns KV cache
-            out = layer(
-                x,
-                attention_mask=None,
-                position_ids=layer_pos,
-                past_key_value=_to_cache(layer_past),
-                use_cache=use_cache,
-                output_attentions=False,
-            )
+            # BLOOM models don't accept position_ids or past_key_value parameters
+            # BLOOM uses layer_past instead and requires alibi for ALiBi (Attention with Linear Biases)
+            if self.is_bloom:
+                # BLOOM: pass attention_mask, alibi, layer_past, and use_cache
+                # Generate ALiBi tensor for BLOOM
+                # build_alibi_tensor signature: build_alibi_tensor(attention_mask, num_heads, dtype)
+                # attention_mask must be a tensor of shape (batch_size, seq_length)
+                alibi = None
+                if self.build_alibi_tensor is not None and self.num_heads is not None:
+                    try:
+                        batch_size, seq_length = x.shape[:2]
+                        
+                        # Calculate total key length (current sequence + past if applicable)
+                        total_seq_length = seq_length
+                        if layer_past is not None:
+                            # layer_past is tuple of (key, value), key shape is [batch, num_heads, past_seq_len, head_dim]
+                            if isinstance(layer_past, (tuple, list)) and len(layer_past) >= 1:
+                                past_key = layer_past[0]
+                                if past_key is not None and past_key.ndim >= 3:
+                                    past_seq_len = past_key.shape[2]
+                                    total_seq_length += past_seq_len
+                        
+                        # Create or use attention_mask for ALiBi generation
+                        # If attention_mask is provided, use it (should already have correct shape)
+                        # Otherwise, create a dummy one with shape (batch_size, total_seq_length)
+                        if attention_mask is not None:
+                            # attention_mask might be 2D (batch_size, seq_length) or 4D (batch_size, 1, 1, seq_length)
+                            # For ALiBi, we need 2D shape (batch_size, seq_length)
+                            if attention_mask.ndim == 4:
+                                # Extract the last dimension
+                                alibi_attention_mask = attention_mask.squeeze(1).squeeze(1)  # (batch_size, seq_length)
+                            elif attention_mask.ndim == 2:
+                                alibi_attention_mask = attention_mask
+                            else:
+                                # Fallback: create a dummy mask
+                                alibi_attention_mask = torch.ones(
+                                    (batch_size, total_seq_length),
+                                    device=x.device,
+                                    dtype=torch.bool
+                                )
+                            
+                            # If attention_mask is shorter than total_seq_length, pad it
+                            if alibi_attention_mask.shape[1] < total_seq_length:
+                                # Pad with ones (assuming past tokens are valid)
+                                padding = torch.ones(
+                                    (batch_size, total_seq_length - alibi_attention_mask.shape[1]),
+                                    device=x.device,
+                                    dtype=alibi_attention_mask.dtype
+                                )
+                                alibi_attention_mask = torch.cat([padding, alibi_attention_mask], dim=1)
+                            elif alibi_attention_mask.shape[1] > total_seq_length:
+                                # Truncate to total_seq_length (shouldn't happen, but handle it)
+                                alibi_attention_mask = alibi_attention_mask[:, -total_seq_length:]
+                        else:
+                            # No attention_mask provided, create a dummy one
+                            alibi_attention_mask = torch.ones(
+                                (batch_size, total_seq_length),
+                                device=x.device,
+                                dtype=torch.bool
+                            )
+                        
+                        # build_alibi_tensor(attention_mask, num_heads, dtype)
+                        # attention_mask: (batch_size, seq_length) tensor
+                        # num_heads: int
+                        # dtype: torch.dtype
+                        alibi = self.build_alibi_tensor(
+                            alibi_attention_mask,
+                            self.num_heads,
+                            dtype=x.dtype,
+                        )
+                        # Move alibi to correct device
+                        alibi = alibi.to(x.device)
+                        
+                    except Exception as e:
+                        logger.warning(f"Failed to build ALiBi tensor: {e}, using None")
+                        import traceback
+                        logger.debug(f"ALiBi generation traceback: {traceback.format_exc()}")
+                        alibi = None
+                
+                # Build kwargs dict
+                layer_kwargs = {
+                    "attention_mask": attention_mask,
+                    "alibi": alibi,
+                    "use_cache": use_cache,
+                    "output_attentions": False,
+                }
+                # Add layer_past only if it's not None
+                if layer_past is not None:
+                    layer_kwargs["layer_past"] = layer_past
+                
+                # Filter out None values from kwargs
+                layer_kwargs = {k: v for k, v in layer_kwargs.items() if v is not None}
+                
+                out = layer(x, **layer_kwargs)
+            else:
+                # LLaMA/Mistral/Mixtral: use standard forward with position_ids
+                layer_pos = position_ids if position_ids is not None else default_position_ids(
+                    layer_past, x.shape[1], x.device
+                )
+                # Use standard layer forward
+                # OptimizedLlamaDecoderLayer (including quantized ones) properly returns KV cache
+                out = layer(
+                    x,
+                    attention_mask=None,
+                    position_ids=layer_pos,
+                    past_key_value=_to_cache(layer_past),
+                    use_cache=use_cache,
+                    output_attentions=False,
+                )
             
             # Validate output structure
             if not isinstance(out, (tuple, list)) or len(out) == 0:
