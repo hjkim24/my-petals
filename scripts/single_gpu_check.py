@@ -84,13 +84,21 @@ def main():
         import os
         
         available_memory = psutil.virtual_memory().available
-        # BLOOM-176B INT4는 약 93.5GB 필요, 안전 마진 포함 120GB 이상 필요
-        # 사용 가능한 메모리의 50%를 사용하되, 최소 120GB는 보장
-        min_required_mb = 120 * 1024  # 최소 120GB
-        calculated_mb = int(available_memory * 0.5 / (1024 * 1024))
+        # BLOOM-176B INT4는 약 93.5GB 필요, 피크 메모리 ~200GB
+        # 사용 가능한 메모리의 75%를 사용하되, 최소 250GB는 보장 (충분한 메모리가 있을 때)
+        min_required_mb = 250 * 1024  # 최소 250GB (충분한 메모리가 있을 때)
+        calculated_mb = int(available_memory * 0.75 / (1024 * 1024))
         max_memory_mb = max(min_required_mb, calculated_mb)
+        
+        # 사용 가능한 메모리가 300GB 이상이면 제한을 더 완화
+        if available_memory / (1024**3) >= 300:
+            calculated_mb = int(available_memory * 0.8 / (1024 * 1024))
+            max_memory_mb = calculated_mb
+            print(f"Available memory: {available_memory / (1024**3):.1f}GB, using 80% = {max_memory_mb / 1024:.1f}GB (large memory mode)")
+        else:
+            print(f"Available memory: {available_memory / (1024**3):.1f}GB, using 75% = {max_memory_mb / 1024:.1f}GB")
+        
         max_memory = {"cpu": f"{max_memory_mb}MiB"}
-        print(f"Available memory: {available_memory / (1024**3):.1f}GB, limiting to {max_memory_mb / 1024:.1f}GB (min 120GB for BLOOM-176B INT4)")
         
         # 디스크 오프로딩을 위한 임시 디렉토리 생성
         offload_folder = tempfile.mkdtemp(prefix="model_offload_")
